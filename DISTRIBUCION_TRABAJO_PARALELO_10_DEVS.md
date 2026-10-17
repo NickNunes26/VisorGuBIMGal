@@ -1,250 +1,253 @@
 # Plan de Trabajo Paralelo para Equipo de +10 Desarrolladores
 
 **Documento:** Distribución de Tareas, Contratos de Interfaz y Gobernanza Técnica  
-**Proyecto:** Visor BIM/GIS & Kernel Soberano (Rust/WASM + WebGPU/TypeScript)  
+**Proyecto:** Visor Web BIM/GIS basado en **IFClite** (`@ifc-lite/*`)  
+**Base técnica:** [`SPEC_IFCLITE_BIM_GIS_VIEWER.md`](./SPEC_IFCLITE_BIM_GIS_VIEWER.md) y [`RIESGOS.md`](./RIESGOS.md)  
 **Fecha:** 2026-10-17  
-**Objetivo:** Permitir el trabajo simultáneo de más de 10 desarrolladores con cero conflictos de fusión (*zero merge conflicts*), dependencias desacopladas mediante contratos y progreso paralelo guiado por pruebas.
+**Objetivo:** Coordinar el trabajo concurrente de 10 a 12 desarrolladores sobre el desarrollo del visor con **IFClite** como motor principal, garantizando cero conflictos en Git y manteniendo el aislamiento de arquitectura hexagonal que permitirá en el futuro la transición hacia un kernel propio.
 
 ---
 
-## 1. Principio Fundamental: Desarrollo Basado en Contratos (API-First)
+## 1. Principio Fundamental: Arquitectura Hexagonal y Trabajo Desacoplado
 
-Para que 10–12 ingenieros trabajen al mismo tiempo sin bloquearse:
-1. **Los límites de módulo son inmutables:** Cada paquete (`crate` en Rust o directorio en TypeScript) tiene un contrato público (`trait` o `interface`). Nadie programa contra la implementación interna de otro compañero, sino contra su interfaz y mocks tipados.
-2. **Propiedad de código clara (Code Ownership):** Cada desarrollador es responsable exclusivo de su rama y módulo. Los cambios en interfaces públicas requieren un RFC breve o aprobación del equipo.
-3. **Mocks y TDD:** El equipo de frontend no espera a que el kernel de Rust esté terminado; utiliza adaptadores simulados (*mocks*) con geometría precargada desde el primer día.
+Para que más de 10 desarrolladores trabajen en paralelo sobre la base de IFClite sin colisiones:
+1. **Límites estrictos de Puertos y Adaptadores:** La interfaz de dominio (`src/domain/`) y los casos de uso (`src/application/`) definen los contratos. Nadie importa `@ifc-lite` fuera de `src/infrastructure/ifclite/`.
+2. **Propiedad de código por directorios (Code Ownership):** Cada desarrollador tiene asignado un módulo específico y una rama aislada.
+3. **Desarrollo guiado por contratos y Mocks:** Los desarrolladores de UI, GIS y exportación pueden trabajar desde el primer día utilizando datos sintéticos o adaptadores simulados (*mocks*) sin esperar a que el adaptador de IFClite esté completado.
 
 ---
 
-## 2. Mapa de Squads y Asignación Individual (+10 Devs)
+## 2. Mapa de Squads y Asignación de Tareas (12 Desarrolladores)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        COORDINACIÓN GENERAL                            │
 ├───────────────────┬───────────────────┬────────────────────────────────┤
-│  SQUAD 1: KERNEL  │  SQUAD 2: CAD 2D  │   SQUAD 3: GRÁFICOS Y BRIDGE   │
-│  (Rust / WASM)    │  (Slicer & DXF)   │   (WebGPU / Memoria WASM)      │
-│  Dev 01, 02, 03, 04│  Dev 05, 06       │   Dev 07, 08                   │
+│  SQUAD 1: IFCLITE │ SQUAD 2: PLANOS   │   SQUAD 3: GIS 2D/3D           │
+│  Y MOTOR 3D       │ Y EXPORTACIÓN DXF │   Y COORDENADAS                │
+│  Dev 01, 02, 03   │ Dev 04, 05        │   Dev 06, 07                   │
 ├───────────────────┴───────────────────┴────────────────────────────────┤
-│  SQUAD 4: FRONTEND, GIS Y FEDERACIÓN  │  SQUAD 5: QA, CI/CD Y FIXTURES │
-│  Dev 09, 10, 11                       │  Dev 12                        │
-└───────────────────────────────────────┴────────────────────────────────┘
+│  SQUAD 4: CASOS DE USO Y FEDERACIÓN   │  SQUAD 5: UI Y PANELES         │
+│  Dev 08, 09                           │  Dev 10, 11                    │
+├───────────────────────────────────────┴────────────────────────────────┤
+│  SQUAD 6: CI/CD, DESPLIEGUE EN VERCEL Y QA (Dev 12)                    │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### SQUAD 1: Core del Kernel BIM (Rust)
+### SQUAD 1: Adaptador IFClite & Renderizado 3D
 
-#### **DEV 01: Lead Lexer & Parser STEP ISO 10303-21**
-* **Ubicación exclusiva:** `crates/step-parser/`
-* **Misión:** Desarrollar el parser de streaming de bytes de alto rendimiento con `winnow` y `memchr`.
+#### **DEV 01: Adaptador Core de IFClite, Parser y Memoria**
+* **Ubicación exclusiva:** `src/infrastructure/ifclite/parser/` y `src/infrastructure/ifclite/store/`
+* **Misión:** Encapsular las APIs de `@ifc-lite/core` para lectura de archivos IFC, carga a través de Web Workers y ciclo de vida de memoria.
 * **Entregables:**
-  - Tokenizador de entidades `#ID=TYPE(PARAMS);`.
-  - Decodificador zero-copy de caracteres escapados (`\X2\`, `\X4\`, `\S\`).
-  - Creación del índice directo `StepIndex` para resolución $O(1)$ por Express ID.
-* **Contrato público:**
-  ```rust
-  pub trait StepParser {
-      fn parse_index<'a>(&self, bytes: &'a [u8]) -> Result<StepIndex<'a>, StepError>;
-      fn decode_string(&self, raw: &str) -> String;
-  }
-  ```
-* **Dependencias:** Ninguna (módulo base).
-
----
-
-#### **DEV 02: Grafo Relacional, Propiedades y Árbol Espacial**
-* **Ubicación exclusiva:** `crates/spatial-tree/` y `crates/ifc-schema/`
-* **Misión:** Reconstruir la jerarquía espacial y resolver los Property Sets (`IfcPropertySet`).
-* **Entregables:**
-  - Indexación de `IfcRelAggregates` y `IfcRelContainedInSpatialStructure`.
-  - Construcción del árbol `Project -> Site -> Building -> Storey -> Elementos`.
-  - Extracción de propiedades (`Name`, `GlobalId`, `Tag`, cantidades `IfcElementQuantity`).
-* **Contrato público:**
-  ```rust
-  pub trait SpatialHierarchy {
-      fn build_tree(&self, index: &StepIndex) -> SpatialNode;
-      fn get_element_properties(&self, id: u32) -> Option<ElementProperties>;
-  }
-  ```
-* **Mock para trabajar:** Puede consumir un `StepIndex` sintético o estático.
-
----
-
-#### **DEV 03: Motor de Extrusión Geométrica y Perfiles 3D**
-* **Ubicación exclusiva:** `crates/ifc-geometry/src/extrusions/`
-* **Misión:** Convertir perfiles 2D en prismas y mallas extruidas con precisión RTC.
-* **Entregables:**
-  - Evaluador de `IfcRectangleProfileDef`, `IfcCircleProfileDef` e `IfcArbitraryClosedProfileDef`.
-  - Extrusión de `IfcExtrudedAreaSolid` a lo largo de un vector de dirección con matriz local `IfcAxis2Placement3D`.
-  - Sustracción de origen Relative-To-Center (RTC) para evitar temblor GPU.
-* **Contrato público:**
-  ```rust
-  pub trait GeometryTessellator {
-      fn tessellate_extrusion(&self, entity: &RawEntity, rtc_offset: DVec3) -> Result<IndexedMesh, GeoError>;
-  }
-  ```
-
----
-
-#### **DEV 04: Motor de Operaciones Booleanas (CSG) para Huecos y Vanos**
-* **Ubicación exclusiva:** `crates/ifc-geometry/src/csg/`
-* **Misión:** Resolver aperturas de puertas y ventanas (`IfcOpeningElement` en `IfcBooleanClippingResult`).
-* **Entregables:**
-  - Intersección de mallas acelerada por BVH para localizar triángulos solapados entre muro y hueco.
-  - Corte de triángulos y re-teselado de caras resultantes con `earcut`.
-  - Fusión de normales y eliminación de caras coplanares redundantes.
-* **Contrato público:**
-  ```rust
-  pub trait CsgEngine {
-      fn boolean_difference(&self, solid_a: &IndexedMesh, solid_b: &IndexedMesh) -> Result<IndexedMesh, CsgError>;
-  }
-  ```
-
----
-
-### SQUAD 2: Motor CAD 2D y Planos Vectoriales
-
-#### **DEV 05: Slicer 2D e Intersección Malla-Plano**
-* **Ubicación exclusiva:** `crates/cad-slicer/src/slicer/`
-* **Misión:** Cortar la geometría 3D con un plano arbitrario o de planta a cota $Z$.
-* **Entregables:**
-  - Consulta rápida de triángulos intersectados mediante el árbol `bvh`.
-  - Algoritmo de intersección triángulo-plano produciendo segmentos de línea.
-  - Algoritmo de encadenamiento de contornos (*contour stitching*) para generar polilíneas 2D cerradas.
-* **Contrato público:**
-  ```rust
-  pub trait MeshSlicer {
-      fn slice_mesh(&self, mesh: &IndexedMesh, plane: Plane) -> Vec<Polyline2D>;
-  }
-  ```
-
----
-
-#### **DEV 06: Generador de Exportación DXF AC1015 (R2000) y SVG**
-* **Ubicación exclusiva:** `crates/cad-slicer/src/exporter/`
-* **Misión:** Escribir archivos vectoriales CAD e interactivos para descarga directa.
-* **Entregables:**
-  - Serializador DXF nativo formato AC1015 (AutoCAD 2000) con capas (`IFC-CUT`, `IFC-PROJECTION`), TrueColor RGB, UTF-8 y tramas (`HATCH`).
-  - Serializador SVG con estilos CSS y metadatos de entidades.
-* **Contrato público:**
-  ```rust
-  pub trait DrawingExporter {
-      fn export_dxf(&self, drawing: &DrawingDocument) -> Vec<u8>;
-      fn export_svg(&self, drawing: &DrawingDocument) -> String;
-  }
-  ```
-
----
-
-### SQUAD 3: Gráficos 3D, WebGPU y Puente WASM
-
-#### **DEV 07: Puente WASM y Transferencia Zero-Copy**
-* **Ubicación exclusiva:** `crates/wasm-api/` y `src/infrastructure/wasm-bridge/`
-* **Misión:** Conectar el runtime de Rust con el navegador sin sobrecoste de clonación.
-* **Entregables:**
-  - Exportación de punteros a la memoria lineal de WebAssembly (`Float32Array` y `Uint32Array`).
-  - Web Worker en TypeScript para procesar modelos en segundo plano mediante `Transferable Objects`.
-  - Ciclo de vida y liberación de memoria (`free_mesh_buffer`).
+  - Carga de modelos desde `ArrayBuffer` / `File` sin retener buffers duplicados en RAM (prevención de OOM, ver `RSK-03`).
+  - Extracción de metadata básica, esquema IFC (IFC2X3, IFC4) y unidades (`m`, `mm`).
+  - Implementación del método de liberación `disposeModel()` para desasignar memoria WASM y recursos.
 * **Contrato TypeScript:**
   ```typescript
-  export interface WasmBridgePort {
-    loadModel(id: string, buffer: ArrayBuffer): Promise<ModelHandle>;
-    getGeometryBuffers(handle: ModelHandle): Promise<SharedGpuBuffers>;
+  export interface IfcParserPort {
+    parseModel(modelId: string, file: File): Promise<LoadedModelHandle>;
+    disposeModel(modelId: string): Promise<void>;
   }
   ```
 
 ---
 
-#### **DEV 08: Pipeline de Renderizado WebGPU e Instanciación**
-* **Ubicación exclusiva:** `src/ui/viewer/` (shaders y pipeline WebGPU)
-* **Misión:** Dibujar la geometría masiva a 60 FPS con selección por clic.
+#### **DEV 02: Adaptador de Renderizado WebGPU & Diagnóstico Fallback**
+* **Ubicación exclusiva:** `src/infrastructure/ifclite/renderer/` y `src/ui/viewer/`
+* **Misión:** Integrar el renderer WebGPU oficial de IFClite y preparar el fallback a WebGL.
 * **Entregables:**
-  - Shaders WGSL para iluminación Diffuse/Specular y compensación de offset RTC.
-  - Buffer de selección en GPU (Picking Buffer por `express_id` y `model_id` al hacer clic).
-  - Detección de capacidades WebGPU y adaptador de contingencia WebGL (Three.js).
-* **Contrato UI:**
+  - Inicialización y montaje del canvas de renderizado de IFClite.
+  - Implementación de controles de cámara: órbita, pan, zoom, encuadre de modelo seleccionado y vistas ortogonales (N, S, E, O, planta).
+  - Detección de soporte de WebGPU con pantalla de diagnóstico amigable y prototipado del fallback WebGL/Three.js (`NFR-03`).
+* **Contrato TypeScript:**
   ```typescript
-  export interface Viewer3DPort {
-    mount(canvas: HTMLCanvasElement): void;
-    renderModel(modelId: string, buffers: SharedGpuBuffers): void;
-    onElementClick(callback: (ref: ElementRef | null) => void): void;
+  export interface BimRendererPort {
+    init(canvas: HTMLCanvasElement): Promise<RendererCapabilities>;
+    loadGeometry(modelId: string, handle: LoadedModelHandle): Promise<void>;
+    setCameraView(view: "orbit" | "top" | "front" | "fit-all"): void;
+    highlightElement(ref: ElementRef | null): void;
   }
   ```
 
 ---
 
-### SQUAD 4: Aplicación Frontend, GIS y Federación
-
-#### **DEV 09: Gestor de Federación de Modelos y Estado de Dominio**
-* **Ubicación exclusiva:** `src/domain/` y `src/application/use-cases/`
-* **Misión:** Gestionar múltiples modelos simultáneos sin colisiones de identificadores.
+#### **DEV 03: Adaptador 2D de IFClite y Planos de Corte**
+* **Ubicación exclusiva:** `src/infrastructure/ifclite/drawing-2d/`
+* **Misión:** Implementar la generación de secciones y vistas 2D utilizando `@ifc-lite/drawing-2d`.
 * **Entregables:**
-  - Estado reactivo para visibilidad individual, aislamiento y colores por modelo.
-  - Claves compuestas `modelId + expressId`.
-  - Casos de uso de la aplicación: `LoadModelUseCase`, `ToggleVisibilityUseCase`, `SelectElementUseCase`.
+  - Corte interactivo 3D según plano de sección ($Ax + By + Cz + D = 0$).
+  - Invocación de `@ifc-lite/drawing-2d` para generar la geometría de planta o sección a una cota dada.
+  - Mapeo de la salida de IFClite al contrato neutral `DrawingDocument` (capas `IFC-CUT`, `IFC-PROJECTION`, `IFC-HATCH`).
+* **Contrato TypeScript:**
+  ```typescript
+  export interface DrawingGeneratorPort {
+    generateSection(modelIds: string[], planeParams: SectionPlane): Promise<DrawingDocument>;
+  }
+  ```
 
 ---
 
-#### **DEV 10: Integración GIS 2D (Leaflet) y Transformación de Coordenadas**
-* **Ubicación exclusiva:** `src/infrastructure/gis-leaflet/` y `src/domain/coordinates/`
-* **Misión:** Mostrar la geolocalización del proyecto y vincular mapa 2D con la escena 3D.
+### SQUAD 2: Exportación DXF/SVG & Persistencia Local
+
+#### **DEV 04: Motor de Exportación DXF & SVG**
+* **Ubicación exclusiva:** `src/infrastructure/export/`
+* **Misión:** Gestionar la exportación del dibujo vectorial a formatos descargables compatibles con CAD.
 * **Entregables:**
-  - Integración de Leaflet con capas configurables WMS/WMTS.
-  - Cálculo de matriz de transformación `localToMap` utilizando `proj4js` (EPSG:25829, 25830, 4326).
-  - Representación del modelo mediante marcador y caja envolvente orientada (OBB).
+  - Adaptador para el exportador DXF R12 de IFClite con codificación Windows-1252.
+  - Generador SVG complementario para visualización directa en navegador con estilos y grosores (`RSK-04`).
+  - Evaluación técnica de `@tarikjabiri/dxf` como alternativa para soportar capas y entidades avanzadas.
+  - Mecanismo de descarga local de archivos con nombres parametrizados (`<modelo>_seccion_<fecha>.dxf`).
+* **Contrato TypeScript:**
+  ```typescript
+  export interface ExportPort {
+    exportToDxf(doc: DrawingDocument): Blob;
+    exportToSvg(doc: DrawingDocument): string;
+  }
+  ```
 
 ---
 
-#### **DEV 11: Sistema de UI, Paneles, Árbol Espacial y Propiedades**
+#### **DEV 05: Persistencia Local y Sesiones (IndexedDB)**
+* **Ubicación exclusiva:** `src/infrastructure/storage/` y `src/domain/session/`
+* **Misión:** Almacenar el estado de trabajo del usuario en el navegador sin backend.
+* **Entregables:**
+  - Servicio IndexedDB para persistir la lista de modelos cargados, visibilidad, colores asignados y transformaciones CRS.
+  - Serialización y deserialización de la sesión a formato JSON para importar/exportar proyectos locales.
+  - Guardado de la última posición de cámara y configuración de capas GIS.
+* **Contrato TypeScript:**
+  ```typescript
+  export interface SessionStoragePort {
+    saveSession(session: SessionState): Promise<void>;
+    loadSession(): Promise<SessionState | null>;
+    exportSessionJson(session: SessionState): string;
+  }
+  ```
+
+---
+
+### SQUAD 3: GIS 2D/3D & Georreferenciación
+
+#### **DEV 06: Módulo GIS 2D (Leaflet) & Servicios OGC**
+* **Ubicación exclusiva:** `src/infrastructure/gis-leaflet/` y `src/ui/map/`
+* **Misión:** Integrar el mapa 2D ligero para contextualizar los modelos IFC georreferenciados.
+* **Entregables:**
+  - Componente Leaflet 2D con selector de mapas base (OpenStreetMap, ortofotos).
+  - Soporte para añadir URLs de capas WMS y WMTS externas con manejo de fallos por CORS.
+  - Vista sincronizada (split screen o minimapa flotante) entre la vista 3D y el mapa 2D.
+* **Contrato TypeScript:**
+  ```typescript
+  export interface GisMapPort {
+    initMap(containerId: string): void;
+    addWmsLayer(url: string, layerName: string): Promise<void>;
+    setMarker(coords: [number, number], label: string): void;
+    drawPolygon(rings: [number, number][]): void;
+  }
+  ```
+
+---
+
+#### **DEV 07: Servicio de Coordenadas, CRS & Proyecciones**
+* **Ubicación exclusiva:** `src/domain/coordinates/` y `src/infrastructure/gis-cesium/`
+* **Misión:** Realizar la georreferenciación rigurosa de los archivos IFC y preparar la extensión a CesiumJS.
+* **Entregables:**
+  - Lectura de entidades `IfcProjectedCRS` e `IfcMapConversion` a través del adaptador de IFClite.
+  - Cálculo de matriz de transformación `localToMap` con `proj4js` para convertir coordenadas locales a EPSG:4326/UTM.
+  - Definición del marcador y caja envolvente orientada (OBB) en el mapa Leaflet (`RSK-05`).
+  - Módulo opcional base de CesiumJS para visualización en globo 3D (Fase 2).
+
+---
+
+### SQUAD 4: Casos de Uso, Dominio y Federación
+
+#### **DEV 08: Gestor de Federación de Múltiples Modelos**
+* **Ubicación exclusiva:** `src/domain/models/` y `src/application/use-cases/federation/`
+* **Misión:** Coordinar la apertura simultánea de múltiples modelos sin colisiones de identificadores.
+* **Entregables:**
+  - Registro de modelos `ModelRecord` con claves compuestas `(modelId, expressId)`.
+  - Casos de uso: `LoadIfcUseCase`, `RemoveModelUseCase`, `ToggleVisibilityUseCase`, `IsolateElementsUseCase`.
+  - Gestión de transformaciones visuales manuales para alinear modelos que carezcan de origen compartido.
+
+---
+
+#### **DEV 09: Extracción de Propiedades, Filtros y Árbol Espacial**
+* **Ubicación exclusiva:** `src/domain/models/` y `src/application/use-cases/properties/`
+* **Misión:** Consultar la información BIM no geométrica de los modelos cargados.
+* **Entregables:**
+  - Caso de uso `GetSpatialTreeUseCase`: jerarquía `IfcProject -> IfcSite -> IfcBuilding -> IfcBuildingStorey`.
+  - Caso de uso `GetElementPropertiesUseCase`: extracción de atributos y Property Sets (`IfcPropertySet`).
+  - Filtro por clases IFC (`IfcWall`, `IfcDoor`, `IfcWindow`, `IfcSlab`).
+
+---
+
+### SQUAD 5: Interfaz de Usuario, Paneles y Herramientas
+
+#### **DEV 10: Paneles UI, Árbol Espacial e Inspector de Propiedades**
 * **Ubicación exclusiva:** `src/ui/panels/` y `src/ui/components/`
-* **Misión:** Crear la interfaz de usuario moderna, fluida y accesible.
+* **Misión:** Construir la interfaz de control, accesible y reactiva.
 * **Entregables:**
-  - Árbol espacial virtualizado para soportar más de 50.000 nodos sin degradar el DOM.
-  - Panel inspector de propiedades tabulares (`IfcPropertySet`).
-  - Barra de herramientas: control de capas, planos de sección y botón de exportación DXF/SVG.
+  - Lista de modelos cargados con controles de visibilidad, color y botón de retirar.
+  - Componente de Árbol Espacial virtualizado para navegar por pisos y elementos sin congelar el navegador.
+  - Tabla inspectora de propiedades seleccionadas (GlobalId, tipo, dimensiones, materiales).
+  - Indicadores visuales de progreso de carga y gestión de errores amigables.
 
 ---
 
-### SQUAD 5: Calidad, CI/CD y Automatización
-
-#### **DEV 12: Infraestructura de CI/CD, Benchmarking y Fixtures**
-* **Ubicación exclusiva:** `.github/workflows/`, `tests/fixtures/`, `vercel.json`
-* **Misión:** Garantizar que ningún commit rompa el build ni la compatibilidad.
+#### **DEV 11: Herramientas de Navegación, Gizmo de Sección y Vista 2D**
+* **Ubicación exclusiva:** `src/ui/viewer/tools/` y `src/ui/drawings/`
+* **Misión:** Desarrollar los controles interactivos sobre la escena y la previsualización de planos.
 * **Entregables:**
-  - Pipeline de GitHub Actions: linting, `cargo test`, `vitest`, typecheck y despliegue continuo en Vercel.
-  - Configuración de cabeceras COOP/COEP en `vercel.json`.
-  - Suite de pruebas E2E en Playwright sobre navegadores reales con y sin WebGPU.
-  - Colección de archivos `.ifc` de prueba pequeños, medianos y con georreferenciación real.
+  - Gizmo o slider interactivo para ajustar la posición y altura de los planos de corte 3D.
+  - Modal o panel de previsualización 2D para ver los planos generados por IFClite antes de exportar.
+  - Controles de zoom/pan en la vista previa 2D y botones de descarga directa en DXF y SVG.
 
 ---
 
-## 3. Matriz de Dependencias y Ruta Crítica
+### SQUAD 6: Calidad, CI/CD, Despliegue en Vercel y QA
 
-| Desarrollador | Depende directamente de | Puede avanzar en paralelo usando |
+#### **DEV 12: CI/CD, Despliegue en Vercel, Pruebas y Fixtures**
+* **Ubicación exclusiva:** `.github/workflows/`, `vercel.json`, `tests/`
+* **Misión:** Asegurar la infraestructura de despliegue y la calidad técnica continua.
+* **Entregables:**
+  - Configuración de despliegue en Vercel con cabeceras `Cross-Origin-Opener-Policy: same-origin` y `Cross-Origin-Embedder-Policy: credentialless` (`RSK-02`).
+  - Pipeline de GitHub Actions ejecutando pruebas unitarias con Vitest y typecheck en cada PR.
+  - Pruebas E2E automatizadas con Playwright (verificación de carga de IFC y ausencia de fugas de memoria).
+  - Suite de modelos IFC de prueba clasificados por tamaño y complejidad geométrica.
+  - Validación de los archivos DXF generados en lectores CAD reales (LibreCAD/QCAD).
+
+---
+
+## 3. Matriz de Dependencias y Mocks para Trabajo Autónomo
+
+| Desarrollador | Módulo asignado | Puede avanzar en paralelo usando |
 |---|---|---|
-| **Dev 01 (STEP Parser)** | *Ninguno* | Archivos de texto ISO 10303-21 en bruto. |
-| **Dev 02 (Árbol Espacial)** | Dev 01 | Mock de `StepIndex` precompilado en memoria. |
-| **Dev 03 (Extrusión 3D)** | Dev 01 | Entidades `IfcExtrudedAreaSolid` creadas sintéticamente. |
-| **Dev 04 (CSG / Huecos)** | Dev 03 | Mallas de prueba de cajas y cilindros en memoria. |
-| **Dev 05 (Slicer 2D)** | Dev 03 | Mallas OBJ/STL básicas sin esperar al parser IFC. |
-| **Dev 06 (DXF/SVG)** | Dev 05 | Listas de polilíneas sintéticas en 2D. |
-| **Dev 07 (WASM Bridge)** | Dev 03 | Malla estática generada por un crate temporal. |
-| **Dev 08 (WebGPU)** | Dev 07 | Búferes planos de vértices (`Float32Array`) sintéticos. |
-| **Dev 09 (Federación)** | *Ninguno* | Contratos de dominio en TypeScript puro. |
-| **Dev 10 (GIS/Leaflet)** | *Ninguno* | Coordenadas y matrices simuladas (`proj4js`). |
-| **Dev 11 (UI/Paneles)** | Dev 09 | Estado simulado de Zustand / Reactive Store. |
-| **Dev 12 (CI/CD / QA)** | *Ninguno* | Fixtures iniciales y configuración de Vercel/GitHub. |
+| **Dev 01** | `ifclite/parser` | Archivos `.ifc` de prueba locales. |
+| **Dev 02** | `ifclite/renderer` | Canvas HTML y el visor de ejemplo de `@ifc-lite`. |
+| **Dev 03** | `ifclite/drawing-2d` | Modelos de prueba oficiales del paquete de IFClite. |
+| **Dev 04** | `export/dxf-svg` | Objetos `DrawingDocument` sintéticos en memoria. |
+| **Dev 05** | `storage/indexeddb` | Objetos `SessionState` simulados en TypeScript. |
+| **Dev 06** | `gis-leaflet` | Coordenadas fijas y servicios WMS públicos (IGN/Catastro). |
+| **Dev 07** | `domain/coordinates` | Matrices de prueba y cálculos con `proj4js`. |
+| **Dev 08** | `application/federation` | Mocks tipados de `LoadedModelHandle`. |
+| **Dev 09** | `application/properties` | Datos JSON simulados de árboles espaciales IFC. |
+| **Dev 10** | `ui/panels` | Store reactivo simulado con Zustand o similar. |
+| **Dev 11** | `ui/viewer/tools` | Canvas de prueba con caja 3D básica. |
+| **Dev 12** | `ci-cd/vercel/qa` | Repositorio base, scripts de build y tests iniciales. |
 
 ---
 
-## 4. Flujo de Trabajo en Git para Evitar Conflictos
+## 4. Convención de Ramas y Flujo Git
 
-1. **Estructura de Ramas:**
-   - `main`: Código verificado y desplegado en producción en Vercel.
-   - `feature/<squad>-<dev-id>-<descripcion>`:
-     - Ejemplos: `feature/kernel-dev01-step-lexer`, `feature/ui-dev11-spatial-tree-panel`.
-2. **Regla de No Invasión de Directorios:**
-   - Las PRs que modifiquen archivos fuera del módulo asignado al desarrollador **serán rechazadas automáticamente** salvo que sean actualizaciones consensuadas de contratos en `src/application/ports/` o `crates/*/src/lib.rs`.
-3. **Validación Automática en PR:**
-   - Todo commit en rama debe pasar: `cargo test`, `npm run lint`, `npm test` y el check de tipos de TypeScript.
+1. **Ramas por Desarrollador:**
+   - Formato: `feature/<squad>-dev<numero>-<nombre-tarea>`
+   - Ejemplos:
+     - `feature/squad1-dev01-ifclite-parser`
+     - `feature/squad2-dev04-dxf-export`
+     - `feature/squad3-dev06-leaflet-wms`
+     - `feature/squad5-dev10-spatial-tree-ui`
+2. **Políticas de Integración Continua:**
+   - Ninguna PR puede tocar archivos de otro módulo sin aprobación previa.
+   - Todo commit debe pasar `npm run lint` y `npm run typecheck`.
+   - Vercel generará una URL de vista previa automática (*Preview Deployment*) para cada Pull Request.
