@@ -24,6 +24,8 @@ const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 /// Consecutive profile points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
+/// Steps along a ruled wall that twists, where two triangles would not follow it.
+const RULED_STEPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
@@ -52,6 +54,7 @@ pub struct ElementGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsupportedSchema;
 
+#[derive(Clone)]
 struct Profile {
     outer: Vec<DVec2>,
     holes: Vec<Vec<DVec2>>,
@@ -288,6 +291,159 @@ fn prism(profile: Profile, offset: DVec3) -> Mesh {
         }
     }
     Mesh { positions, triangles }
+}
+
+/// One cross-section of a loft: its outer ring, then its holes, placed in space.
+type Section = Vec<Vec<DVec3>>;
+
+/// Triangulates a section on its own plane.
+fn section_cap(section: &Section) -> Option<Vec<[u32; 3]>> {
+    let outer = section.first()?;
+    let normal = (0..outer.len())
+        .fold(DVec3::ZERO, |sum, i| sum + outer[i].cross(outer[(i + 1) % outer.len()]))
+        .try_normalize()?;
+    let u = normal.any_orthonormal_vector();
+    let v = normal.cross(u);
+    let flat: Vec<Vec<DVec2>> = section
+        .iter()
+        .map(|ring| ring.iter().map(|point| DVec2::new(point.dot(u), point.dot(v))).collect())
+        .collect();
+    let rings: Vec<&[DVec2]> = flat.iter().map(Vec::as_slice).collect();
+    Some(triangulate_rings(&rings))
+}
+
+/// Joins corresponding rings of successive sections and caps both ends. Every section needs
+/// the same ring sizes, wound as `wound` leaves them.
+fn loft(sections: &[Section]) -> Option<Mesh> {
+    let (first, last) = (sections.first()?, sections.last()?);
+    let sizes: Vec<u32> = first.iter().map(|ring| ring.len() as u32).collect();
+    let matching = sections.iter().all(|section| {
+        section.iter().map(|ring| ring.len() as u32).eq(sizes.iter().copied())
+    });
+    if sections.len() < 2 || !matching || sizes.iter().any(|size| *size < 3) {
+        return None;
+    }
+    let count: u32 = sizes.iter().sum();
+    let positions: Vec<DVec3> = sections.iter().flatten().flatten().copied().collect();
+
+    let mut triangles = Vec::new();
+    for step in 0..sections.len() as u32 - 1 {
+        let mut start = step * count;
+        for size in &sizes {
+            for i in 0..*size {
+                let (a, b) = (start + i, start + (i + 1) % size);
+                triangles.push([a, b, b + count]);
+                triangles.push([a, b + count, a + count]);
+            }
+            start += size;
+        }
+    }
+    for [a, b, c] in section_cap(first)? {
+        triangles.push([a, c, b]);
+    }
+    let end = (sections.len() as u32 - 1) * count;
+    for [a, b, c] in section_cap(last)? {
+        triangles.push([a + end, b + end, c + end]);
+    }
+    Some(solids::outward(Mesh { positions, triangles }))
+}
+
+/// Gives two rings the same number of points, matched by their share of the perimeter.
+fn matched_rings(a: &[DVec2], b: &[DVec2]) -> (Vec<DVec2>, Vec<DVec2>) {
+    if a.len() == b.len() {
+        return (a.to_vec(), b.to_vec());
+    }
+    // Outlines of different kinds can start anywhere: begin them near each other.
+    let nearest = (0..b.len()).min_by(|i, j| {
+        b[*i].distance_squared(a[0]).total_cmp(&b[*j].distance_squared(a[0]))
+    });
+    let mut b = b.to_vec();
+    b.rotate_left(nearest.unwrap_or(0));
+
+    let shares = |ring: &[DVec2]| {
+        let mut walked = 0.0;
+        let mut result = Vec::with_capacity(ring.len());
+        for i in 0..ring.len() {
+            result.push(walked);
+            walked += ring[i].distance(ring[(i + 1) % ring.len()]);
+        }
+        result.iter_mut().for_each(|share| *share /= walked);
+        result
+    };
+    let (of_a, of_b) = (shares(a), shares(&b));
+    let mut all: Vec<f64> = of_a.iter().chain(&of_b).copied().collect();
+    all.sort_by(f64::total_cmp);
+    all.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
+
+    let at = |ring: &[DVec2], of: &[f64], share: f64| {
+        let index = of.partition_point(|value| *value <= share).saturating_sub(1);
+        let next = of.get(index + 1).copied().unwrap_or(1.0);
+        ring[index].lerp(ring[(index + 1) % ring.len()], (share - of[index]) / (next - of[index]))
+    };
+    (
+        all.iter().map(|share| at(a, &of_a, *share)).collect(),
+        all.iter().map(|share| at(&b, &of_b, *share)).collect(),
+    )
+}
+
+/// Pairs start and end sections point for point, unless a part or a hole has no partner.
+fn section_pairs(start: &[Profile], end: &[Profile]) -> Option<Vec<(Profile, Profile)>> {
+    if start.len() != end.len() {
+        return None;
+    }
+    let pair = |(a, b): (&Profile, &Profile)| {
+        let (a, b) = (wound(a.clone()), wound(b.clone()));
+        if a.holes.len() != b.holes.len() {
+            return None;
+        }
+        let (first_outer, second_outer) = matched_rings(&a.outer, &b.outer);
+        let (first_holes, second_holes) =
+            a.holes.iter().zip(&b.holes).map(|(x, y)| matched_rings(x, y)).unzip();
+        Some((
+            Profile { outer: first_outer, holes: first_holes },
+            Profile { outer: second_outer, holes: second_holes },
+        ))
+    };
+    start.iter().zip(end).map(pair).collect()
+}
+
+/// The section `share` of the way from `a` to `b`, which `section_pairs` matched.
+fn blended(a: &Profile, b: &Profile, share: f64, place: impl Fn(DVec2) -> DVec3) -> Section {
+    let starts = std::iter::once(&a.outer).chain(&a.holes);
+    let ends = std::iter::once(&b.outer).chain(&b.holes);
+    starts
+        .zip(ends)
+        .map(|(start, end)| start.iter().zip(end).map(|(p, q)| place(p.lerp(*q, share))).collect())
+        .collect()
+}
+
+/// Whether every wall from `a` to `b`, moved along `offset`, is flat.
+fn flat_walls(a: &Profile, b: &Profile, offset: DVec3) -> bool {
+    let starts = std::iter::once(&a.outer).chain(&a.holes);
+    let ends = std::iter::once(&b.outer).chain(&b.holes);
+    starts.zip(ends).all(|(start, end)| {
+        (0..start.len()).all(|i| {
+            let next = (i + 1) % start.len();
+            let across = (end[i].extend(0.0) + offset) - start[i].extend(0.0);
+            let (along_start, along_end) = (start[next] - start[i], end[next] - end[i]);
+            let (first, second) = (along_start.extend(0.0), along_end.extend(0.0));
+            let scale = first.length() * second.length() * across.length();
+            first.cross(across).dot(second).abs() <= scale * 1e-9
+        })
+    })
+}
+
+/// The run of a polyline between two parameters, which count its segments from zero.
+fn polyline_between(path: &[DVec3], start: f64, end: f64) -> Vec<DVec3> {
+    let at = |t: f64| {
+        let index = (t.floor() as usize).min(path.len() - 2);
+        path[index].lerp(path[index + 1], t - index as f64)
+    };
+    let inner = (start.floor() as usize + 1)..(end.ceil() as usize);
+    let mut run = vec![at(start)];
+    run.extend_from_slice(&path[inner]);
+    run.push(at(end));
+    run
 }
 
 fn transformed(mesh: Mesh, transform: DMat4) -> Mesh {
@@ -598,7 +754,11 @@ impl<'a> ModelEvaluator<'a> {
 
     /// Local geometry of a representation item, before any placement.
     fn solid(&mut self, id: u32, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Mesh> {
-        if def.is_a("IfcExtrudedAreaSolid") {
+        if def.is_a("IfcExtrudedAreaSolidTapered") {
+            self.tapered_extrusion(entity, def)
+        } else if def.is_a("IfcRevolvedAreaSolidTapered") {
+            self.tapered_revolution(entity, def)
+        } else if def.is_a("IfcExtrudedAreaSolid") {
             self.extrusion(entity, def)
         } else if def.is_a("IfcBooleanResult") {
             self.boolean(entity, def, depth)
@@ -612,9 +772,7 @@ impl<'a> ModelEvaluator<'a> {
         } else if def.is_a("IfcCsgPrimitive3D") {
             self.primitive(id, entity, def)
         } else if def.is_a("IfcManifoldSolidBrep") {
-            attribute(entity, def, "Outer")
-                .and_then(reference)
-                .and_then(|shell| self.shell(&[shell]))
+            self.brep(entity, def)
         } else if def.is_a("IfcShellBasedSurfaceModel") {
             let shells: Vec<u32> = list(attribute(entity, def, "SbsmBoundary"))
                 .iter()
@@ -745,9 +903,8 @@ impl<'a> ModelEvaluator<'a> {
         }
     }
 
-    fn revolved(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
-        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
-        let profiles = self.profiles(profile, 0)?;
+    /// The placement of a revolution, a point on its axis, the axis, and how far it turns.
+    fn revolution(&mut self, entity: &Entity, def: &EntityDef) -> Option<(DMat4, DVec3, DVec3, f64)> {
         let position = attribute(entity, def, "Position")
             .and_then(reference)
             .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
@@ -762,11 +919,13 @@ impl<'a> ModelEvaluator<'a> {
             .unwrap_or(DVec3::Z)
             .try_normalize()?;
         let angle = attribute(entity, def, "Angle").and_then(number)? * self.units.plane_angle;
-        if !(angle > 0.0) {
-            return None;
-        }
+        (angle > 0.0).then_some((position, axis_point, direction, angle.min(std::f64::consts::TAU)))
+    }
 
-        let angle = angle.min(std::f64::consts::TAU);
+    fn revolved(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let (position, axis_point, direction, angle) = self.revolution(entity, def)?;
         let parts = profiles.into_iter().map(|profile| {
             let profile = wound(profile);
             let mut rings: Vec<&[DVec2]> = vec![&profile.outer];
@@ -775,6 +934,85 @@ impl<'a> ModelEvaluator<'a> {
             solids::revolve(&rings, &caps, axis_point, direction, angle)
         });
         Some(transformed(merged(parts), position))
+    }
+
+    /// Start and end sections of a tapered sweep. Unmatched ones sweep the start unchanged.
+    fn taper(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<(Profile, Profile)>> {
+        let start = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let start = self.profiles(start, 0)?;
+        let end = attribute(entity, def, "EndSweptArea").and_then(reference);
+        let end = end.and_then(|id| self.profiles(id, 0));
+        let pairs = end.and_then(|end| section_pairs(&start, &end));
+        if pairs.is_none() {
+            self.warn("taper-ignored", "end section does not match the start".into());
+        }
+        pairs.or_else(|| section_pairs(&start, &start))
+    }
+
+    fn tapered_extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let (offset, position) = self.extrusion_path(entity, def)?;
+        let pairs = self.taper(entity, def)?;
+        let mut parts = Vec::with_capacity(pairs.len());
+        for (start, end) in &pairs {
+            // Flat walls are exact. Twisted ones are ruled surfaces, so follow them in steps.
+            let steps = if flat_walls(start, end, offset) { 1 } else { RULED_STEPS };
+            let sections: Vec<Section> = (0..=steps)
+                .map(|step| {
+                    let share = step as f64 / steps as f64;
+                    blended(start, end, share, |point| point.extend(0.0) + offset * share)
+                })
+                .collect();
+            parts.push(loft(&sections)?);
+        }
+        Some(transformed(merged(parts.into_iter()), position))
+    }
+
+    fn tapered_revolution(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let (position, axis_point, axis, angle) = self.revolution(entity, def)?;
+        let pairs = self.taper(entity, def)?;
+        let step_angle = std::f64::consts::TAU / solids::CIRCLE_SEGMENTS as f64;
+        let steps = ((angle / step_angle).ceil() as usize).max(1);
+        let mut parts = Vec::with_capacity(pairs.len());
+        for (start, end) in &pairs {
+            let sections: Vec<Section> = (0..=steps)
+                .map(|step| {
+                    let share = step as f64 / steps as f64;
+                    blended(start, end, share, |point| {
+                        solids::turned(point.extend(0.0), axis_point, axis, angle * share)
+                    })
+                })
+                .collect();
+            parts.push(loft(&sections)?);
+        }
+        Some(transformed(merged(parts.into_iter()), position))
+    }
+
+    /// Voids are shells too. Their normals should point into the void, but files differ.
+    fn brep(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let outer = attribute(entity, def, "Outer").and_then(reference)?;
+        let outer = self.shell(&[outer])?;
+        let voids: Vec<u32> = list(attribute(entity, def, "Voids")).iter().filter_map(reference).collect();
+        if voids.is_empty() {
+            return Some(outer);
+        }
+        let mut parts = vec![solids::outward(outer)];
+        for void in voids {
+            if let Some(mut mesh) = self.shell(&[void]) {
+                if mesh.volume() > 0.0 {
+                    mesh.triangles.iter_mut().for_each(|triangle| triangle.swap(1, 2));
+                }
+                parts.push(mesh);
+            }
+        }
+        Some(merged(parts.into_iter()))
+    }
+
+    /// Whether a directrix is a polyline, the one curve whose parameters are simple to apply.
+    fn is_polyline(&self, id: u32) -> bool {
+        self.lookup(id).is_some_and(|(curve, def)| {
+            def.is_a("IfcPolyline")
+                || (def.is_a("IfcIndexedPolyCurve") && attribute(&curve, &def, "Segments").is_none())
+        })
     }
 
     fn swept_disk(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
@@ -788,12 +1026,25 @@ impl<'a> ModelEvaluator<'a> {
         if !(radius > 0.0) {
             return None;
         }
-        let trimmed = |name: &str| attribute(entity, def, name).and_then(number).is_some();
-        if trimmed("StartParam") || trimmed("EndParam") {
-            self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
-        }
         let mut path = self.curve_path(directrix, 0)?;
+        let bound = |name: &str| attribute(entity, def, name).and_then(number);
+        let (start, end) = (bound("StartParam"), bound("EndParam"));
+        if start.is_some() || end.is_some() {
+            let last = path.len().saturating_sub(1) as f64;
+            let (from, to) = (start.unwrap_or(0.0).clamp(0.0, last), end.unwrap_or(last).clamp(0.0, last));
+            // Exactly 0 to 1 over many segments may mean the whole curve. Too much bar beats
+            // a missing one, as with booleans.
+            let ambiguous = last > 1.0 && from == 0.0 && to == 1.0;
+            if self.is_polyline(directrix) && to > from && !ambiguous {
+                path = polyline_between(&path, from, to);
+            } else {
+                self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
+            }
+        }
         path.dedup_by(|a, b| a.distance_squared(*b) <= POINT_TOLERANCE * POINT_TOLERANCE);
+        if let Some(fillet) = attribute(entity, def, "FilletRadius").and_then(number) {
+            path = solids::filleted(&path, fillet * scale);
+        }
         (path.len() >= 2).then(|| solids::pipe(&path, radius, inner))
     }
 
@@ -1427,9 +1678,8 @@ impl<'a> ModelEvaluator<'a> {
             .collect()
     }
 
-    fn extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
-        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
-        let profiles = self.profiles(profile, 0)?;
+    /// What an extrusion moves its section by, and where it stands.
+    fn extrusion_path(&mut self, entity: &Entity, def: &EntityDef) -> Option<(DVec3, DMat4)> {
         let depth = attribute(entity, def, "Depth").and_then(number)? * self.units.length;
         let direction = attribute(entity, def, "ExtrudedDirection")
             .and_then(reference)
@@ -1438,7 +1688,14 @@ impl<'a> ModelEvaluator<'a> {
         let position = attribute(entity, def, "Position")
             .and_then(reference)
             .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
-        let parts = profiles.into_iter().map(|profile| prism(profile, direction * depth));
+        Some((direction * depth, position))
+    }
+
+    fn extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let (offset, position) = self.extrusion_path(entity, def)?;
+        let parts = profiles.into_iter().map(|profile| prism(profile, offset));
         Some(transformed(merged(parts), position))
     }
 

@@ -595,6 +595,184 @@ fn cyclic_operands_and_curves_end_with_a_diagnostic() {
     assert!(evaluator.diagnostics().iter().any(|item| item.code == "nesting-too-deep"));
 }
 
+const SQUARE_TAPER: &str = "#6=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,2.,2.);\n\
+    #7=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,1.,1.);\n";
+
+#[test]
+fn tapered_extrusion_narrows_to_its_end_section() {
+    let body = format!("{SQUARE_TAPER}#5=IFCEXTRUDEDAREASOLIDTAPERED(#6,#903,#901,3.,#7);\n");
+    let mesh = evaluate(&body);
+    // A frustum: h/3 (A1 + A2 + sqrt(A1 A2)).
+    close(mesh.volume(), 7.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+    let top: Vec<_> = mesh.positions.iter().filter(|point| point.z > 2.9).collect();
+    assert!(!top.is_empty() && top.iter().all(|point| point.x.abs() <= 0.5 + 1e-9));
+    assert!(mesh.positions.iter().any(|point| point.x > 0.9));
+}
+
+#[test]
+fn tapered_extrusion_may_lean() {
+    let body = format!(
+        "{SQUARE_TAPER}#8=IFCDIRECTION((0.6,0.,0.8));\n#5=IFCEXTRUDEDAREASOLIDTAPERED(#6,#903,#8,5.,#7);\n"
+    );
+    let mesh = evaluate(&body);
+    // A depth of 5 along this direction rises 4 and moves 3 sideways.
+    close(mesh.volume(), 4.0 / 3.0 * 7.0, 1e-9);
+    let top: Vec<_> = mesh.positions.iter().filter(|point| point.z > 3.9).collect();
+    assert!(top.iter().all(|point| (point.x - 3.0).abs() <= 0.5 + 1e-9));
+}
+
+#[test]
+fn tapered_extrusion_with_twisted_walls_follows_the_ruled_surface() {
+    let body = "#6=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,4.,1.);\n\
+        #7=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,1.,4.);\n\
+        #5=IFCEXTRUDEDAREASOLIDTAPERED(#6,#903,#901,2.,#7);\n";
+    let mesh = evaluate(body);
+    // The prismoidal formula: h/6 (A1 + 4 Am + A2), with a 2.5 by 2.5 mid-section.
+    close(mesh.volume(), 11.0, 0.05);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn tapered_extrusion_keeps_holes() {
+    let body = "#6=IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,$,#905,2.,2.,0.5,$,$);\n\
+        #7=IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,$,#905,1.,1.,0.25,$,$);\n\
+        #5=IFCEXTRUDEDAREASOLIDTAPERED(#6,#903,#901,3.,#7);\n";
+    let mesh = evaluate(body);
+    close(mesh.volume(), 7.0 - 7.0 / 4.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn tapered_extrusion_between_different_outlines_is_still_closed() {
+    let body = "#6=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,2.,2.);\n\
+        #7=IFCCIRCLEPROFILEDEF(.AREA.,$,#905,1.);\n\
+        #5=IFCEXTRUDEDAREASOLIDTAPERED(#6,#903,#901,3.,#7);\n";
+    let mesh = evaluate(body);
+    assert_eq!(mesh.open_edges(), 0);
+    assert!(mesh.volume() > 3.0 * faceted_circle_area(1.0) && mesh.volume() < 12.0);
+    let top = mesh.positions.iter().filter(|point| point.z > 2.9);
+    top.for_each(|point| close(point.x.hypot(point.y), 1.0, 1e-9));
+}
+
+#[test]
+fn tapered_extrusion_with_unmatched_sections_says_so() {
+    let body = "#6=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,2.,2.);\n\
+        #7=IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,$,#905,1.,1.,0.25,$,$);\n\
+        #5=IFCEXTRUDEDAREASOLIDTAPERED(#6,#903,#901,3.,#7);\n";
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let element = evaluator.evaluate(2).unwrap();
+    close(element.meshes[0].mesh.volume(), 12.0, 1e-9);
+    assert!(evaluator.diagnostics().iter().any(|item| item.code == "taper-ignored"));
+}
+
+#[test]
+fn tapered_revolution_changes_section_along_the_turn() {
+    // Sections centred 3 m from the Y axis, 0.8 wide at the start and 0.4 at the end.
+    let body = "#6=IFCCARTESIANPOINT((3.,0.));\n#7=IFCAXIS2PLACEMENT2D(#6,$);\n\
+        #8=IFCRECTANGLEPROFILEDEF(.AREA.,$,#7,0.8,1.);\n\
+        #9=IFCRECTANGLEPROFILEDEF(.AREA.,$,#7,0.4,1.);\n\
+        #10=IFCDIRECTION((0.,1.,0.));\n#11=IFCAXIS1PLACEMENT(#900,#10);\n\
+        #5=IFCREVOLVEDAREASOLIDTAPERED(#8,#903,#11,1.570796326794897,#9);\n";
+    let mesh = evaluate(body);
+    // Pappus: the centroid stays at 3 m and the mean area is 0.6.
+    close(mesh.volume(), 3.0 * 0.6 * PI / 2.0, 0.02);
+    assert_eq!(mesh.open_edges(), 0);
+    // A positive turn about +Y carries +X to -Z, where the end section is the narrow one.
+    let (min, _) = bounds(&mesh);
+    close(min.z, -3.2, 1e-9);
+    let (_, max) = bounds(&mesh);
+    close(max.x, 3.4, 1e-9);
+}
+
+/// A closed shell of six quads around a box, wound outwards or inwards.
+fn box_shell(first: u32, low: f64, high: f64, outwards: bool) -> String {
+    let corner = |x: bool, y: bool, z: bool| {
+        let value = |high_side: bool| if high_side { high } else { low };
+        format!("({:?},{:?},{:?})", value(x), value(y), value(z))
+    };
+    let mut text = String::new();
+    for (index, (x, y, z)) in (0..8).map(|bits| (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0)).enumerate() {
+        text += &format!("#{}=IFCCARTESIANPOINT({});\n", first + index as u32, corner(x, y, z));
+    }
+    let quads = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+    let mut faces = Vec::new();
+    for (index, quad) in quads.iter().enumerate() {
+        let id = first + 10 + index as u32 * 3;
+        let mut points: Vec<String> = quad.iter().map(|corner| format!("#{}", first + corner)).collect();
+        if !outwards {
+            points.reverse();
+        }
+        text += &format!("#{id}=IFCPOLYLOOP(({}));\n", points.join(","));
+        text += &format!("#{}=IFCFACEOUTERBOUND(#{id},.T.);\n", id + 1);
+        text += &format!("#{}=IFCFACE((#{}));\n", id + 2, id + 1);
+        faces.push(format!("#{}", id + 2));
+    }
+    text + &format!("#{}=IFCCLOSEDSHELL(({}));\n", first + 40, faces.join(","))
+}
+
+#[test]
+fn voids_are_taken_out_of_a_brep_however_their_shell_is_wound() {
+    for inwards_as_specified in [true, false] {
+        let body = format!(
+            "{}{}#5=IFCFACETEDBREPWITHVOIDS(#1040,(#2040));\n",
+            box_shell(1000, 0.0, 2.0, true),
+            box_shell(2000, 0.5, 1.5, !inwards_as_specified),
+        );
+        let mesh = evaluate(&body);
+        close(mesh.volume(), 7.0, 1e-9);
+        assert_eq!(mesh.open_edges(), 0);
+    }
+}
+
+#[test]
+fn swept_disk_runs_between_its_parameters_on_a_polyline() {
+    let body = "#6=IFCCARTESIANPOINT((10.,0.,0.));\n#7=IFCCARTESIANPOINT((10.,10.,0.));\n\
+        #8=IFCPOLYLINE((#900,#6,#7));\n#5=IFCSWEPTDISKSOLID(#8,0.5,$,0.5,1.5);\n";
+    let mesh = evaluate(body);
+    let (min, max) = bounds(&mesh);
+    close(min.x, 5.0, 1e-9);
+    close(max.y, 5.0, 1e-9);
+}
+
+#[test]
+fn swept_disk_keeps_the_whole_bar_when_its_parameters_are_ambiguous() {
+    let body = "#6=IFCCARTESIANPOINT((10.,0.,0.));\n#7=IFCCARTESIANPOINT((10.,10.,0.));\n\
+        #8=IFCPOLYLINE((#900,#6,#7));\n#5=IFCSWEPTDISKSOLID(#8,0.5,$,0.,1.);\n";
+    let mesh = evaluate_with(body, true);
+    close(bounds(&mesh).1.y, 10.0, 1e-9);
+}
+
+#[test]
+fn swept_disk_on_a_curve_without_simple_parameters_says_it_ignored_them() {
+    let body = "#6=IFCCIRCLE(#905,5.);\n#5=IFCSWEPTDISKSOLID(#6,0.5,$,0.,1.);\n";
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    evaluator.evaluate(2).unwrap();
+    assert!(evaluator.diagnostics().iter().any(|item| item.code == "sweep-trim-ignored"));
+}
+
+#[test]
+fn polygonal_swept_disk_rounds_its_corners() {
+    let body = "#6=IFCCARTESIANPOINT((10.,0.,0.));\n#7=IFCCARTESIANPOINT((10.,10.,0.));\n\
+        #8=IFCPOLYLINE((#900,#6,#7));\n#5=IFCSWEPTDISKSOLIDPOLYGONAL(#8,0.5,$,$,$,2.);\n";
+    let mesh = evaluate(body);
+    assert_eq!(mesh.open_edges(), 0);
+    // A sharp mitre would reach this corner of the outside of the bend.
+    let corner = DVec3::new(10.5, -0.5, 0.0);
+    assert!(mesh.positions.iter().all(|point| point.distance(corner) > 0.5));
+    // Two 8 m legs and a quarter circle of 2 m radius, around a twelve-sided disk.
+    let dodecagon = 3.0 * 0.5 * 0.5;
+    close(mesh.volume(), dodecagon * (16.0 + PI), 0.05);
+}
+
 /// Reports what each fixture still lacks, and pins the ones this work made complete.
 #[test]
 fn fixtures_that_use_these_solids_now_evaluate() {
