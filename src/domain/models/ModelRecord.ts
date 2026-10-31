@@ -34,7 +34,6 @@ export interface ModelRecord {
   coordinateReference?: CoordinateReference;
   errorMessage?: string;
   bounds?: ModelBounds;
-  originalBytes?: Uint8Array;
 }
 
 export interface ElementRef {
@@ -44,6 +43,14 @@ export interface ElementRef {
 }
 
 export type PropertyScalar = string | number | boolean | null;
+
+/** JSON-safe encoding of one EXPRESS attribute value. */
+export type AttributeValue =
+  | PropertyScalar
+  | { ref: number }
+  | { enum: string }
+  | { type: string; value: AttributeValue }
+  | AttributeValue[];
 
 export type PropertyValue =
   | { kind: 'single'; value: PropertyScalar }
@@ -109,7 +116,7 @@ export interface SelectedElementDetails {
   globalId?: string;
   type: string;
   name?: string;
-  attributes: Record<string, any>;
+  attributes: Record<string, AttributeValue>;
   propertySets: PropertySetItem[];
   typeObject?: TypeObjectRef;
   materials?: MaterialInfo[];

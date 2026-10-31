@@ -1,18 +1,24 @@
 import React, { useEffect, useRef, useState, type DragEvent } from 'react';
-import { bimEngine } from '../../infrastructure/ifclite/BimEngine';
 import { RefreshCw, Box, Compass, Eye, UploadCloud } from 'lucide-react';
-import type { ModelId } from '../../domain/models/ModelRecord';
+import type { ElementRef } from '../../domain/models/ModelRecord';
+import type { RendererPort } from '../../domain/kernel/RendererPort';
 
 interface BimViewerProps {
+  renderer: RendererPort;
   onOpenFile: (file: File) => void;
-  onSelectElement: (modelId: ModelId | null, expressId: number | null) => void;
+  onSelectElement: (ref: ElementRef | null) => void;
+  onHoverElement?: (ref: ElementRef | null) => void;
+  onInitError?: (message: string | null) => void;
   statusText: string;
   isWorking: boolean;
 }
 
 export const BimViewer: React.FC<BimViewerProps> = ({
+  renderer,
   onOpenFile,
   onSelectElement,
+  onHoverElement,
+  onInitError,
   statusText,
   isWorking
 }) => {
@@ -21,23 +27,32 @@ export const BimViewer: React.FC<BimViewerProps> = ({
   const [initError, setInitError] = useState<string | null>(null);
 
   useEffect(() => {
+    renderer.setHandlers({
+      onSelect: (ref) => onSelectElement(ref),
+      onHover: (ref) => onHoverElement?.(ref)
+    });
+  }, [renderer, onSelectElement, onHoverElement]);
+
+  useEffect(() => {
     if (!canvasRef.current) return;
 
-    bimEngine.setHandlers({
-      onSelectElement: (mId, eId) => onSelectElement(mId, eId)
-    });
-
-    bimEngine
+    renderer
       .initialize(canvasRef.current)
+      .then(() => {
+        setInitError(null);
+        onInitError?.(null);
+      })
       .catch((err) => {
-        console.error('Error initializing BimEngine:', err);
-        setInitError(err instanceof Error ? err.message : 'Error al inicializar WebGPU');
+        console.error('Error initializing renderer:', err);
+        const msg = err instanceof Error ? err.message : 'Error al inicializar WebGPU';
+        setInitError(msg);
+        onInitError?.(msg);
       });
 
     return () => {
-      bimEngine.destroy();
+      renderer.destroy();
     };
-  }, []);
+  }, [renderer, onInitError]);
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -70,21 +85,21 @@ export const BimViewer: React.FC<BimViewerProps> = ({
       <div className="viewport-overlay-toolbar">
         <button
           className="btn btn-ghost btn-icon"
-          onClick={() => bimEngine.setViewPreset('iso')}
+          onClick={() => renderer.setViewPreset('iso')}
           title="Vista Isométrica"
         >
           <Box size={15} />
         </button>
         <button
           className="btn btn-ghost btn-icon"
-          onClick={() => bimEngine.setViewPreset('top')}
+          onClick={() => renderer.setViewPreset('top')}
           title="Vista Planta (Superior)"
         >
           <Compass size={15} />
         </button>
         <button
           className="btn btn-ghost btn-icon"
-          onClick={() => bimEngine.setViewPreset('front')}
+          onClick={() => renderer.setViewPreset('front')}
           title="Vista Frontal"
         >
           <Eye size={15} />
@@ -92,7 +107,7 @@ export const BimViewer: React.FC<BimViewerProps> = ({
         <div style={{ width: '1px', height: '16px', background: 'rgba(255,255,255,0.1)' }} />
         <button
           className="btn btn-ghost btn-icon"
-          onClick={() => bimEngine.fitToView()}
+          onClick={() => renderer.fitToView()}
           title="Encuadrar modelo"
         >
           <RefreshCw size={14} />

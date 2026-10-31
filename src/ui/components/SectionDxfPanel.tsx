@@ -1,26 +1,56 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Scissors, Download, FileCode, CheckCircle, RefreshCw } from 'lucide-react';
-import type { DrawingCutType, SectionCutOptions } from '../../domain/drawings/DrawingTypes';
-import { ifcDrawingService } from '../../infrastructure/ifclite/IfcDrawingService';
-import { bimEngine } from '../../infrastructure/ifclite/BimEngine';
+import type { DrawingCut, DrawingOptions } from '../../domain/drawings/DrawingTypes';
+import type {
+  ExportedDrawing,
+  GeneratedDrawing,
+  KernelPort
+} from '../../domain/kernel/KernelPort';
 import type { ModelRecord } from '../../domain/models/ModelRecord';
 
 interface SectionDxfPanelProps {
   models: ModelRecord[];
+  kernel: KernelPort;
 }
 
-export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
-  const [cutType, setCutType] = useState<DrawingCutType>('floorplan');
+type CutPreset = 'plan' | 'section-x' | 'section-y';
+
+function downloadExportedDrawing(res: ExportedDrawing): void {
+  const part: BlobPart =
+    typeof res.content === 'string' ? res.content : new Uint8Array(res.content);
+  const blob = new Blob([part], { type: res.mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = res.filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel }) => {
+  const [cutPreset, setCutPreset] = useState<CutPreset>('plan');
   const [position, setPosition] = useState<number>(1.2); // 1.2m typical floor cut
   const [includeHidden, setIncludeHidden] = useState<boolean>(true);
   const [includeHatching, setIncludeHatching] = useState<boolean>(true);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [previewSvg, setPreviewSvg] = useState<string | null>(null);
+  const [currentDrawing, setCurrentDrawing] = useState<GeneratedDrawing | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (currentDrawing) {
+        void kernel.discardDrawing(currentDrawing.drawingId);
+      }
+    };
+  }, [currentDrawing, kernel]);
 
   const handleGenerate = async () => {
-    const meshes = bimEngine.getModelMeshes();
-    if (meshes.length === 0) {
+    const visibleIds = models.filter((m) => m.visible).map((m) => m.id);
+    const modelIds = visibleIds.length > 0 ? visibleIds : models.map((m) => m.id);
+    if (modelIds.length === 0) {
       alert('No hay mallas IFC cargadas para generar el plano 2D.');
       return;
     }
@@ -29,21 +59,31 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
     setStatusMessage('Calculando corte 2D...');
 
     try {
-      const options: SectionCutOptions = {
-        cutType,
-        position,
-        includeHiddenLines: includeHidden,
+      const cut: DrawingCut =
+        cutPreset === 'plan'
+          ? { kind: 'plan', elevation: position }
+          : {
+              kind: 'section',
+              axis: cutPreset === 'section-x' ? 'x' : 'y',
+              position,
+              look: 'positive'
+            };
+
+      const options: DrawingOptions = {
+        cut,
+        frame: { kind: 'project' },
         includeProjection: true,
+        includeHiddenLines: includeHidden,
+        includeHatching,
         includeEdges: true,
         mergeLines: true
       };
 
-      const drawing = await ifcDrawingService.generateDrawing(meshes, options, (stage, pct) => {
+      const generated = await kernel.generateDrawing(modelIds, options, (stage, pct) => {
         setStatusMessage(`${stage} (${pct}%)`);
       });
 
-      // Generate SVG preview
-      const svgRes = ifcDrawingService.exportDrawing(drawing, {
+      const svgRes = await kernel.exportDrawing(generated.drawingId, {
         format: 'svg',
         fileName: 'preview',
         units: 'm',
@@ -51,7 +91,13 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
         showHatching: includeHatching
       });
 
-      setPreviewSvg(svgRes.content);
+      const svgText =
+        typeof svgRes.content === 'string'
+          ? svgRes.content
+          : new TextDecoder().decode(svgRes.content);
+
+      setCurrentDrawing(generated);
+      setPreviewSvg(svgText);
       setStatusMessage('Plano 2D generado correctamente.');
     } catch (err) {
       console.error(err);
@@ -61,23 +107,26 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
     }
   };
 
-  const handleExport = (format: 'dxf' | 'svg') => {
+  const handleExport = async (format: 'dxf' | 'svg') => {
+    if (!currentDrawing) {
+      alert('No hay ningún dibujo 2D generado para exportar.');
+      return;
+    }
     try {
       const activeModel = models[0];
-      const crs = activeModel?.coordinateReference?.crsId;
       const baseName = activeModel ? activeModel.fileName.replace(/\.ifc$/i, '') : 'plano-ifc';
-      const fileName = `${baseName}-${cutType}`;
+      const fileName = `${baseName}-${cutPreset}`;
 
-      const res = ifcDrawingService.exportDrawing(null, {
+      const res = await kernel.exportDrawing(currentDrawing.drawingId, {
         format,
         fileName,
-        crsComment: crs,
+        crsComment: currentDrawing.crsId,
         units: 'm',
         showHiddenLines: includeHidden,
         showHatching: includeHatching
       });
 
-      ifcDrawingService.downloadFile(res.content, res.mimeType, res.filename);
+      downloadExportedDrawing(res);
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Error al exportar');
     }
@@ -92,12 +141,12 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
         <select
           className="select"
           style={{ width: '100%' }}
-          value={cutType}
-          onChange={(e) => setCutType(e.target.value as DrawingCutType)}
+          value={cutPreset}
+          onChange={(e) => setCutPreset(e.target.value as CutPreset)}
         >
-          <option value="floorplan">Planta arquitectónica a cota (Z horizontal)</option>
-          <option value="section-x">Sección vertical (Plano X)</option>
-          <option value="section-z">Sección transversal (Plano Z)</option>
+          <option value="plan">Planta arquitectónica a cota (Z horizontal)</option>
+          <option value="section-x">Sección vertical (Eje X)</option>
+          <option value="section-y">Sección transversal (Eje Y)</option>
         </select>
       </div>
 
@@ -141,7 +190,7 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
         className="btn btn-primary"
         style={{ width: '100%', justifyContent: 'center', padding: '8px' }}
         disabled={isGenerating || models.length === 0}
-        onClick={handleGenerate}
+        onClick={() => void handleGenerate()}
       >
         {isGenerating ? <RefreshCw size={15} className="spin" /> : <Scissors size={15} />}
         <span>{isGenerating ? 'Generando plano...' : 'Generar plano 2D'}</span>
@@ -192,7 +241,7 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
             <button
               className="btn btn-secondary"
               style={{ flex: 1, justifyContent: 'center' }}
-              onClick={() => handleExport('dxf')}
+              onClick={() => void handleExport('dxf')}
             >
               <Download size={14} />
               <span>Exportar DXF (R12)</span>
@@ -200,7 +249,7 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models }) => {
             <button
               className="btn btn-secondary"
               style={{ flex: 1, justifyContent: 'center' }}
-              onClick={() => handleExport('svg')}
+              onClick={() => void handleExport('svg')}
             >
               <FileCode size={14} />
               <span>Exportar SVG</span>

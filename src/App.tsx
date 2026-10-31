@@ -8,21 +8,27 @@ import { GisMapPanel } from './ui/components/GisMapPanel';
 import { BimViewer } from './ui/viewer/BimViewer';
 
 import type {
-  ModelRecord,
+  ElementRef,
+  ModelBounds,
   ModelId,
+  ModelRecord,
   SelectedElementDetails
 } from './domain/models/ModelRecord';
-import { ifcParserService } from './infrastructure/ifclite/IfcParserService';
-import { bimEngine } from './infrastructure/ifclite/BimEngine';
+import type { SpatialTree } from './domain/kernel/KernelPort';
+import { kernel, renderer } from './infrastructure/composition';
 import { leafletService } from './infrastructure/gis/LeafletService';
 
 import { Layers, FolderTree, Sliders, Scissors } from 'lucide-react';
 
 export default function App() {
   const [models, setModels] = useState<ModelRecord[]>([]);
+  const [spatialTrees, setSpatialTrees] = useState<Record<ModelId, SpatialTree>>({});
+  const [selectedRef, setSelectedRef] = useState<ElementRef | null>(null);
+  const [, setHoveredRef] = useState<ElementRef | null>(null);
   const [selectedElement, setSelectedElement] = useState<SelectedElementDetails | null>(null);
   const [statusText, setStatusText] = useState<string>('Listo. Abre un archivo IFC para comenzar.');
   const [isWorking, setIsWorking] = useState<boolean>(false);
+  const [rendererError, setRendererError] = useState<string | null>(null);
 
   // Tab state
   const [leftTab, setLeftTab] = useState<'models' | 'tree'>('models');
@@ -37,37 +43,51 @@ export default function App() {
       setStatusText(`Cargando ${fileInput.name}...`);
 
       try {
-        // 1. Parse IFC columnar store and metadata
-        const { modelRecord } = await ifcParserService.parseModel(
-          modelId,
-          fileInput,
-          (phase, pct) => {
-            setStatusText(`${phase} (${pct}%)`);
-          }
-        );
+        const buffer = await fileInput.arrayBuffer();
 
-        // 2. Stream geometry to WebGPU renderer
+        // 1. Open model in kernel
+        const summary = await kernel.openModel(modelId, buffer, (phase, pct) => {
+          setStatusText(`${phase} (${pct}%)`);
+        });
+
+        // 2. Stream geometry from kernel to renderer
         setStatusText('Procesando geometría 3D en WebGPU...');
-        const bytes = modelRecord.originalBytes!;
-        const { meshCount, bounds } = await bimEngine.loadModelGeometry(
-          modelId,
-          bytes,
-          (loadedMeshes) => {
-            setStatusText(`Cargadas ${loadedMeshes} mallas 3D...`);
-          }
-        );
+        renderer.addModel(modelId);
 
+        let meshCount = 0;
+        let bounds: ModelBounds | undefined;
+
+        for await (const event of kernel.streamGeometry(modelId)) {
+          if (event.type === 'batch') {
+            renderer.addBatch(event.batch);
+          } else if (event.type === 'progress') {
+            setStatusText(`Cargadas ${event.processedElements} mallas 3D...`);
+          } else if (event.type === 'complete') {
+            meshCount = event.meshCount;
+            bounds = event.bounds;
+          }
+        }
+
+        renderer.finishModel(modelId, bounds);
+
+        // 3. Load spatial tree for the model
+        const tree = await kernel.getSpatialTree(modelId);
+        if (tree) {
+          setSpatialTrees((prev) => ({ ...prev, [modelId]: tree }));
+        }
+
+        const units: 'm' | 'mm' = summary.lengthUnitScale < 0.01 ? 'mm' : 'm';
         const newModel: ModelRecord = {
           id: modelId,
           fileName: fileInput.name,
           fileSize: fileInput.size,
-          schema: modelRecord.schema,
+          schema: summary.schemaIdentifier || summary.schema,
           status: 'ready',
           visible: true,
-          units: modelRecord.units || 'm',
-          elementCount: modelRecord.elementCount || 0,
+          units,
+          elementCount: summary.elementCount,
           meshCount,
-          coordinateReference: modelRecord.coordinateReference,
+          coordinateReference: summary.coordinateReference,
           bounds
         };
 
@@ -103,26 +123,24 @@ export default function App() {
     [loadIfcFile]
   );
 
-  // Selection handler
+  // Selection handler keyed by ElementRef
   const handleSelectElement = useCallback(
-    async (modelId: ModelId | null, expressId: number | null) => {
-      bimEngine.setSelectedExpressId(expressId);
+    async (ref: ElementRef | null) => {
+      setSelectedRef(ref);
+      renderer.setSelection(ref);
 
-      if (!modelId || !expressId) {
+      if (!ref) {
         setSelectedElement(null);
         return;
       }
 
-      const model = models.find((m) => m.id === modelId) || models[0];
+      const model = models.find((m) => m.id === ref.modelId) || models[0];
       if (!model) return;
 
-      const details = await ifcParserService.getElementDetails(
-        model.id,
-        model.fileName,
-        expressId
-      );
+      const resolvedRef: ElementRef = { modelId: model.id, expressId: ref.expressId, globalId: ref.globalId };
+      const details = await kernel.getElementDetails(resolvedRef);
 
-      setSelectedElement(details);
+      setSelectedElement(details ? { ...details, modelName: model.fileName } : null);
       setRightTab('props');
     },
     [models]
@@ -134,7 +152,7 @@ export default function App() {
       prev.map((m) => {
         if (m.id === id) {
           const next = !m.visible;
-          bimEngine.setModelVisibility(id, next);
+          renderer.setModelVisibility(id, next);
           return { ...m, visible: next };
         }
         return m;
@@ -144,9 +162,21 @@ export default function App() {
 
   // Remove model
   const handleRemoveModel = useCallback((id: ModelId) => {
-    bimEngine.removeModel(id);
-    ifcParserService.removeStore(id);
+    renderer.removeModel(id);
+    void kernel.closeModel(id);
     setModels((prev) => prev.filter((m) => m.id !== id));
+    setSpatialTrees((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setSelectedRef((prev) => {
+      if (prev?.modelId === id) {
+        renderer.setSelection(null);
+        return null;
+      }
+      return prev;
+    });
     setSelectedElement((prev) => (prev?.modelId === id ? null : prev));
   }, []);
 
@@ -161,16 +191,20 @@ export default function App() {
     }
   }, []);
 
+  const isWebGpuAvailable =
+    !rendererError && typeof navigator !== 'undefined' && 'gpu' in navigator;
+
   return (
     <div className="app-container">
       <Header
         onOpenFile={(file) => void loadIfcFile(file)}
         onLoadSample={handleLoadSample}
-        onSetPreset={(p) => bimEngine.setViewPreset(p)}
-        onFitView={() => bimEngine.fitToView()}
+        onSetPreset={(p) => renderer.setViewPreset(p)}
+        onFitView={() => renderer.fitToView()}
         isGisExpanded={isGisExpanded}
         onToggleGis={() => setIsGisExpanded((prev) => !prev)}
         isWorking={isWorking}
+        isWebGpuAvailable={isWebGpuAvailable}
       />
 
       <div className="workspace">
@@ -204,8 +238,9 @@ export default function App() {
             ) : (
               <SpatialTreePanel
                 models={models}
-                onSelectElement={(mId, eId) => void handleSelectElement(mId, eId)}
-                selectedExpressId={selectedElement?.expressId}
+                spatialTrees={spatialTrees}
+                onSelectElement={(ref) => void handleSelectElement(ref)}
+                selectedRef={selectedRef}
               />
             )}
           </div>
@@ -214,8 +249,11 @@ export default function App() {
         {/* Center Viewport */}
         <main className="viewport-center">
           <BimViewer
+            renderer={renderer}
             onOpenFile={(file) => void loadIfcFile(file)}
-            onSelectElement={(mId, eId) => void handleSelectElement(mId, eId)}
+            onSelectElement={(ref) => void handleSelectElement(ref)}
+            onHoverElement={setHoveredRef}
+            onInitError={setRendererError}
             statusText={statusText}
             isWorking={isWorking}
           />
@@ -252,7 +290,7 @@ export default function App() {
             {rightTab === 'props' ? (
               <PropertiesPanel element={selectedElement} />
             ) : (
-              <SectionDxfPanel models={models} />
+              <SectionDxfPanel models={models} kernel={kernel} />
             )}
           </div>
         </aside>

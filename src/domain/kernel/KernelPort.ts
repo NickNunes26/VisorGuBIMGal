@@ -1,14 +1,16 @@
 import type {
+  AttributeValue,
   CoordinateReference,
   ElementRef,
   MaterialInfo,
   ModelBounds,
   ModelId,
-  PropertyScalar,
   SelectedElementDetails
 } from '../models/ModelRecord';
 import type { DrawingExportConfig, DrawingFrame, DrawingOptions } from '../drawings/DrawingTypes';
 import type { GeometryBatch } from './GeometryBatch';
+
+export type { AttributeValue };
 
 export type Vec3d = readonly [number, number, number];
 
@@ -99,14 +101,6 @@ export interface SpatialTree {
   /** Products with no spatial container, ascending expressId. */
   unassigned: SpatialElement[];
 }
-
-/** JSON-safe encoding of one EXPRESS attribute value. */
-export type AttributeValue =
-  | PropertyScalar
-  | { ref: number }
-  | { enum: string }
-  | { type: string; value: AttributeValue }
-  | AttributeValue[];
 
 export type ElementDetails = Omit<SelectedElementDetails, 'modelName' | 'attributes'> & {
   /** Keyed by EXPRESS attribute name. */
