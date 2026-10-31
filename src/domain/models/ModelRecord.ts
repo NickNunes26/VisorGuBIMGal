@@ -2,11 +2,17 @@ export type ModelId = string;
 
 export interface CoordinateReference {
   crsId?: string;                 // e.g. "EPSG:25829" or "EPSG:3857"
-  source: 'ifc-map-conversion' | 'user-defined' | 'unknown';
-  localToMap?: number[];          // 4x4 column-major, absolute model metres to map coordinates
+  source: 'ifc-map-conversion' | 'ifc-site' | 'user-defined' | 'unknown';
+  localToMap?: number[];          // 4x4 column-major, model metres to map metres. See docs/05 section 2
   verticalDatum?: string;
-  confidence: 'verified' | 'user-supplied' | 'unknown';
-  latLng?: [number, number];      // Approximate geographic anchor [lat, lng]
+  confidence: 'verified' | 'user-supplied' | 'unknown';   // 'verified' needs an exact CRS match
+  latLng?: [number, number];      // Decimal degrees [lat, lng]
+  crsName?: string;               // IfcProjectedCRS fields, as written in the file
+  mapProjection?: string;
+  mapZone?: string;
+  mapUnit?: string;
+  geodeticDatum?: string;
+  trueNorth?: number;             // Degrees, for display only. Already inside localToMap
 }
 
 export interface ModelBounds {
@@ -37,10 +43,42 @@ export interface ElementRef {
   globalId?: string;
 }
 
+export type PropertyScalar = string | number | boolean | null;
+
+export type PropertyValue =
+  | { kind: 'single'; value: PropertyScalar }
+  | { kind: 'enumerated'; values: PropertyScalar[] }
+  | { kind: 'list'; values: PropertyScalar[] }
+  | { kind: 'bounded'; lower?: PropertyScalar; upper?: PropertyScalar; setPoint?: PropertyScalar }
+  | { kind: 'table'; defining: PropertyScalar[]; defined: PropertyScalar[] }
+  | { kind: 'complex'; properties: PropertyItem[] };
+
 export interface PropertyItem {
   name: string;
-  value: string | number | boolean | null;
+  value: PropertyScalar;          // Display value: the raw number, never converted to SI
   type?: string;
+  kind?: 'property' | 'quantity'; // Optional, like `unit` and `structured`, until T-011
+  unit?: string;                  // Effective unit of `value`, when one is known
+  structured?: PropertyValue;
+}
+
+export interface MaterialLayer {
+  name?: string;
+  thickness?: number;             // Metres
+}
+
+export interface MaterialInfo {
+  kind: 'material' | 'layer-set' | 'profile-set' | 'constituent-set' | 'list';
+  name?: string;
+  layers?: MaterialLayer[];
+  source: 'instance' | 'type';    // An instance assignment wins over its type's
+}
+
+export interface TypeObjectRef {
+  expressId: number;
+  type: string;
+  name?: string;
+  globalId?: string;
 }
 
 export interface PropertySetItem {
@@ -58,4 +96,6 @@ export interface SelectedElementDetails {
   name?: string;
   attributes: Record<string, any>;
   propertySets: PropertySetItem[];
+  typeObject?: TypeObjectRef;
+  materials?: MaterialInfo[];
 }

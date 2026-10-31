@@ -27,14 +27,19 @@ export const MeshFlag = {
   HiddenByDefault: 1 << 2
 } as const;
 
+/** Largest vertex distance from a batch origin, in metres. f32 keeps about 0.5 mm here. */
+export const MAX_BATCH_RADIUS = 4096;
+
 /**
  * One transferable block of triangles. Positions are metres, IFC Z-up, as f32 relative to
- * the model's originShift. Indices are zero-based within this batch. An element may own
- * several records: one per colour, for instance.
+ * `origin`. Indices are zero-based within this batch. An element may own several records:
+ * one per colour, for instance.
  */
 export interface GeometryBatch {
   modelId: ModelId;
   sequence: number;
+  /** Absolute model coordinates, as f64. Absolute vertex = origin + position. */
+  origin: readonly [number, number, number];
   positions: Float32Array;
   normals: Float32Array;
   indices: Uint32Array;
@@ -43,7 +48,8 @@ export interface GeometryBatch {
 
 /** Returns the first wire-format violation, or null. For tests and mock data, not hot paths. */
 export function findBatchError(batch: GeometryBatch): string | null {
-  const { positions, normals, indices, meshTable } = batch;
+  const { origin, positions, normals, indices, meshTable } = batch;
+  if (origin.length !== 3 || !origin.every(Number.isFinite)) return 'origin is not three finite numbers';
   if (positions.length % 3 !== 0) return 'positions length is not a multiple of 3';
   if (normals.length !== positions.length) return 'normals length differs from positions length';
   if (indices.length % 3 !== 0) return 'indices length is not a multiple of 3';

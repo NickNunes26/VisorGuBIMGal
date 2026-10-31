@@ -1,21 +1,26 @@
 import type {
   CoordinateReference,
   ElementRef,
+  MaterialInfo,
   ModelBounds,
   ModelId,
+  PropertyScalar,
   SelectedElementDetails
 } from '../models/ModelRecord';
-import type { DrawingExportConfig, DrawingOptions } from '../drawings/DrawingTypes';
+import type { DrawingExportConfig, DrawingFrame, DrawingOptions } from '../drawings/DrawingTypes';
 import type { GeometryBatch } from './GeometryBatch';
 
 export type Vec3d = readonly [number, number, number];
 
 export type ProgressHandler = (phase: string, percent: number) => void;
 
+export type SchemaId = 'IFC2X3' | 'IFC4' | 'IFC4X3';
+
 export interface KernelDiagnostic {
   severity: 'info' | 'warning' | 'error';
   code: string;
   message: string;
+  modelId?: ModelId;
   expressId?: number;
 }
 
@@ -24,6 +29,7 @@ export type KernelErrorCode =
   | 'unsupported-schema'
   | 'out-of-memory'
   | 'model-not-open'
+  | 'drawing-not-found'
   | 'internal';
 
 /** Thrown for failures of a whole operation. Per-element problems are diagnostics instead. */
@@ -40,15 +46,17 @@ export class KernelError extends Error {
 }
 
 export interface ModelSummary {
-  schema: string;
+  schema: SchemaId;
+  /** The FILE_SCHEMA text as written, e.g. 'IFC4X3_ADD2'. */
+  schemaIdentifier: string;
   /** Every entity in the file. */
   entityCount: number;
-  /** IfcProduct instances that can appear in the viewer. */
+  /** IfcProduct instances with a representation, excluding IfcOpeningElement. */
   elementCount: number;
-  /** Metres per file length unit: 0.001 for millimetres. */
+  /** Metres per file length unit, resolved from IfcProject.UnitsInContext. */
   lengthUnitScale: number;
-  /** Subtracted from model coordinates before vertices become f32. See docs/05 section 2. */
-  originShift: Vec3d;
+  /** 'default' means the file declared no length unit and metres were assumed. */
+  lengthUnitSource: 'ifc' | 'default';
   coordinateReference: CoordinateReference;
   diagnostics: KernelDiagnostic[];
 }
@@ -68,6 +76,8 @@ export interface SpatialElement {
   expressId: number;
   type: string;
   name?: string;
+  /** 'references' is IfcRelReferencedInSpatialStructure: the element also appears at its container. */
+  via: 'contains' | 'references';
 }
 
 export interface SpatialNode {
@@ -78,16 +88,45 @@ export interface SpatialNode {
   longName?: string;
   /** Metres, for storeys. */
   elevation?: number;
+  /** Ascending expressId. */
   children: SpatialNode[];
+  /** Ascending expressId. Excludes IfcOpeningElement. */
   elements: SpatialElement[];
 }
 
-export type ElementDetails = Omit<SelectedElementDetails, 'modelName'>;
+export interface SpatialTree {
+  root: SpatialNode;
+  /** Products with no spatial container, ascending expressId. */
+  unassigned: SpatialElement[];
+}
+
+/** JSON-safe encoding of one EXPRESS attribute value. */
+export type AttributeValue =
+  | PropertyScalar
+  | { ref: number }
+  | { enum: string }
+  | { type: string; value: AttributeValue }
+  | AttributeValue[];
+
+export type ElementDetails = Omit<SelectedElementDetails, 'modelName' | 'attributes'> & {
+  /** Keyed by EXPRESS attribute name. */
+  attributes: Record<string, AttributeValue>;
+  materials: MaterialInfo[];
+};
 
 export type DrawingId = string;
 
+export interface GeneratedDrawing {
+  drawingId: DrawingId;
+  frame: DrawingFrame;
+  /** CRS of the drawing, for a 'map' frame. */
+  crsId?: string;
+  diagnostics: KernelDiagnostic[];
+}
+
 export interface ExportedDrawing {
-  content: string;
+  /** SVG is text. DXF is encoded bytes: pass them to Blob as they are. */
+  content: string | Uint8Array;
   mimeType: string;
   filename: string;
 }
@@ -109,19 +148,19 @@ export interface KernelPort {
 
   getElementDetails(ref: ElementRef): Promise<ElementDetails | null>;
 
-  /** The IfcProject root. */
-  getSpatialTree(modelId: ModelId): Promise<SpatialNode | null>;
+  getSpatialTree(modelId: ModelId): Promise<SpatialTree | null>;
 
-  /** Cuts the given models together, in absolute model coordinates. */
+  /** Cuts the given models together in the frame named by `options`. */
   generateDrawing(
     modelIds: readonly ModelId[],
     options: DrawingOptions,
     onProgress?: ProgressHandler
-  ): Promise<DrawingId>;
+  ): Promise<GeneratedDrawing>;
 
-  /** SVG output is safe to inject into the DOM: see docs/05 section 5. */
+  /** Serialises only. SVG output is safe to inject: see docs/05 section 5. */
   exportDrawing(drawingId: DrawingId, config: DrawingExportConfig): Promise<ExportedDrawing>;
 
+  /** Drawings outlive the models they came from until this is called. Idempotent. */
   discardDrawing(drawingId: DrawingId): Promise<void>;
 
   /** Frees everything held for the model. Calling it twice is harmless. */

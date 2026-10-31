@@ -1,6 +1,5 @@
 import type { ElementRef, ModelBounds, ModelId } from '../models/ModelRecord';
 import type { GeometryBatch } from './GeometryBatch';
-import type { Vec3d } from './KernelPort';
 
 export type ViewPreset = 'iso' | 'top' | 'front' | 'side';
 
@@ -18,7 +17,7 @@ export interface RendererPort {
   initialize(canvas: HTMLCanvasElement): Promise<void>;
   setHandlers(handlers: RendererEventHandlers): void;
 
-  addModel(modelId: ModelId, originShift: Vec3d): void;
+  addModel(modelId: ModelId): void;
   addBatch(batch: GeometryBatch): void;
   /** Frames the scene if this is the first visible model. */
   finishModel(modelId: ModelId, bounds: ModelBounds | undefined): void;
