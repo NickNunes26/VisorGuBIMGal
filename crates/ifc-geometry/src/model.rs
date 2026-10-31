@@ -9,11 +9,14 @@ use earcut::Earcut;
 use glam::{DMat4, DVec2, DVec3, DVec4};
 use ifc_schema::units::{ProjectUnits, project_units};
 use ifc_schema::{EntityDef, Schema, SchemaId, schema};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use step_parser::{Entity, StepIndex, Value};
 
 /// Bounds placement chains and nested mapped items, which a hostile file could make cyclic.
 const MAX_DEPTH: usize = 64;
+/// Items one element may expand to. Maps sharing maps can multiply at every level, so the
+/// depth limit alone leaves exponentially many expansions.
+const MAX_ITEMS_PER_ELEMENT: usize = 100_000;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 const CIRCLE_SEGMENTS: usize = 32;
 /// Consecutive profile points closer than this are one point. Metres.
@@ -61,6 +64,7 @@ pub struct ModelEvaluator<'a> {
     diagnostics: Vec<Diagnostic>,
     current: Option<u32>,
     degraded: bool,
+    items_used: usize,
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -179,6 +183,7 @@ impl<'a> ModelEvaluator<'a> {
             diagnostics: Vec::new(),
             current: None,
             degraded: false,
+            items_used: 0,
         };
         evaluator.index_openings();
         evaluator.index_colors();
@@ -230,15 +235,15 @@ impl<'a> ModelEvaluator<'a> {
             let color = list(attribute(&entity, &def, "Styles"))
                 .iter()
                 .filter_map(reference)
-                .find_map(|style| self.style_color(style, 0));
+                .find_map(|style| self.style_color(style, &mut HashSet::new()));
             if let Some(color) = color {
                 self.item_colors.insert(item, color);
             }
         }
     }
 
-    fn style_color(&self, id: u32, depth: usize) -> Option<u32> {
-        if depth >= MAX_DEPTH {
+    fn style_color(&self, id: u32, visited: &mut HashSet<u32>) -> Option<u32> {
+        if !visited.insert(id) {
             return None;
         }
         let (entity, def) = self.lookup(id)?;
@@ -261,7 +266,7 @@ impl<'a> ModelEvaluator<'a> {
             return list(attribute(&entity, &def, "Styles"))
                 .iter()
                 .filter_map(reference)
-                .find_map(|style| self.style_color(style, depth + 1));
+                .find_map(|style| self.style_color(style, visited));
         }
         None
     }
@@ -289,6 +294,7 @@ impl<'a> ModelEvaluator<'a> {
     pub fn evaluate(&mut self, id: u32) -> Option<ElementGeometry> {
         self.current = Some(id);
         self.degraded = false;
+        self.items_used = 0;
         let (entity, def) = self.lookup(id)?;
         let mut meshes = self.product_meshes(&entity, &def);
 
@@ -393,6 +399,13 @@ impl<'a> ModelEvaluator<'a> {
     ) {
         if depth >= MAX_DEPTH {
             self.warn("nesting-too-deep", format!("#{id} is nested too deeply"));
+            return;
+        }
+        self.items_used += 1;
+        if self.items_used > MAX_ITEMS_PER_ELEMENT {
+            if self.items_used == MAX_ITEMS_PER_ELEMENT + 1 {
+                self.warn("too-many-items", "representation expands too far".into());
+            }
             return;
         }
         let Some((entity, def)) = self.lookup(id) else {

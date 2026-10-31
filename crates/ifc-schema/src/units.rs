@@ -59,6 +59,10 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 /// The `(unit type, SI factor)` of a named unit.
+pub fn named_unit(file: &StepIndex<'_>, schema: &'static Schema, id: u32) -> Option<(String, f64)> {
+    resolve_unit(file, schema, id, 0)
+}
+
 fn resolve_unit(
     file: &StepIndex<'_>,
     schema: &'static Schema,

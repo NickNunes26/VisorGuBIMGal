@@ -181,6 +181,38 @@ fn hostile_models_never_panic() {
     }
 }
 
+/// Thirty levels of maps that each map the next twice: 2^30 expansions from 90 entities.
+#[test]
+fn shared_maps_do_not_multiply_the_work() {
+    let mut body = String::from(
+        "#1=IFCWALL('a',$,$,$,$,#2,#3,$,$);\n#2=IFCLOCALPLACEMENT($,$);\n\
+         #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#10));\n#7=IFCAXIS2PLACEMENT3D(#8,$,$);\n\
+         #8=IFCCARTESIANPOINT((0.,0.,0.));\n",
+    );
+    for level in 0..30u32 {
+        let (representation, map) = (10 + level * 4, 11 + level * 4);
+        let (first, second) = (12 + level * 4, 13 + level * 4);
+        let next = representation + 4;
+        body.push_str(&format!(
+            "#{representation}=IFCSHAPEREPRESENTATION($,'Body','MappedRepresentation',(#{first},#{second}));\n\
+             #{first}=IFCMAPPEDITEM(#{map},$);\n#{second}=IFCMAPPEDITEM(#{map},$);\n\
+             #{map}=IFCREPRESENTATIONMAP(#7,#{next});\n"
+        ));
+    }
+    body.push_str(
+        "#130=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#131));\n\
+         #131=IFCTRIANGULATEDFACESET(#132,$,$,((1,2,3)),$);\n\
+         #132=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n",
+    );
+    let text =
+        format!("ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{body}ENDSEC;END-ISO-10303-21;");
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let element = evaluator.evaluate(1).unwrap();
+    assert!(element.degraded);
+    assert!(evaluator.diagnostics().iter().any(|item| item.code == "too-many-items"));
+}
+
 /// Coverage over every real file. Never panics, and reports what is not evaluated yet.
 #[test]
 fn every_file_evaluates_without_panicking() {
