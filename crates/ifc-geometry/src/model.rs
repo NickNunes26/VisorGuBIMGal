@@ -3,8 +3,9 @@
 //! Every failure is local to its element (R8): what cannot be evaluated becomes a
 //! [`Diagnostic`], and the rest of the model carries on.
 
-use crate::csg::subtract_all;
+use crate::csg::{intersect, subtract, subtract_all, union};
 use crate::mesh::Mesh;
+use crate::solids;
 use earcut::Earcut;
 use glam::{DMat4, DVec2, DVec3, DVec4};
 use ifc_schema::units::{ProjectUnits, project_units};
@@ -17,8 +18,9 @@ const MAX_DEPTH: usize = 64;
 /// Items one element may expand to. Maps sharing maps can multiply at every level, so the
 /// depth limit alone leaves exponentially many expansions.
 const MAX_ITEMS_PER_ELEMENT: usize = 100_000;
+/// Booleans one element may evaluate. Each costs far more than a plain item.
+const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
-const CIRCLE_SEGMENTS: usize = 32;
 /// Consecutive profile points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
 
@@ -65,6 +67,7 @@ pub struct ModelEvaluator<'a> {
     current: Option<u32>,
     degraded: bool,
     items_used: usize,
+    booleans_used: usize,
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -139,6 +142,95 @@ fn triangulate_rings(rings: &[&[DVec2]]) -> Vec<[u32; 3]> {
         .collect()
 }
 
+/// Separate solids sharing one mesh.
+fn merged(parts: impl Iterator<Item = Mesh>) -> Mesh {
+    let mut all = Mesh::default();
+    for mesh in parts {
+        let first = all.positions.len() as u32;
+        all.positions.extend(mesh.positions);
+        all.triangles.extend(mesh.triangles.iter().map(|triangle| triangle.map(|id| id + first)));
+    }
+    all
+}
+
+/// Whether a logical is `.T.` or `.F.`. Absent or unknown gives `None`.
+fn flag(value: Option<&Value>) -> Option<bool> {
+    match value {
+        Some(Value::Enum(flag)) if flag == "T" => Some(true),
+        Some(Value::Enum(flag)) if flag == "F" => Some(false),
+        _ => None,
+    }
+}
+
+/// Appends a curve segment, dropping the joint it shares with what came before.
+fn join(path: &mut Vec<DVec3>, part: Vec<DVec3>) {
+    let shared = match (path.last(), part.first()) {
+        (Some(last), Some(first)) => last.distance_squared(*first) <= POINT_TOLERANCE * POINT_TOLERANCE,
+        _ => false,
+    };
+    path.extend(part.into_iter().skip(shared as usize));
+}
+
+fn on_conic(frame: DMat4, radii: DVec2, start: f64, sweep: f64) -> Vec<DVec3> {
+    solids::arc(DVec2::ZERO, radii, start, sweep)
+        .into_iter()
+        .map(|point| frame.transform_point3(point.extend(0.0)))
+        .collect()
+}
+
+/// Outer ring counter-clockwise, holes clockwise.
+fn wound(mut profile: Profile) -> Profile {
+    if ring_area(&profile.outer) < 0.0 {
+        profile.outer.reverse();
+    }
+    for hole in &mut profile.holes {
+        if ring_area(hole) > 0.0 {
+            hole.reverse();
+        }
+    }
+    profile
+}
+
+/// Extrudes a profile along `offset`, which must not lie in the profile's plane.
+fn prism(profile: Profile, offset: DVec3) -> Mesh {
+    let Profile { outer, holes } = wound(profile);
+    let mut rings: Vec<&[DVec2]> = vec![&outer];
+    rings.extend(holes.iter().map(Vec::as_slice));
+    let caps = triangulate_rings(&rings);
+
+    let count = rings.iter().map(|ring| ring.len()).sum::<usize>() as u32;
+    let mut positions = Vec::with_capacity(count as usize * 2);
+    for shift in [DVec3::ZERO, offset] {
+        for ring in &rings {
+            positions.extend(ring.iter().map(|point| point.extend(0.0) + shift));
+        }
+    }
+
+    let mut triangles = Vec::with_capacity(caps.len() * 2 + count as usize * 2);
+    for [a, b, c] in caps {
+        triangles.push([a, c, b]);
+        triangles.push([a + count, b + count, c + count]);
+    }
+    let mut start = 0u32;
+    for ring in &rings {
+        let length = ring.len() as u32;
+        for i in 0..length {
+            let (a, b) = (start + i, start + (i + 1) % length);
+            triangles.push([a, b, b + count]);
+            triangles.push([a, b + count, a + count]);
+        }
+        start += length;
+    }
+
+    // Extruding downwards turns the solid inside out.
+    if offset.z < 0.0 {
+        for triangle in &mut triangles {
+            triangle.swap(1, 2);
+        }
+    }
+    Mesh { positions, triangles }
+}
+
 fn transformed(mesh: Mesh, transform: DMat4) -> Mesh {
     let mut result = mesh.map_positions(|point| transform.transform_point3(point));
     if transform.determinant() < 0.0 {
@@ -184,6 +276,7 @@ impl<'a> ModelEvaluator<'a> {
             current: None,
             degraded: false,
             items_used: 0,
+            booleans_used: 0,
         };
         evaluator.index_openings();
         evaluator.index_colors();
@@ -295,6 +388,7 @@ impl<'a> ModelEvaluator<'a> {
         self.current = Some(id);
         self.degraded = false;
         self.items_used = 0;
+        self.booleans_used = 0;
         let (entity, def) = self.lookup(id)?;
         let mut meshes = self.product_meshes(&entity, &def);
 
@@ -412,38 +506,13 @@ impl<'a> ModelEvaluator<'a> {
             self.warn("missing-item", format!("#{id} cannot be read"));
             return;
         };
-        let color = self.item_colors.get(&id).copied().unwrap_or(inherited);
+        let color = self.item_color(id).unwrap_or(inherited);
 
         if def.is_a("IfcMappedItem") {
             self.mapped_item(&entity, &def, transform, color, depth, out);
             return;
         }
-        let local = if def.is_a("IfcExtrudedAreaSolid") {
-            self.extrusion(&entity, &def)
-        } else if def.is_a("IfcFacetedBrep") {
-            attribute(&entity, &def, "Outer")
-                .and_then(reference)
-                .and_then(|shell| self.shell(&[shell]))
-        } else if def.is_a("IfcShellBasedSurfaceModel") {
-            let shells: Vec<u32> = list(attribute(&entity, &def, "SbsmBoundary"))
-                .iter()
-                .filter_map(reference)
-                .collect();
-            self.shell(&shells)
-        } else if def.is_a("IfcFaceBasedSurfaceModel") {
-            let sets: Vec<u32> = list(attribute(&entity, &def, "FbsmFaces"))
-                .iter()
-                .filter_map(reference)
-                .collect();
-            self.shell(&sets)
-        } else if def.is_a("IfcTriangulatedFaceSet") {
-            self.triangulated_face_set(&entity, &def)
-        } else if def.is_a("IfcPolygonalFaceSet") {
-            self.polygonal_face_set(&entity, &def)
-        } else {
-            self.warn("unsupported-geometry", format!("#{id} {}", def.name()));
-            None
-        };
+        let local = self.solid(id, &entity, &def, depth);
 
         if let Some(mesh) = local {
             out.push(ElementMesh {
@@ -451,6 +520,246 @@ impl<'a> ModelEvaluator<'a> {
                 rgba: color,
             });
         }
+    }
+
+    /// Exporters may style a boolean result or only the solid it started from.
+    fn item_color(&self, id: u32) -> Option<u32> {
+        let mut current = id;
+        for _ in 0..MAX_DEPTH {
+            if let Some(color) = self.item_colors.get(&current) {
+                return Some(*color);
+            }
+            let (entity, def) = self.lookup(current)?;
+            let next = attribute(&entity, &def, "FirstOperand")
+                .or_else(|| attribute(&entity, &def, "TreeRootExpression"));
+            current = next.and_then(reference)?;
+        }
+        None
+    }
+
+    /// Local geometry of a representation item, before any placement.
+    fn solid(&mut self, id: u32, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Mesh> {
+        if def.is_a("IfcExtrudedAreaSolid") {
+            self.extrusion(entity, def)
+        } else if def.is_a("IfcBooleanResult") {
+            self.boolean(entity, def, depth)
+        } else if def.is_a("IfcCsgSolid") {
+            let root = attribute(entity, def, "TreeRootExpression").and_then(reference)?;
+            self.operand(root, depth + 1)
+        } else if def.is_a("IfcRevolvedAreaSolid") {
+            self.revolved(entity, def)
+        } else if def.is_a("IfcSweptDiskSolid") {
+            self.swept_disk(entity, def)
+        } else if def.is_a("IfcCsgPrimitive3D") {
+            self.primitive(id, entity, def)
+        } else if def.is_a("IfcFacetedBrep") {
+            attribute(entity, def, "Outer")
+                .and_then(reference)
+                .and_then(|shell| self.shell(&[shell]))
+        } else if def.is_a("IfcShellBasedSurfaceModel") {
+            let shells: Vec<u32> = list(attribute(entity, def, "SbsmBoundary"))
+                .iter()
+                .filter_map(reference)
+                .collect();
+            self.shell(&shells)
+        } else if def.is_a("IfcFaceBasedSurfaceModel") {
+            let sets: Vec<u32> = list(attribute(entity, def, "FbsmFaces"))
+                .iter()
+                .filter_map(reference)
+                .collect();
+            self.shell(&sets)
+        } else if def.is_a("IfcTriangulatedFaceSet") {
+            self.triangulated_face_set(entity, def)
+        } else if def.is_a("IfcPolygonalFaceSet") {
+            self.polygonal_face_set(entity, def)
+        } else {
+            self.warn("unsupported-geometry", format!("#{id} {}", def.name()));
+            None
+        }
+    }
+
+    fn operand(&mut self, id: u32, depth: usize) -> Option<Mesh> {
+        if depth >= MAX_DEPTH {
+            self.warn("nesting-too-deep", format!("#{id} is nested too deeply"));
+            return None;
+        }
+        let (entity, def) = self.lookup(id)?;
+        self.solid(id, &entity, &def, depth)
+    }
+
+    /// A failed boolean leaves the first operand: too much material beats a missing wall.
+    fn boolean(&mut self, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Mesh> {
+        let first = attribute(entity, def, "FirstOperand").and_then(reference)?;
+        let second = attribute(entity, def, "SecondOperand").and_then(reference)?;
+        let first = self.operand(first, depth + 1)?;
+
+        self.booleans_used += 1;
+        if self.booleans_used > MAX_BOOLEANS_PER_ELEMENT {
+            if self.booleans_used == MAX_BOOLEANS_PER_ELEMENT + 1 {
+                self.warn("too-many-booleans", "boolean expression expands too far".into());
+            }
+            return Some(first);
+        }
+
+        let second = match self.lookup(second) {
+            Some((half, half_def)) if half_def.is_a("IfcHalfSpaceSolid") => {
+                self.half_space(&half, &half_def, &first)
+            }
+            _ => self.operand(second, depth + 1),
+        };
+        let Some(second) = second else {
+            self.warn("boolean-failed", "second operand cannot be evaluated".into());
+            return Some(first);
+        };
+        if !is_closed(&first) || !is_closed(&second) {
+            self.warn("boolean-on-open-mesh", "boolean skipped: an operand is not closed".into());
+            return Some(first);
+        }
+
+        let operator = match attribute(entity, def, "Operator") {
+            Some(Value::Enum(operator)) => operator.as_str(),
+            _ => "DIFFERENCE",
+        };
+        let result = match operator {
+            "UNION" => union(&first, &second),
+            "INTERSECTION" => intersect(&first, &second),
+            _ => subtract(&first, &second),
+        };
+        match result {
+            Ok(mesh) => (!mesh.is_empty()).then_some(mesh),
+            Err(error) => {
+                self.warn("boolean-failed", error.to_string());
+                Some(first)
+            }
+        }
+    }
+
+    /// Half spaces are unbounded, so they become a block reaching past everything in `target`.
+    fn half_space(&mut self, entity: &Entity, def: &EntityDef, target: &Mesh) -> Option<Mesh> {
+        let surface = attribute(entity, def, "BaseSurface").and_then(reference)?;
+        let (plane, plane_def) = self.lookup(surface)?;
+        if !plane_def.is_a("IfcPlane") {
+            self.warn("unsupported-surface", format!("#{surface} {}", plane_def.name()));
+            return None;
+        }
+        let frame = attribute(&plane, &plane_def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let origin = frame.w_axis.truncate();
+        let normal = frame.z_axis.truncate();
+        // AgreementFlag is true when the normal points away from the material.
+        let agrees = matches!(attribute(entity, def, "AgreementFlag"), Some(Value::Enum(flag)) if flag == "T");
+        let into = if agrees { -normal } else { normal };
+
+        let reach = |from: DVec3| {
+            let furthest = target.positions.iter().fold(0.0_f64, |most, point| most.max(point.distance(from)));
+            furthest * 2.0 + 1.0
+        };
+        let size = reach(origin);
+        let (x, y) = solids::perpendiculars(into);
+        let placement = DMat4::from_cols(x.extend(0.0), y.extend(0.0), into.extend(0.0), origin.extend(1.0));
+        let block = Mesh::cuboid(DVec3::new(-size, -size, 0.0), DVec3::splat(size));
+        let block = transformed(block, placement);
+        if !def.is_a("IfcPolygonalBoundedHalfSpace") {
+            return Some(block);
+        }
+
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let boundary = attribute(entity, def, "PolygonalBoundary").and_then(reference)?;
+        let outer = clean_ring(self.curve_points(boundary)?);
+        if outer.len() < 3 {
+            return None;
+        }
+        // The plane may tilt, so the prism must also reach the far side of the block.
+        let length = reach(position.w_axis.truncate()) + size * 2.0;
+        let prism_mesh = prism(Profile { outer, holes: Vec::new() }, DVec3::new(0.0, 0.0, length * 2.0));
+        let start = DMat4::from_translation(DVec3::new(0.0, 0.0, -length));
+        let prism_mesh = transformed(prism_mesh, position * start);
+        match intersect(&block, &prism_mesh) {
+            Ok(mesh) => Some(mesh),
+            Err(error) => {
+                self.warn("boolean-failed", error.to_string());
+                None
+            }
+        }
+    }
+
+    fn revolved(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let axis = attribute(entity, def, "Axis").and_then(reference)?;
+        let (axis, axis_def) = self.lookup(axis)?;
+        let axis_point = attribute(&axis, &axis_def, "Location")
+            .and_then(reference)
+            .and_then(|id| self.point(id))?;
+        let direction = attribute(&axis, &axis_def, "Axis")
+            .and_then(reference)
+            .and_then(|id| self.direction(id))
+            .unwrap_or(DVec3::Z)
+            .try_normalize()?;
+        let angle = attribute(entity, def, "Angle").and_then(number)? * self.units.plane_angle;
+        if !(angle > 0.0) {
+            return None;
+        }
+
+        let angle = angle.min(std::f64::consts::TAU);
+        let parts = profiles.into_iter().map(|profile| {
+            let profile = wound(profile);
+            let mut rings: Vec<&[DVec2]> = vec![&profile.outer];
+            rings.extend(profile.holes.iter().map(Vec::as_slice));
+            let caps = triangulate_rings(&rings);
+            solids::revolve(&rings, &caps, axis_point, direction, angle)
+        });
+        Some(transformed(merged(parts), position))
+    }
+
+    fn swept_disk(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let directrix = attribute(entity, def, "Directrix").and_then(reference)?;
+        let scale = self.units.length;
+        let radius = attribute(entity, def, "Radius").and_then(number)? * scale;
+        let inner = attribute(entity, def, "InnerRadius")
+            .and_then(number)
+            .map(|inner| inner * scale)
+            .filter(|inner| *inner > 0.0 && *inner < radius);
+        if !(radius > 0.0) {
+            return None;
+        }
+        let trimmed = |name: &str| attribute(entity, def, name).and_then(number).is_some();
+        if trimmed("StartParam") || trimmed("EndParam") {
+            self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
+        }
+        let mut path = self.curve_path(directrix, 0)?;
+        path.dedup_by(|a, b| a.distance_squared(*b) <= POINT_TOLERANCE * POINT_TOLERANCE);
+        (path.len() >= 2).then(|| solids::pipe(&path, radius, inner))
+    }
+
+    fn primitive(&mut self, id: u32, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let scale = self.units.length;
+        let size = |name: &str| Some(attribute(entity, def, name).and_then(number)? * scale);
+        let mesh = match def.name() {
+            "IfcBlock" => {
+                Mesh::cuboid(DVec3::ZERO, DVec3::new(size("XLength")?, size("YLength")?, size("ZLength")?))
+            }
+            "IfcRectangularPyramid" => {
+                solids::pyramid(size("XLength")?, size("YLength")?, size("Height")?)
+            }
+            "IfcRightCircularCone" => solids::cone(size("BottomRadius")?, size("Height")?),
+            "IfcRightCircularCylinder" => solids::cylinder(size("Radius")?, size("Height")?),
+            "IfcSphere" => solids::sphere(size("Radius")?),
+            other => {
+                self.warn("unsupported-geometry", format!("#{id} {other}"));
+                return None;
+            }
+        };
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        Some(transformed(mesh, position))
     }
 
     /// ISO 10303-43 semantics: moves the mapping origin onto the mapping target.
@@ -590,41 +899,162 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     fn curve_points(&mut self, id: u32) -> Option<Vec<DVec2>> {
+        let path = self.curve_path(id, 0)?;
+        Some(path.into_iter().map(DVec3::truncate).collect())
+    }
+
+    /// A curve as a polyline. Arcs are tessellated, not replaced by their chords.
+    fn curve_path(&mut self, id: u32, depth: usize) -> Option<Vec<DVec3>> {
+        // Composite curves can share segments, so depth alone leaves exponentially many.
+        self.items_used += 1;
+        if depth >= MAX_DEPTH || self.items_used > MAX_ITEMS_PER_ELEMENT {
+            self.warn("nesting-too-deep", format!("#{id} is nested too deeply"));
+            return None;
+        }
         let (entity, def) = self.lookup(id)?;
         if def.is_a("IfcPolyline") {
-            return list(attribute(&entity, &def, "Points"))
+            list(attribute(&entity, &def, "Points"))
                 .iter()
-                .map(|point| {
-                    let point = self.point(reference(point)?)?;
-                    Some(point.truncate())
-                })
-                .collect();
-        }
-        if def.is_a("IfcIndexedPolyCurve") {
-            if attribute(&entity, &def, "Segments").is_some_and(|segments| {
-                list(Some(segments))
-                    .iter()
-                    .any(|segment| matches!(segment, Value::Typed { name, .. } if name == "IFCARCINDEX"))
-            }) {
-                self.warn("arc-approximated", format!("#{id} arcs treated as chords"));
+                .map(|point| self.point(reference(point)?))
+                .collect()
+        } else if def.is_a("IfcIndexedPolyCurve") {
+            self.indexed_curve(&entity, &def)
+        } else if def.is_a("IfcCompositeCurve") {
+            let mut path = Vec::new();
+            for segment in list(attribute(&entity, &def, "Segments")).iter().filter_map(reference) {
+                let (segment, segment_def) = self.lookup(segment)?;
+                let parent = attribute(&segment, &segment_def, "ParentCurve").and_then(reference)?;
+                let mut part = self.curve_path(parent, depth + 1)?;
+                if flag(attribute(&segment, &segment_def, "SameSense")) == Some(false) {
+                    part.reverse();
+                }
+                join(&mut path, part);
             }
-            let points = attribute(&entity, &def, "Points").and_then(reference)?;
-            let (points, points_def) = self.lookup(points)?;
-            return list(attribute(&points, &points_def, "CoordList"))
-                .iter()
-                .map(|pair| {
-                    let pair = list(Some(pair));
-                    let value = |index: usize| pair.get(index).and_then(number);
-                    Some(DVec2::new(value(0)?, value(1)?) * self.units.length)
-                })
-                .collect();
+            Some(path)
+        } else if def.is_a("IfcTrimmedCurve") {
+            self.trimmed_curve(&entity, &def)
+        } else if def.is_a("IfcCircle") || def.is_a("IfcEllipse") {
+            let (frame, radii) = self.conic(&entity, &def)?;
+            Some(on_conic(frame, radii, 0.0, std::f64::consts::TAU))
+        } else {
+            self.warn("unsupported-curve", format!("#{id} {}", def.name()));
+            None
         }
-        self.warn("unsupported-curve", format!("#{id} {}", def.name()));
-        None
+    }
+
+    fn indexed_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let points = attribute(entity, def, "Points").and_then(reference)?;
+        let (points, points_def) = self.lookup(points)?;
+        let scale = self.units.length;
+        let coordinates: Vec<DVec3> = list(attribute(&points, &points_def, "CoordList"))
+            .iter()
+            .map(|point| {
+                let point = list(Some(point));
+                let value = |index: usize| point.get(index).and_then(number);
+                Some(DVec3::new(value(0)?, value(1)?, value(2).unwrap_or(0.0)) * scale)
+            })
+            .collect::<Option<_>>()?;
+
+        let segments = list(attribute(entity, def, "Segments"));
+        if segments.is_empty() {
+            return Some(coordinates);
+        }
+        let mut path = Vec::new();
+        for segment in segments {
+            let Value::Typed { name, value } = segment else { return None };
+            let corners: Vec<DVec3> = list(Some(value))
+                .iter()
+                .map(|index| coordinates.get((number(index)? as usize).checked_sub(1)?).copied())
+                .collect::<Option<_>>()?;
+            match (name.as_str(), corners.as_slice()) {
+                ("IFCARCINDEX", [a, b, c]) => join(&mut path, solids::arc_through(*a, *b, *c)),
+                _ => join(&mut path, corners),
+            }
+        }
+        Some(path)
+    }
+
+    /// The placement of a circle or ellipse, and its semi-axes.
+    fn conic(&mut self, entity: &Entity, def: &EntityDef) -> Option<(DMat4, DVec2)> {
+        let frame = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let scale = self.units.length;
+        let size = |name: &str| Some(attribute(entity, def, name).and_then(number)? * scale);
+        let radii = if def.is_a("IfcEllipse") {
+            DVec2::new(size("SemiAxis1")?, size("SemiAxis2")?)
+        } else {
+            DVec2::splat(size("Radius")?)
+        };
+        Some((frame, radii))
+    }
+
+    fn trimmed_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let basis = attribute(entity, def, "BasisCurve").and_then(reference)?;
+        let (basis, basis_def) = self.lookup(basis)?;
+        let forward = flag(attribute(entity, def, "SenseAgreement")).unwrap_or(true);
+        let by_parameter = !matches!(
+            attribute(entity, def, "MasterRepresentation"),
+            Some(Value::Enum(master)) if master == "CARTESIAN"
+        );
+        let trim1 = list(attribute(entity, def, "Trim1"));
+        let trim2 = list(attribute(entity, def, "Trim2"));
+        let parameter = |trim: &[Value]| {
+            trim.iter().find_map(|value| match value {
+                Value::Typed { name, value } if name == "IFCPARAMETERVALUE" => number(value),
+                _ => None,
+            })
+        };
+        let cartesian = |evaluator: &Self, trim: &[Value]| {
+            trim.iter().filter_map(reference).find_map(|point| evaluator.point(point))
+        };
+
+        if basis_def.is_a("IfcLine") {
+            let start = attribute(&basis, &basis_def, "Pnt").and_then(reference).and_then(|id| self.point(id))?;
+            let vector = attribute(&basis, &basis_def, "Dir").and_then(reference)?;
+            let (vector, vector_def) = self.lookup(vector)?;
+            let orientation = attribute(&vector, &vector_def, "Orientation")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))?
+                .try_normalize()?;
+            let magnitude = attribute(&vector, &vector_def, "Magnitude").and_then(number)?;
+            let step = orientation * magnitude * self.units.length;
+            let end = |evaluator: &Self, trim: &[Value]| {
+                let from_parameter = parameter(trim).map(|value| start + step * value);
+                let from_point = cartesian(evaluator, trim);
+                if by_parameter { from_parameter.or(from_point) } else { from_point.or(from_parameter) }
+            };
+            return Some(vec![end(self, trim1)?, end(self, trim2)?]);
+        }
+
+        if !basis_def.is_a("IfcCircle") && !basis_def.is_a("IfcEllipse") {
+            self.warn("unsupported-curve", format!("trimmed {}", basis_def.name()));
+            return None;
+        }
+        let (frame, radii) = self.conic(&basis, &basis_def)?;
+        let inverse = frame.inverse();
+        let angle_scale = self.units.plane_angle;
+        let angle = |evaluator: &Self, trim: &[Value]| {
+            let from_parameter = parameter(trim).map(|value| value * angle_scale);
+            let from_point = cartesian(evaluator, trim).map(|point| {
+                let local = inverse.transform_point3(point);
+                (local.y / radii.y).atan2(local.x / radii.x)
+            });
+            if by_parameter { from_parameter.or(from_point) } else { from_point.or(from_parameter) }
+        };
+        let (start, end) = (angle(self, trim1)?, angle(self, trim2)?);
+        let tau = std::f64::consts::TAU;
+        let turn = |amount: f64| match amount.rem_euclid(tau) {
+            0.0 => tau,
+            amount => amount,
+        };
+        let sweep = if forward { turn(end - start) } else { -turn(start - end) };
+        Some(on_conic(frame, radii, start, sweep))
     }
 
     fn profile(&mut self, id: u32) -> Option<Profile> {
         let (entity, def) = self.lookup(id)?;
+        let scale = self.units.length;
         let curve = |name: &str| attribute(&entity, &def, name).and_then(reference);
 
         let (outer, holes) = if def.is_a("IfcArbitraryClosedProfileDef") {
@@ -637,31 +1067,39 @@ impl<'a> ModelEvaluator<'a> {
                 }
             }
             (outer, holes)
-        } else if def.name() == "IfcRectangleProfileDef" || def.is_a("IfcRoundedRectangleProfileDef")
-        {
-            if def.is_a("IfcRoundedRectangleProfileDef") {
-                self.warn("rounding-ignored", format!("#{id} corners are left square"));
-            }
-            let size = |name: &str| {
-                Some(attribute(&entity, &def, name).and_then(number)? * self.units.length / 2.0)
+        } else if def.name() == "IfcEllipseProfileDef" {
+            let size = |name: &str| Some(attribute(&entity, &def, name).and_then(number)? * scale);
+            let radii = DVec2::new(size("SemiAxis1")?, size("SemiAxis2")?);
+            let ring = solids::arc(DVec2::ZERO, radii, 0.0, std::f64::consts::TAU);
+            (self.placed_profile(&entity, &def, ring), Vec::new())
+        } else if def.name() == "IfcCircleProfileDef" || def.is_a("IfcCircleHollowProfileDef") {
+            let radius = attribute(&entity, &def, "Radius").and_then(number)? * scale;
+            let circle = |radius: f64| solids::arc(DVec2::ZERO, DVec2::splat(radius), 0.0, std::f64::consts::TAU);
+            let wall = attribute(&entity, &def, "WallThickness").and_then(number).map(|wall| wall * scale);
+            let holes = match wall.filter(|wall| *wall > 0.0 && *wall < radius) {
+                Some(wall) => vec![self.placed_profile(&entity, &def, circle(radius - wall))],
+                None => Vec::new(),
             };
-            let (x, y) = (size("XDim")?, size("YDim")?);
-            let outer = vec![
-                DVec2::new(-x, -y),
-                DVec2::new(x, -y),
-                DVec2::new(x, y),
-                DVec2::new(-x, y),
-            ];
-            (self.placed_profile(&entity, &def, outer), Vec::new())
-        } else if def.name() == "IfcCircleProfileDef" {
-            let radius = attribute(&entity, &def, "Radius").and_then(number)? * self.units.length;
-            let outer = (0..CIRCLE_SEGMENTS)
-                .map(|i| {
-                    let angle = i as f64 / CIRCLE_SEGMENTS as f64 * std::f64::consts::TAU;
-                    DVec2::new(angle.cos(), angle.sin()) * radius
-                })
-                .collect();
-            (self.placed_profile(&entity, &def, outer), Vec::new())
+            (self.placed_profile(&entity, &def, circle(radius)), holes)
+        } else if def.is_a("IfcRectangleProfileDef") {
+            let size = |name: &str| attribute(&entity, &def, name).and_then(number).map(|value| value * scale);
+            let (x, y) = (size("XDim")? / 2.0, size("YDim")? / 2.0);
+            let box_of = |x: f64, y: f64, radius: f64| {
+                solids::rounded(&[(-x, -y, radius), (x, -y, radius), (x, y, radius), (-x, y, radius)])
+            };
+            let radius = size("RoundingRadius").or_else(|| size("OuterFilletRadius")).unwrap_or(0.0);
+            let wall = size("WallThickness").filter(|wall| *wall > 0.0 && *wall < x.min(y));
+            let holes = match wall {
+                Some(wall) => {
+                    let inner = box_of(x - wall, y - wall, size("InnerFilletRadius").unwrap_or(0.0));
+                    vec![self.placed_profile(&entity, &def, inner)]
+                }
+                None => Vec::new(),
+            };
+            (self.placed_profile(&entity, &def, box_of(x, y, radius)), holes)
+        } else if let Some(corners) = self.section(&entity, &def) {
+            let ring = solids::rounded(&corners);
+            (self.placed_profile(&entity, &def, ring), Vec::new())
         } else {
             self.warn("unsupported-profile", format!("#{id} {}", def.name()));
             return None;
@@ -676,6 +1114,116 @@ impl<'a> ModelEvaluator<'a> {
         (outer.len() >= 3).then_some(Profile { outer, holes })
     }
 
+    /// The outline of a steel section, in its own centred coordinates.
+    fn section(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<solids::Corner>> {
+        let scale = self.units.length;
+        let size = |name: &str| Some(attribute(entity, def, name).and_then(number)? * scale);
+        let radius = |name: &str| size(name).unwrap_or(0.0);
+        let sloped = ["FlangeSlope", "WebSlope", "LegSlope"]
+            .iter()
+            .any(|name| attribute(entity, def, name).and_then(number).is_some_and(|slope| slope != 0.0));
+
+        let corners = match def.name() {
+            "IfcIShapeProfileDef" => solids::i_section(
+                size("OverallWidth")?,
+                size("OverallDepth")?,
+                size("WebThickness")?,
+                size("FlangeThickness")?,
+                radius("FilletRadius"),
+                radius("FlangeEdgeRadius"),
+            ),
+            "IfcLShapeProfileDef" => {
+                let depth = size("Depth")?;
+                solids::l_section(
+                    depth,
+                    size("Width").unwrap_or(depth),
+                    size("Thickness")?,
+                    radius("FilletRadius"),
+                    radius("EdgeRadius"),
+                )
+            }
+            "IfcTShapeProfileDef" => solids::t_section(
+                size("Depth")?,
+                size("FlangeWidth")?,
+                size("WebThickness")?,
+                size("FlangeThickness")?,
+                [radius("FilletRadius"), radius("FlangeEdgeRadius"), radius("WebEdgeRadius")],
+            ),
+            "IfcUShapeProfileDef" => solids::u_section(
+                size("Depth")?,
+                size("FlangeWidth")?,
+                size("WebThickness")?,
+                size("FlangeThickness")?,
+                radius("FilletRadius"),
+                radius("EdgeRadius"),
+            ),
+            "IfcCShapeProfileDef" => solids::c_section(
+                size("Depth")?,
+                size("Width")?,
+                size("WallThickness")?,
+                size("Girth")?,
+                radius("InternalFilletRadius"),
+            ),
+            "IfcZShapeProfileDef" => solids::z_section(
+                size("Depth")?,
+                size("FlangeWidth")?,
+                size("WebThickness")?,
+                size("FlangeThickness")?,
+                radius("FilletRadius"),
+                radius("EdgeRadius"),
+            ),
+            _ => return None,
+        };
+        if sloped {
+            self.warn("profile-slope-ignored", format!("{} drawn with parallel faces", def.name()));
+        }
+        Some(corners)
+    }
+
+    /// Every closed area of a profile. Composite profiles have several.
+    fn profiles(&mut self, id: u32, depth: usize) -> Option<Vec<Profile>> {
+        self.items_used += 1;
+        if depth >= MAX_DEPTH || self.items_used > MAX_ITEMS_PER_ELEMENT {
+            self.warn("nesting-too-deep", format!("#{id} is nested too deeply"));
+            return None;
+        }
+        let (entity, def) = self.lookup(id)?;
+        if def.is_a("IfcCompositeProfileDef") {
+            let mut all = Vec::new();
+            for part in list(attribute(&entity, &def, "Profiles")).iter().filter_map(reference) {
+                all.extend(self.profiles(part, depth + 1)?);
+            }
+            return Some(all);
+        }
+        if def.is_a("IfcDerivedProfileDef") {
+            let parent = attribute(&entity, &def, "ParentProfile").and_then(reference)?;
+            let parents = self.profiles(parent, depth + 1)?;
+            // A mirrored profile flips across the Y axis, whatever its derived operator says.
+            let matrix = if def.is_a("IfcMirroredProfileDef") {
+                DMat4::from_scale(DVec3::new(-1.0, 1.0, 1.0))
+            } else {
+                attribute(&entity, &def, "Operator")
+                    .and_then(reference)
+                    .map_or(DMat4::IDENTITY, |id| self.transformation_operator(id))
+            };
+            let apply = |ring: Vec<DVec2>| -> Vec<DVec2> {
+                ring.into_iter()
+                    .map(|point| matrix.transform_point3(point.extend(0.0)).truncate())
+                    .collect()
+            };
+            return Some(
+                parents
+                    .into_iter()
+                    .map(|Profile { outer, holes }| Profile {
+                        outer: apply(outer),
+                        holes: holes.into_iter().map(apply).collect(),
+                    })
+                    .collect(),
+            );
+        }
+        self.profile(id).map(|profile| vec![profile])
+    }
+
     fn placed_profile(&mut self, entity: &Entity, def: &EntityDef, ring: Vec<DVec2>) -> Vec<DVec2> {
         let Some(position) = attribute(entity, def, "Position").and_then(reference) else {
             return ring;
@@ -688,7 +1236,7 @@ impl<'a> ModelEvaluator<'a> {
 
     fn extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
         let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
-        let Profile { mut outer, mut holes } = self.profile(profile)?;
+        let profiles = self.profiles(profile, 0)?;
         let depth = attribute(entity, def, "Depth").and_then(number)? * self.units.length;
         let direction = attribute(entity, def, "ExtrudedDirection")
             .and_then(reference)
@@ -697,57 +1245,8 @@ impl<'a> ModelEvaluator<'a> {
         let position = attribute(entity, def, "Position")
             .and_then(reference)
             .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
-
-        if ring_area(&outer) < 0.0 {
-            outer.reverse();
-        }
-        for hole in &mut holes {
-            if ring_area(hole) > 0.0 {
-                hole.reverse();
-            }
-        }
-
-        let mut rings: Vec<&[DVec2]> = vec![&outer];
-        rings.extend(holes.iter().map(Vec::as_slice));
-        let caps = triangulate_rings(&rings);
-
-        let count = rings.iter().map(|ring| ring.len()).sum::<usize>() as u32;
-        let mut positions = Vec::with_capacity(count as usize * 2);
-        for offset in [DVec3::ZERO, direction * depth] {
-            for ring in &rings {
-                positions.extend(ring.iter().map(|point| point.extend(0.0) + offset));
-            }
-        }
-
-        let mut triangles = Vec::with_capacity(caps.len() * 2 + count as usize * 2);
-        for [a, b, c] in caps {
-            triangles.push([a, c, b]);
-            triangles.push([a + count, b + count, c + count]);
-        }
-        let mut start = 0u32;
-        for ring in &rings {
-            let length = ring.len() as u32;
-            for i in 0..length {
-                let (a, b) = (start + i, start + (i + 1) % length);
-                triangles.push([a, b, b + count]);
-                triangles.push([a, b + count, a + count]);
-            }
-            start += length;
-        }
-
-        // Extruding downwards turns the solid inside out.
-        if direction.z * depth < 0.0 {
-            for triangle in &mut triangles {
-                triangle.swap(1, 2);
-            }
-        }
-        Some(transformed(
-            Mesh {
-                positions,
-                triangles,
-            },
-            position,
-        ))
+        let parts = profiles.into_iter().map(|profile| prism(profile, direction * depth));
+        Some(transformed(merged(parts), position))
     }
 
     /// Faces from closed shells, open shells or connected face sets.

@@ -1,0 +1,461 @@
+//! Solids checked against closed-form volumes and the normative IFC definitions.
+
+use glam::DVec3;
+use ifc_geometry::{Mesh, ModelEvaluator};
+use std::f64::consts::{PI, TAU};
+use std::fs;
+use std::path::Path;
+use step_parser::index;
+
+const COMMON: &str = "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+    #2=IFCWALL('w',$,$,$,$,$,#3,$);\n\
+    #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+    #4=IFCSHAPEREPRESENTATION($,'Body','SolidModel',(#5));\n\
+    #900=IFCCARTESIANPOINT((0.,0.,0.));\n\
+    #901=IFCDIRECTION((0.,0.,1.));\n\
+    #902=IFCDIRECTION((1.,0.,0.));\n\
+    #903=IFCAXIS2PLACEMENT3D(#900,$,$);\n\
+    #904=IFCCARTESIANPOINT((0.,0.));\n\
+    #905=IFCAXIS2PLACEMENT2D(#904,$);\n";
+
+/// A regular polygon of 32 sides, as circles are faceted, against the true circle.
+fn faceted_circle_area(radius: f64) -> f64 {
+    16.0 * radius * radius * (TAU / 32.0).sin()
+}
+
+fn bounds(mesh: &Mesh) -> (DVec3, DVec3) {
+    let start = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+    mesh.positions
+        .iter()
+        .fold(start, |(min, max), point| (min.min(*point), max.max(*point)))
+}
+
+fn evaluate_with(body: &str, expect_diagnostics: bool) -> Mesh {
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let element = evaluator.evaluate(2).expect("the element evaluates");
+    if !expect_diagnostics {
+        assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());
+    }
+    let mut meshes = element.meshes;
+    assert_eq!(meshes.len(), 1);
+    meshes.remove(0).mesh
+}
+
+fn evaluate(body: &str) -> Mesh {
+    evaluate_with(body, false)
+}
+
+fn close(actual: f64, expected: f64, tolerance: f64) {
+    assert!((actual - expected).abs() <= tolerance, "{actual} against {expected}");
+}
+
+#[test]
+fn block_starts_at_its_position_and_grows_along_the_axes() {
+    let mesh = evaluate("#5=IFCBLOCK(#903,2.,3.,4.);\n");
+    close(mesh.volume(), 24.0, 1e-9);
+    assert_eq!(bounds(&mesh), (DVec3::ZERO, DVec3::new(2.0, 3.0, 4.0)));
+}
+
+#[test]
+fn cylinder_base_is_at_the_origin_and_rises_along_z() {
+    let mesh = evaluate("#5=IFCRIGHTCIRCULARCYLINDER(#903,3.,0.5);\n");
+    close(mesh.volume(), faceted_circle_area(0.5) * 3.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+    let (min, max) = bounds(&mesh);
+    close(min.z, 0.0, 1e-12);
+    close(max.z, 3.0, 1e-12);
+}
+
+#[test]
+fn cone_tapers_to_its_apex() {
+    let mesh = evaluate("#5=IFCRIGHTCIRCULARCONE(#903,3.,1.);\n");
+    close(mesh.volume(), faceted_circle_area(1.0), 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+    assert!(mesh.positions.contains(&DVec3::new(0.0, 0.0, 3.0)));
+}
+
+#[test]
+fn sphere_is_centred_on_its_position() {
+    let mesh = evaluate("#5=IFCSPHERE(#903,2.);\n");
+    close(mesh.volume(), 4.0 / 3.0 * PI * 8.0, 2.0);
+    assert_eq!(mesh.open_edges(), 0);
+    let (min, max) = bounds(&mesh);
+    close(min.z, -2.0, 1e-9);
+    close(max.z, 2.0, 1e-9);
+}
+
+#[test]
+fn pyramid_apex_sits_over_the_middle_of_its_base() {
+    let mesh = evaluate("#5=IFCRECTANGULARPYRAMID(#903,2.,4.,3.);\n");
+    close(mesh.volume(), 8.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+    assert!(mesh.positions.contains(&DVec3::new(1.0, 2.0, 3.0)));
+}
+
+const TWO_HIGH_BLOCK: &str = "#10=IFCBLOCK(#903,1.,1.,2.);\n\
+    #11=IFCCARTESIANPOINT((0.,0.,1.));\n\
+    #12=IFCAXIS2PLACEMENT3D(#11,$,$);\n\
+    #13=IFCPLANE(#12);\n";
+
+#[test]
+fn agreement_flag_true_means_the_normal_points_away_from_the_material() {
+    let mesh = evaluate(&format!(
+        "{TWO_HIGH_BLOCK}#14=IFCHALFSPACESOLID(#13,.T.);\n\
+         #5=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#10,#14);\n"
+    ));
+    close(mesh.volume(), 1.0, 1e-9);
+    close(bounds(&mesh).0.z, 1.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn agreement_flag_false_keeps_the_other_side() {
+    let mesh = evaluate(&format!(
+        "{TWO_HIGH_BLOCK}#14=IFCHALFSPACESOLID(#13,.F.);\n\
+         #5=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#10,#14);\n"
+    ));
+    close(mesh.volume(), 1.0, 1e-9);
+    close(bounds(&mesh).1.z, 1.0, 1e-9);
+}
+
+#[test]
+fn polygonal_bound_limits_the_clip_to_its_outline() {
+    // Removes the upper half of the block, but only where x is below 0.5.
+    let mesh = evaluate(&format!(
+        "{TWO_HIGH_BLOCK}#20=IFCCARTESIANPOINT((-1.,-1.));\n\
+         #21=IFCCARTESIANPOINT((0.5,-1.));\n\
+         #22=IFCCARTESIANPOINT((0.5,2.));\n\
+         #23=IFCCARTESIANPOINT((-1.,2.));\n\
+         #24=IFCPOLYLINE((#20,#21,#22,#23,#20));\n\
+         #14=IFCPOLYGONALBOUNDEDHALFSPACE(#13,.F.,#903,#24);\n\
+         #5=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#10,#14);\n"
+    ));
+    close(mesh.volume(), 1.5, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn clipping_a_rotated_plane_cuts_on_the_diagonal() {
+    let mesh = evaluate(
+        "#10=IFCBLOCK(#903,1.,1.,1.);\n\
+         #11=IFCCARTESIANPOINT((1.,0.,0.));\n\
+         #12=IFCDIRECTION((1.,0.,1.));\n\
+         #15=IFCAXIS2PLACEMENT3D(#11,#12,$);\n\
+         #13=IFCPLANE(#15);\n\
+         #14=IFCHALFSPACESOLID(#13,.F.);\n\
+         #5=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#10,#14);\n",
+    );
+    close(mesh.volume(), 0.5, 1e-9);
+}
+
+const OVERLAPPING: &str = "#10=IFCBLOCK(#903,2.,2.,2.);\n\
+    #11=IFCCARTESIANPOINT((1.,1.,1.));\n\
+    #12=IFCAXIS2PLACEMENT3D(#11,$,$);\n\
+    #13=IFCBLOCK(#12,2.,2.,2.);\n";
+
+#[test]
+fn boolean_operators_follow_their_names() {
+    for (operator, expected) in [("UNION", 15.0), ("INTERSECTION", 1.0), ("DIFFERENCE", 7.0)] {
+        let mesh = evaluate(&format!(
+            "{OVERLAPPING}#6=IFCBOOLEANRESULT(.{operator}.,#10,#13);\n#5=IFCCSGSOLID(#6);\n"
+        ));
+        close(mesh.volume(), expected, 1e-9);
+        assert_eq!(mesh.open_edges(), 0, "{operator}");
+    }
+}
+
+#[test]
+fn a_full_revolution_makes_a_ring_with_no_caps() {
+    let mesh = evaluate(
+        "#10=IFCCARTESIANPOINT((1.5,0.));\n\
+         #11=IFCAXIS2PLACEMENT2D(#10,$);\n\
+         #12=IFCRECTANGLEPROFILEDEF(.AREA.,$,#11,1.,1.);\n\
+         #13=IFCDIRECTION((0.,1.,0.));\n\
+         #14=IFCAXIS1PLACEMENT(#900,#13);\n\
+         #5=IFCREVOLVEDAREASOLID(#12,#903,#14,6.283185307179586);\n",
+    );
+    close(mesh.volume(), faceted_circle_area(2.0) - faceted_circle_area(1.0), 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+    let (min, max) = bounds(&mesh);
+    close(max.x, 2.0, 1e-9);
+    close(min.x, -2.0, 1e-9);
+    close(max.y - min.y, 1.0, 1e-9);
+}
+
+#[test]
+fn a_part_revolution_is_capped_and_turns_by_the_right_hand_rule() {
+    let mesh = evaluate(
+        "#10=IFCCARTESIANPOINT((1.5,0.));\n\
+         #11=IFCAXIS2PLACEMENT2D(#10,$);\n\
+         #12=IFCRECTANGLEPROFILEDEF(.AREA.,$,#11,1.,1.);\n\
+         #13=IFCDIRECTION((0.,1.,0.));\n\
+         #14=IFCAXIS1PLACEMENT(#900,#13);\n\
+         #5=IFCREVOLVEDAREASOLID(#12,#903,#14,1.5707963267948966);\n",
+    );
+    close(mesh.volume(), (faceted_circle_area(2.0) - faceted_circle_area(1.0)) / 4.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+    // Turning +X about +Y by a quarter leads to -Z.
+    let (min, max) = bounds(&mesh);
+    close(min.z, -2.0, 1e-9);
+    close(max.z, 0.0, 1e-9);
+}
+
+fn twelve_gon_area(radius: f64) -> f64 {
+    6.0 * radius * radius * (TAU / 12.0).sin()
+}
+
+#[test]
+fn a_straight_pipe_has_the_volume_of_its_section() {
+    let mesh = evaluate(
+        "#10=IFCCARTESIANPOINT((0.,0.,5.));\n\
+         #11=IFCPOLYLINE((#900,#10));\n\
+         #5=IFCSWEPTDISKSOLID(#11,0.5,$,$,$);\n",
+    );
+    close(mesh.volume(), twelve_gon_area(0.5) * 5.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn a_mitred_bend_keeps_section_times_centre_line() {
+    let mesh = evaluate(
+        "#10=IFCCARTESIANPOINT((0.,0.,5.));\n\
+         #12=IFCCARTESIANPOINT((3.,0.,5.));\n\
+         #11=IFCPOLYLINE((#900,#10,#12));\n\
+         #5=IFCSWEPTDISKSOLID(#11,0.25,$,$,$);\n",
+    );
+    close(mesh.volume(), twelve_gon_area(0.25) * 8.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn inner_radius_makes_a_hollow_tube() {
+    let mesh = evaluate(
+        "#10=IFCCARTESIANPOINT((0.,0.,5.));\n\
+         #11=IFCPOLYLINE((#900,#10));\n\
+         #5=IFCSWEPTDISKSOLID(#11,0.5,0.25,$,$);\n",
+    );
+    close(mesh.volume(), (twelve_gon_area(0.5) - twelve_gon_area(0.25)) * 5.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+fn extruded(curve: u32) -> String {
+    format!(
+        "#50=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{curve});\n\
+         #5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\n"
+    )
+}
+
+#[test]
+fn indexed_arcs_are_curves_not_chords() {
+    // A half disc of radius 1: arc from (1,0) through (0,1) to (-1,0), closed by a line.
+    let mesh = evaluate(&format!(
+        "#10=IFCCARTESIANPOINTLIST2D(((1.,0.),(0.,1.),(-1.,0.)));\n\
+         #11=IFCINDEXEDPOLYCURVE(#10,(IFCARCINDEX((1,2,3)),IFCLINEINDEX((3,1))),$);\n{}",
+        extruded(11)
+    ));
+    close(mesh.volume(), faceted_circle_area(1.0) / 2.0, 1e-9);
+}
+
+#[test]
+fn composite_curves_join_trimmed_circles_and_lines() {
+    // A stadium: two half circles of radius 1, centred 2 apart.
+    let mesh = evaluate(&format!(
+        "#10=IFCCARTESIANPOINT((0.,0.));\n\
+         #11=IFCAXIS2PLACEMENT2D(#10,$);\n\
+         #12=IFCCIRCLE(#11,1.);\n\
+         #13=IFCTRIMMEDCURVE(#12,(IFCPARAMETERVALUE(1.5707963267948966)),(IFCPARAMETERVALUE(4.71238898038469)),.T.,.PARAMETER.);\n\
+         #20=IFCCARTESIANPOINT((2.,0.));\n\
+         #21=IFCAXIS2PLACEMENT2D(#20,$);\n\
+         #22=IFCCIRCLE(#21,1.);\n\
+         #23=IFCTRIMMEDCURVE(#22,(IFCPARAMETERVALUE(4.71238898038469)),(IFCPARAMETERVALUE(1.5707963267948966)),.T.,.PARAMETER.);\n\
+         #30=IFCCARTESIANPOINT((0.,-1.));\n\
+         #31=IFCCARTESIANPOINT((2.,-1.));\n\
+         #32=IFCPOLYLINE((#30,#31));\n\
+         #33=IFCCARTESIANPOINT((2.,1.));\n\
+         #34=IFCCARTESIANPOINT((0.,1.));\n\
+         #35=IFCPOLYLINE((#33,#34));\n\
+         #40=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#13);\n\
+         #41=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#32);\n\
+         #42=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#23);\n\
+         #43=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#35);\n\
+         #44=IFCCOMPOSITECURVE((#40,#41,#42,#43),.F.);\n{}",
+        extruded(44)
+    ));
+    close(mesh.volume(), faceted_circle_area(1.0) + 4.0, 1e-9);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn against_the_sense_a_trim_runs_the_short_way_back() {
+    // From 90 to 0 degrees clockwise: a quarter arc, closed through the centre.
+    let mesh = evaluate(&format!(
+        "#12=IFCCIRCLE(#905,1.);\n\
+         #13=IFCTRIMMEDCURVE(#12,(IFCPARAMETERVALUE(1.5707963267948966)),(IFCPARAMETERVALUE(0.)),.F.,.PARAMETER.);\n\
+         #30=IFCCARTESIANPOINT((1.,0.));\n\
+         #31=IFCCARTESIANPOINT((0.,0.));\n\
+         #32=IFCCARTESIANPOINT((0.,1.));\n\
+         #33=IFCPOLYLINE((#30,#31,#32));\n\
+         #40=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#13);\n\
+         #41=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#33);\n\
+         #44=IFCCOMPOSITECURVE((#40,#41),.F.);\n{}",
+        extruded(44)
+    ));
+    close(mesh.volume(), faceted_circle_area(1.0) / 4.0, 1e-9);
+}
+
+fn profile_area(profile: &str) -> f64 {
+    let mesh = evaluate(&format!("{profile}\n#5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\n"));
+    assert_eq!(mesh.open_edges(), 0, "{profile}");
+    mesh.volume()
+}
+
+#[test]
+fn section_profiles_have_the_area_of_their_parts() {
+    // What a fillet takes from or adds to a square corner, with its arc in eight facets.
+    let quarter_fillet = |r: f64| r * r * (1.0 - 4.0 * (PI / 16.0).sin());
+    let cases = [
+        ("IFCISHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.3,0.01,0.02,$,$,$)", 2.0 * 0.2 * 0.02 + 0.26 * 0.01),
+        ("IFCISHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.3,0.01,0.02,0.01,$,$)", 2.0 * 0.2 * 0.02 + 0.26 * 0.01 + 4.0 * quarter_fillet(0.01)),
+        ("IFCLSHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.01,$,$,$)", 0.2 * 0.01 + 0.09 * 0.01),
+        ("IFCTSHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.01,0.02,$,$,$,$,$)", 0.1 * 0.02 + 0.18 * 0.01),
+        ("IFCUSHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.01,0.02,$,$,$)", 0.2 * 0.01 + 2.0 * 0.09 * 0.02),
+        ("IFCCSHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.01,0.03,$)", 0.2 * 0.01 + 2.0 * 0.09 * 0.01 + 2.0 * 0.02 * 0.01),
+        ("IFCZSHAPEPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.01,0.02,$,$)", 0.2 * 0.01 + 2.0 * 0.09 * 0.02),
+        ("IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.01,$,$)", 0.2 * 0.1 - 0.18 * 0.08),
+        ("IFCROUNDEDRECTANGLEPROFILEDEF(.AREA.,$,#905,0.2,0.1,0.02)", 0.2 * 0.1 - 4.0 * quarter_fillet(0.02)),
+    ];
+    for (profile, expected) in cases {
+        close(profile_area(&format!("#50={profile};")), expected, 1e-12);
+    }
+}
+
+#[test]
+fn hollow_and_elliptical_profiles() {
+    close(
+        profile_area("#50=IFCCIRCLEHOLLOWPROFILEDEF(.AREA.,$,#905,1.,0.25);"),
+        faceted_circle_area(1.0) - faceted_circle_area(0.75),
+        1e-9,
+    );
+    // An ellipse is a circle stretched, and its facets stretch with it.
+    close(profile_area("#50=IFCELLIPSEPROFILEDEF(.AREA.,$,#905,2.,1.);"), faceted_circle_area(1.0) * 2.0, 1e-9);
+}
+
+#[test]
+fn composite_profiles_extrude_every_part() {
+    let mesh = evaluate(
+        "#51=IFCRECTANGLEPROFILEDEF(.AREA.,$,#905,1.,1.);\n\
+         #52=IFCCARTESIANPOINT((3.,0.));\n\
+         #53=IFCAXIS2PLACEMENT2D(#52,$);\n\
+         #54=IFCRECTANGLEPROFILEDEF(.AREA.,$,#53,1.,2.);\n\
+         #50=IFCCOMPOSITEPROFILEDEF(.AREA.,$,(#51,#54),$);\n\
+         #5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\n",
+    );
+    close(mesh.volume(), 3.0, 1e-9);
+}
+
+#[test]
+fn derived_profiles_apply_their_operator_and_mirrors_flip_across_y() {
+    let shape = "#51=IFCCARTESIANPOINT((2.,0.));\n\
+         #52=IFCAXIS2PLACEMENT2D(#51,$);\n\
+         #53=IFCRECTANGLEPROFILEDEF(.AREA.,$,#52,1.,1.);\n";
+    let mesh = evaluate(&format!(
+        "{shape}#54=IFCCARTESIANPOINT((0.,5.));\n\
+         #55=IFCCARTESIANTRANSFORMATIONOPERATOR2D($,$,#54,$);\n\
+         #50=IFCDERIVEDPROFILEDEF(.AREA.,$,#53,#55,$);\n\
+         #5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\n"
+    ));
+    close(bounds(&mesh).0.y, 4.5, 1e-9);
+    close(bounds(&mesh).0.x, 1.5, 1e-9);
+
+    let mesh = evaluate(&format!(
+        "{shape}#50=IFCMIRROREDPROFILEDEF(.AREA.,$,#53,$,$);\n\
+         #5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\n"
+    ));
+    close(mesh.volume(), 1.0, 1e-9);
+    close(bounds(&mesh).1.x, -1.5, 1e-9);
+}
+
+#[test]
+fn a_boolean_on_an_open_mesh_keeps_the_first_operand_and_says_so() {
+    let mesh = evaluate_with(
+        "#10=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n\
+         #11=IFCTRIANGULATEDFACESET(#10,$,$,((1,2,3)),$);\n\
+         #12=IFCBLOCK(#903,1.,1.,1.);\n\
+         #5=IFCBOOLEANRESULT(.DIFFERENCE.,#11,#12);\n",
+        true,
+    );
+    assert_eq!(mesh.triangles.len(), 1);
+}
+
+/// Forty levels that each use the level below twice: 2^40 paths.
+#[test]
+fn shared_boolean_operands_do_not_multiply_the_work() {
+    let mut body = String::from("#5=IFCBOOLEANRESULT(.UNION.,#100,#100);\n");
+    for level in 0..40 {
+        let id = 100 + level;
+        body.push_str(&format!("#{id}=IFCBOOLEANRESULT(.UNION.,#{0},#{0});\n", id + 1));
+    }
+    body.push_str("#140=IFCBLOCK(#903,1.,1.,1.);\n");
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let started = std::time::Instant::now();
+    evaluator.evaluate(2).unwrap();
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    assert!(evaluator.diagnostics().iter().any(|item| item.code == "too-many-booleans"));
+}
+
+#[test]
+fn cyclic_operands_and_curves_end_with_a_diagnostic() {
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}\
+         #5=IFCBOOLEANRESULT(.UNION.,#5,#5);\nENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    evaluator.evaluate(2);
+    assert!(evaluator.diagnostics().iter().any(|item| item.code == "nesting-too-deep"));
+}
+
+/// Reports what each fixture still lacks, and pins the ones this work made complete.
+#[test]
+fn fixtures_that_use_these_solids_now_evaluate() {
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures");
+    let mut names: Vec<_> = fs::read_dir(&folder).unwrap().map(|entry| entry.unwrap().path()).collect();
+    names.retain(|path| path.extension().is_some_and(|extension| extension == "ifc"));
+    names.sort();
+
+    for path in names {
+        let bytes = fs::read(&path).unwrap();
+        let file = index(&bytes).unwrap();
+        let mut evaluator = ModelEvaluator::new(&file).unwrap();
+        let ids = evaluator.element_ids();
+        let (mut solids, mut volume) = (0, 0.0);
+        for id in &ids {
+            if let Some(element) = evaluator.evaluate(*id) {
+                solids += !element.meshes.is_empty() as usize;
+                volume += element.meshes.iter().map(|item| item.mesh.volume()).sum::<f64>();
+            }
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let mut codes: Vec<String> =
+            evaluator.diagnostics().iter().map(|item| format!("{}: {}", item.code, item.message)).collect();
+        codes.sort();
+        codes.dedup();
+        println!("{name:<30} {solids:>3}/{:<3} {volume:>12.6}  {:?}", ids.len(), &codes[..codes.len().min(3)]);
+
+        if ["bath-csg-solid", "beam-revolved-solid", "boolean-clipping-halfspace", "reinforcing-stirrup", "geographic-referencing"]
+            .contains(&name.as_str())
+        {
+            assert_eq!(solids, ids.len(), "{name}");
+            assert!(volume > 0.0, "{name}: {volume}");
+            assert!(codes.is_empty(), "{name}: {codes:?}");
+        }
+    }
+}
