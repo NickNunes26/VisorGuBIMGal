@@ -5,6 +5,7 @@ node_modules/
 
 # Rust
 target/
+src/infrastructure/kernel/pkg/
 
 # Production build
 dist/

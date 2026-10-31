@@ -235,15 +235,15 @@ impl<'a> ModelEvaluator<'a> {
             let color = list(attribute(&entity, &def, "Styles"))
                 .iter()
                 .filter_map(reference)
-                .find_map(|style| self.style_color(style, &mut HashSet::new()));
+                .find_map(|style| self.style_color(style, 0, &mut HashSet::new()));
             if let Some(color) = color {
                 self.item_colors.insert(item, color);
             }
         }
     }
 
-    fn style_color(&self, id: u32, visited: &mut HashSet<u32>) -> Option<u32> {
-        if !visited.insert(id) {
+    fn style_color(&self, id: u32, depth: usize, visited: &mut HashSet<u32>) -> Option<u32> {
+        if depth >= MAX_DEPTH || !visited.insert(id) {
             return None;
         }
         let (entity, def) = self.lookup(id)?;
@@ -266,7 +266,7 @@ impl<'a> ModelEvaluator<'a> {
             return list(attribute(&entity, &def, "Styles"))
                 .iter()
                 .filter_map(reference)
-                .find_map(|style| self.style_color(style, visited));
+                .find_map(|style| self.style_color(style, depth + 1, visited));
         }
         None
     }

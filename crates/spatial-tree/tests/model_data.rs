@@ -227,3 +227,45 @@ fn cyclic_hierarchy_does_not_hang_or_crash() {
     assert_eq!(tree.root.express_id, 1);
     let _ = data.element_details(5);
 }
+
+/// A wasm stack is far smaller than a native one, so these chains must not recurse with length.
+#[test]
+fn chains_as_long_as_the_file_do_not_exhaust_the_stack() {
+    const LENGTH: u32 = 200_000;
+    let mut body = String::from(
+        "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+         #2=IFCBUILDINGSTOREY('s',$,$,$,$,$,$,$,.ELEMENT.,0.);\n\
+         #3=IFCRELAGGREGATES('a',$,$,$,#1,(#2));\n\
+         #4=IFCWALL('w',$,$,$,$,$,$,$);\n\
+         #5=IFCRELCONTAINEDINSPATIALSTRUCTURE('c',$,$,$,(#4),#2);\n\
+         #6=IFCPROPERTYSET('g',$,'Pset',$,(#1000000));\n\
+         #7=IFCRELDEFINESBYPROPERTIES('r',$,$,$,(#4),#6);\n",
+    );
+    for level in 0..LENGTH {
+        let (part, relation, property) = (100_000 + level, 400_000 + level, 1_000_000 + level);
+        let parent = if level == 0 { 4 } else { part - 1 };
+        body.push_str(&format!("#{part}=IFCWALL('w',$,$,$,$,$,$,$);\n"));
+        body.push_str(&format!("#{relation}=IFCRELAGGREGATES('a',$,$,$,#{parent},(#{part}));\n"));
+        body.push_str(&format!("#{property}=IFCCOMPLEXPROPERTY('c',$,'u',(#{}));\n", property + 1));
+    }
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let data = ModelData::open(&file).unwrap();
+
+    // The stack a wasm build gets.
+    let handle = std::thread::Builder::new().stack_size(1024 * 1024);
+    std::thread::scope(|scope| {
+        handle
+            .spawn_scoped(scope, || {
+                let tree = data.spatial_tree().unwrap();
+                assert_eq!(tree.root.children[0].elements.len(), LENGTH as usize + 1);
+                let wall = data.element_details(4).unwrap();
+                assert_eq!(wall.property_sets[0].name, "Pset");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    });
+}

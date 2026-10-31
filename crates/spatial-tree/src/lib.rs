@@ -264,14 +264,14 @@ fn si_label(prefix: Option<&str>, name: &str) -> String {
         Some("CENTI") => "c",
         Some("DECI") => "d",
         Some("KILO") => "k",
-        Some("MICRO") => "µ",
+        Some("MICRO") => "Ãƒâ€šÃ‚Âµ",
         Some(other) => other,
         None => "",
     };
     let base = match name {
         "METRE" => "m",
-        "SQUARE_METRE" => "m²",
-        "CUBIC_METRE" => "m³",
+        "SQUARE_METRE" => "mÃƒâ€šÃ‚Â²",
+        "CUBIC_METRE" => "mÃƒâ€šÃ‚Â³",
         "GRAM" => "g",
         "SECOND" => "s",
         "RADIAN" => "rad",
@@ -280,7 +280,7 @@ fn si_label(prefix: Option<&str>, name: &str) -> String {
         "JOULE" => "J",
         "WATT" => "W",
         "KELVIN" => "K",
-        "DEGREE_CELSIUS" => "°C",
+        "DEGREE_CELSIUS" => "Ãƒâ€šÃ‚Â°C",
         other => other,
     };
     format!("{prefix}{base}")
@@ -610,30 +610,32 @@ impl<'a> ModelData<'a> {
     }
 
     /// Adds an element and the parts it aggregates, which the viewer shows individually.
+    /// Iterative with a visited set: a chain of parts can be as long as the file, and a
+    /// depth limit alone leaves exponentially many paths in a graph.
     fn collect_elements(
         &self,
         id: u32,
         referenced: bool,
-        visited: &mut HashSet<u32>,
         seen: &mut HashSet<u32>,
         out: &mut Vec<SpatialElement>,
     ) {
-        // A visited set, as a depth limit alone leaves exponentially many paths in a graph.
-        if !visited.insert(id) {
-            return;
-        }
-        let Some((_, def)) = self.lookup(id) else { return };
-        if def.is_a("IfcFeatureElementSubtraction") {
-            return;
-        }
-        if !referenced {
-            seen.insert(id);
-        }
-        if let Some(element) = self.element(id, referenced) {
-            out.push(element);
-        }
-        for part in self.relations.parts.get(&id).into_iter().flatten() {
-            self.collect_elements(*part, referenced, visited, seen, out);
+        let mut visited = HashSet::new();
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some((_, def)) = self.lookup(id) else { continue };
+            if def.is_a("IfcFeatureElementSubtraction") {
+                continue;
+            }
+            if !referenced {
+                seen.insert(id);
+            }
+            if let Some(element) = self.element(id, referenced) {
+                out.push(element);
+            }
+            pending.extend(self.relations.parts.get(&id).into_iter().flatten());
         }
     }
 
@@ -661,16 +663,16 @@ impl<'a> ModelData<'a> {
                     children.extend(self.node(*part, depth + 1, placed, seen));
                 }
                 Some(_) => {
-                    self.collect_elements(*part, false, &mut HashSet::new(), seen, &mut elements);
+                    self.collect_elements(*part, false, seen, &mut elements);
                 }
                 None => {}
             }
         }
         for element in self.relations.contained.get(&id).into_iter().flatten() {
-            self.collect_elements(*element, false, &mut HashSet::new(), seen, &mut elements);
+            self.collect_elements(*element, false, seen, &mut elements);
         }
         for element in self.relations.referenced.get(&id).into_iter().flatten() {
-            self.collect_elements(*element, true, &mut HashSet::new(), seen, &mut elements);
+            self.collect_elements(*element, true, seen, &mut elements);
         }
 
         // IFC relationship sets are unordered.
@@ -705,8 +707,8 @@ impl<'a> ModelData<'a> {
         Some(SpatialTree { root, unassigned })
     }
 
-    fn property(&self, id: u32, visited: &mut HashSet<u32>) -> Option<PropertyItem> {
-        if !visited.insert(id) {
+    fn property(&self, id: u32, depth: usize, visited: &mut HashSet<u32>) -> Option<PropertyItem> {
+        if depth >= MAX_DEPTH || !visited.insert(id) {
             return None;
         }
         let (entity, def) = self.lookup(id)?;
@@ -771,7 +773,7 @@ impl<'a> ModelData<'a> {
             PropertyValue::Complex(
                 refs(attribute(&entity, &def, "HasProperties"))
                     .into_iter()
-                    .filter_map(|id| self.property(id, visited))
+                    .filter_map(|id| self.property(id, depth + 1, visited))
                     .collect(),
             )
         } else {
@@ -804,7 +806,7 @@ impl<'a> ModelData<'a> {
         let method = text(attribute(&entity, &def, "MethodOfMeasurement"));
         let properties = refs(attribute(&entity, &def, field))
             .into_iter()
-            .filter_map(|id| self.property(id, &mut HashSet::new()))
+            .filter_map(|id| self.property(id, 0, &mut HashSet::new()))
             .map(|mut item| {
                 item.method_of_measurement = method.clone();
                 item
