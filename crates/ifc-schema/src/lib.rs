@@ -5,6 +5,7 @@
 //! which STEP parameter holds which attribute. Regeneration: `GENERATING.md`.
 
 mod tables;
+pub mod units;
 
 use std::cmp::Ordering;
 

@@ -10,6 +10,7 @@ publish.workspace = true
 step-parser.workspace = true
 ifc-schema.workspace = true
 glam.workspace = true
+earcut.workspace = true
 
 [lints]
 workspace = true
