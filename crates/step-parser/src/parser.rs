@@ -5,6 +5,10 @@
 
 use crate::{Entity, ErrorKind, ParseError, Value};
 
+/// Maximum nesting depth for lists and typed values. Bound so that hostile input
+/// cannot exhaust the stack; real ISO 10303-21 data stays far below this.
+pub(crate) const MAX_NESTING_DEPTH: usize = 64;
+
 /// Byte length limit guard for escape directives, so a corrupt file cannot make
 /// the decoder allocate without bound. Values this large do not occur in practice.
 const MAX_ESCAPE_UNITS: usize = 1 << 20;
@@ -16,6 +20,19 @@ pub(crate) fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Append a run of raw string bytes: UTF-8 when the run is valid, otherwise
+/// Latin-1 byte by byte, which is what pre-UTF-8 STEP files use.
+fn flush_raw_bytes(out: &mut String, raw: &mut Vec<u8>) {
+    if raw.is_empty() {
+        return;
+    }
+    match std::str::from_utf8(raw) {
+        Ok(text) => out.push_str(text),
+        Err(_) => out.extend(raw.iter().map(|byte| char::from(*byte))),
+    }
+    raw.clear();
 }
 
 /// A cursor over one entity record (or a header statement).
@@ -161,7 +178,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `#id = TYPE(...);`.
+    /// Parse `#id = TYPE(...);` or the complex form `#id = (TYPE(...)TYPE(...));`.
     pub(crate) fn parse_entity(&mut self) -> Result<Entity, ParseError> {
         self.skip_ws_comments()?;
         self.expect(b'#')?;
@@ -169,11 +186,56 @@ impl<'a> Parser<'a> {
         self.skip_ws_comments()?;
         self.expect(b'=')?;
         self.skip_ws_comments()?;
-        let type_name = self.parse_ident()?;
-        let params = self.parse_outer_params()?;
-        self.skip_ws_comments()?;
-        self.expect(b';')?;
-        Ok(Entity { type_name, params })
+        if self.peek() == Some(b'(') {
+            let parts = self.parse_complex_parts()?;
+            self.skip_ws_comments()?;
+            self.expect(b';')?;
+            let (type_name, params) = parts
+                .first()
+                .cloned()
+                .ok_or_else(|| self.error(ErrorKind::MalformedEntity))?;
+            Ok(Entity {
+                type_name,
+                params,
+                parts,
+            })
+        } else {
+            let type_name = self.parse_ident()?;
+            let params = self.parse_outer_params()?;
+            self.skip_ws_comments()?;
+            self.expect(b';')?;
+            let parts = vec![(type_name.clone(), params.clone())];
+            Ok(Entity {
+                type_name,
+                params,
+                parts,
+            })
+        }
+    }
+
+    /// Parse `(NAME(params)NAME(params)...)`, the body of a complex instance.
+    fn parse_complex_parts(&mut self) -> Result<Vec<(String, Vec<Value>)>, ParseError> {
+        self.expect(b'(')?;
+        let mut parts = Vec::new();
+        loop {
+            self.skip_ws_comments()?;
+            match self.peek() {
+                Some(b')') => {
+                    self.pos = self.pos.saturating_add(1);
+                    break;
+                }
+                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+                Some(_) => {}
+            }
+            let name = self.parse_ident()?;
+            let params = self.parse_outer_params()?;
+            parts.push((name, params));
+        }
+        if parts.is_empty() {
+            Err(self.error(ErrorKind::MalformedEntity))
+        } else {
+            Ok(parts)
+        }
     }
 
     /// Parse the parenthesised parameter list of an entity or header statement.
@@ -187,7 +249,7 @@ impl<'a> Parser<'a> {
             return Ok(values);
         }
         loop {
-            values.push(self.parse_value()?);
+            values.push(self.parse_value(0)?);
             self.skip_ws_comments()?;
             match self.bump() {
                 Some(b',') => {
@@ -206,7 +268,10 @@ impl<'a> Parser<'a> {
         Ok(values)
     }
 
-    fn parse_value(&mut self) -> Result<Value, ParseError> {
+    fn parse_value(&mut self, depth: usize) -> Result<Value, ParseError> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(self.error(ErrorKind::NestingTooDeep));
+        }
         self.skip_ws_comments()?;
         let byte = match self.peek() {
             Some(byte) => byte,
@@ -227,7 +292,7 @@ impl<'a> Parser<'a> {
                 self.pos = self.pos.saturating_add(1);
                 self.parse_u32_digits().map(Value::Ref)
             }
-            b'(' => self.parse_list().map(Value::List),
+            b'(' => self.parse_list(depth.saturating_add(1)).map(Value::List),
             b'.' if self.peek_at(1).is_some_and(|next| next.is_ascii_digit()) =>
             {
                 self.parse_number()
@@ -238,7 +303,7 @@ impl<'a> Parser<'a> {
                 let name = self.parse_ident()?;
                 self.skip_ws_comments()?;
                 self.expect(b'(')?;
-                let value = self.parse_value()?;
+                let value = self.parse_value(depth.saturating_add(1))?;
                 self.skip_ws_comments()?;
                 self.expect(b')')?;
                 Ok(Value::Typed {
@@ -250,7 +315,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_list(&mut self) -> Result<Vec<Value>, ParseError> {
+    fn parse_list(&mut self, depth: usize) -> Result<Vec<Value>, ParseError> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(self.error(ErrorKind::NestingTooDeep));
+        }
         self.expect(b'(')?;
         let mut values = Vec::new();
         self.skip_ws_comments()?;
@@ -259,7 +327,7 @@ impl<'a> Parser<'a> {
             return Ok(values);
         }
         loop {
-            values.push(self.parse_value()?);
+            values.push(self.parse_value(depth)?);
             self.skip_ws_comments()?;
             match self.bump() {
                 Some(b',') => {
@@ -344,8 +412,8 @@ impl<'a> Parser<'a> {
 
         if is_real {
             match text.parse::<f64>() {
-                Ok(value) => Ok(Value::Real(value)),
-                Err(_) => Err(self.error(ErrorKind::InvalidNumber)),
+                Ok(value) if value.is_finite() => Ok(Value::Real(value)),
+                _ => Err(self.error(ErrorKind::InvalidNumber)),
             }
         } else {
             match text.parse::<i64>() {
@@ -358,22 +426,30 @@ impl<'a> Parser<'a> {
     fn parse_string(&mut self) -> Result<String, ParseError> {
         self.expect(b'\'')?;
         let mut out = String::new();
+        let mut raw: Vec<u8> = Vec::new();
         loop {
             match self.bump() {
-                None => return Err(self.error(ErrorKind::UnterminatedString)),
+                None => {
+                    flush_raw_bytes(&mut out, &mut raw);
+                    return Err(self.error(ErrorKind::UnterminatedString));
+                }
                 Some(b'\'') => {
                     if self.peek() == Some(b'\'') {
+                        flush_raw_bytes(&mut out, &mut raw);
                         self.pos = self.pos.saturating_add(1);
                         out.push('\'');
                     } else {
+                        flush_raw_bytes(&mut out, &mut raw);
                         return Ok(out);
                     }
                 }
-                Some(b'\\') => self.parse_escape(&mut out)?,
-                // STEP files in the wild are frequently ISO-8859-1. Every raw
-                // byte is therefore a valid Latin-1 scalar, which keeps invalid
-                // UTF-8 from ever reaching `String` construction.
-                Some(byte) => out.push(char::from(byte)),
+                Some(b'\\') => {
+                    flush_raw_bytes(&mut out, &mut raw);
+                    self.parse_escape(&mut out)?;
+                }
+                // Raw bytes are collected and decoded as a run: valid UTF-8 is
+                // kept as UTF-8, otherwise the run falls back to Latin-1.
+                Some(byte) => raw.push(byte),
             }
         }
     }

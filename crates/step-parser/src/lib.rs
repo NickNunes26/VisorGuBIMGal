@@ -44,9 +44,18 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     /// Upper-cased entity type name, for example `IFCWALLSTANDARDCASE`.
+    ///
+    /// For a complex instance this is the name of the first partial.
     pub type_name: String,
     /// The entity parameters, in file order.
+    ///
+    /// For a complex instance these are the parameters of the first partial.
     pub params: Vec<Value>,
+    /// Every partial of a complex instance, in file order.
+    ///
+    /// Ordinary entities have exactly one element, matching [`Self::type_name`]
+    /// and [`Self::params`].
+    pub parts: Vec<(String, Vec<Value>)>,
 }
 
 /// The reason a [`ParseError`] was produced.
@@ -74,6 +83,8 @@ pub enum ErrorKind {
     InvalidEscape,
     /// An entity record did not match the `#id = TYPE(...);` shape.
     MalformedEntity,
+    /// A value was nested more deeply than the parser's safety limit.
+    NestingTooDeep,
     /// The requested entity id is not present in the index.
     UnknownEntity(u32),
 }
@@ -94,6 +105,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::UnterminatedBinary => write!(f, "unterminated binary literal"),
             ErrorKind::InvalidEscape => write!(f, "invalid string escape directive"),
             ErrorKind::MalformedEntity => write!(f, "malformed entity record"),
+            ErrorKind::NestingTooDeep => write!(f, "value nesting exceeds the depth limit"),
             ErrorKind::UnknownEntity(id) => write!(f, "unknown entity #{id}"),
         }
     }
@@ -174,6 +186,7 @@ pub struct StepIndex<'a> {
     type_lookup: HashMap<String, u32>,
     by_type: HashMap<u32, Vec<u32>>,
     duplicates: Vec<u32>,
+    skipped: Vec<ParseError>,
 }
 
 impl<'a> StepIndex<'a> {
@@ -193,6 +206,14 @@ impl<'a> StepIndex<'a> {
     /// Duplicate entity ids encountered while indexing, in file order.
     pub fn duplicate_ids(&self) -> &[u32] {
         &self.duplicates
+    }
+
+    /// Entity records that were malformed and therefore skipped, in file order.
+    ///
+    /// A malformed record does not make [`index`] fail: the scanner resynchronises
+    /// at the next statement-ending semicolon and continues with later records.
+    pub fn skipped(&self) -> &[ParseError] {
+        &self.skipped
     }
 
     /// Look up one entity by `expressId`.

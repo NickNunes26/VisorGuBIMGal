@@ -12,7 +12,7 @@ struct Scanner<'a> {
 
 struct Record {
     id: u32,
-    type_name: String,
+    type_names: Vec<String>,
     start: usize,
     end: usize,
 }
@@ -138,7 +138,44 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Scan `#id = TYPE(...);` without decoding its parameters.
+    /// Skip a parenthesised body. The opening `(` is already consumed.
+    ///
+    /// Records are scanned iteratively, so this cannot exhaust the stack.
+    fn skip_parenthesized_body(&mut self) -> Result<(), ParseError> {
+        let mut depth = 1usize;
+        loop {
+            match self.peek() {
+                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+                Some(b'\'') => {
+                    self.pos = self.pos.saturating_add(1);
+                    self.skip_single_quoted()?;
+                }
+                Some(b'"') => {
+                    self.pos = self.pos.saturating_add(1);
+                    self.skip_double_quoted()?;
+                }
+                Some(b'/') if self.peek_at(1) == Some(b'*') => self.skip_comment()?,
+                Some(b'(') => {
+                    self.pos = self.pos.saturating_add(1);
+                    depth = depth.saturating_add(1);
+                }
+                Some(b')') => {
+                    self.pos = self.pos.saturating_add(1);
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                Some(_) => {
+                    self.pos = self.pos.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Scan `#id = TYPE(...);` or `#id = (TYPE(...)TYPE(...));` without decoding
+    /// its parameters. Complex instances yield every partial type name in file
+    /// order; ordinary instances yield exactly one.
     fn scan_entity(&mut self) -> Result<Record, ParseError> {
         let start = self.pos;
         if self.peek() != Some(b'#') {
@@ -160,58 +197,96 @@ impl<'a> Scanner<'a> {
         }
 
         self.skip_ws_comments()?;
-        let type_name = self.read_word()?;
+        let mut type_names = Vec::new();
+        if self.peek() == Some(b'(') {
+            // Complex entity instance: `(A(...)B(...))`.
+            self.pos = self.pos.saturating_add(1);
+            loop {
+                self.skip_ws_comments()?;
+                match self.peek() {
+                    Some(b')') => {
+                        self.pos = self.pos.saturating_add(1);
+                        break;
+                    }
+                    None => return Err(self.error(ErrorKind::UnexpectedEof)),
+                    Some(_) => {}
+                }
+                let name = self.read_word()?;
+                type_names.push(name);
+                self.skip_ws_comments()?;
+                if self.peek() != Some(b'(') {
+                    return Err(self.error(ErrorKind::MalformedEntity));
+                }
+                self.pos = self.pos.saturating_add(1);
+                self.skip_parenthesized_body()?;
+            }
+        } else {
+            let name = self.read_word()?;
+            type_names.push(name);
+            self.skip_ws_comments()?;
+            if self.peek() != Some(b'(') {
+                return Err(self.error(ErrorKind::MalformedEntity));
+            }
+            self.pos = self.pos.saturating_add(1);
+            self.skip_parenthesized_body()?;
+        }
+
+        if type_names.is_empty() {
+            return Err(self.error(ErrorKind::MalformedEntity));
+        }
+
         self.skip_ws_comments()?;
-        if self.peek() != Some(b'(') {
+        if self.peek() != Some(b';') {
             return Err(self.error(ErrorKind::MalformedEntity));
         }
         self.pos = self.pos.saturating_add(1);
 
-        // Find the record terminator while ignoring strings, comments and
-        // nested parentheses. A semicolon outside them ends the entity.
-        let mut depth = 1usize;
+        Ok(Record {
+            id,
+            type_names,
+            start,
+            end: self.pos,
+        })
+    }
+
+    /// Skip to and including the next statement-ending semicolon.
+    ///
+    /// Parentheses are deliberately not balanced here: a truncated record is
+    /// exactly what we are recovering from, so the next semicolon outside a
+    /// string or comment is the safest place to resume.
+    fn resync_to_statement_end(&mut self) -> bool {
         loop {
             match self.peek() {
-                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+                None => return false,
+                Some(b';') => {
+                    self.pos = self.pos.saturating_add(1);
+                    return true;
+                }
                 Some(b'\'') => {
                     self.pos = self.pos.saturating_add(1);
-                    self.skip_single_quoted()?;
+                    if self.skip_single_quoted().is_err() {
+                        return false;
+                    }
                 }
                 Some(b'"') => {
                     self.pos = self.pos.saturating_add(1);
-                    self.skip_double_quoted()?;
-                }
-                Some(b'/') if self.peek_at(1) == Some(b'*') => self.skip_comment()?,
-                Some(b'(') => {
-                    self.pos = self.pos.saturating_add(1);
-                    depth = depth.saturating_add(1);
-                }
-                Some(b')') => {
-                    if depth == 0 {
-                        return Err(self.error(ErrorKind::MalformedEntity));
+                    if self.skip_double_quoted().is_err() {
+                        return false;
                     }
-                    self.pos = self.pos.saturating_add(1);
-                    depth -= 1;
                 }
-                Some(b';') if depth == 0 => {
-                    self.pos = self.pos.saturating_add(1);
-                    break;
+                Some(b'/') if self.peek_at(1) == Some(b'*') => {
+                    if self.skip_comment().is_err() {
+                        return false;
+                    }
                 }
                 Some(_) => {
                     self.pos = self.pos.saturating_add(1);
                 }
             }
         }
-
-        Ok(Record {
-            id,
-            type_name,
-            start,
-            end: self.pos,
-        })
     }
 
-    /// Skip to and including the next top-level semicolon.
+    /// Skip to and including the next semicolon. Used for header statements.
     fn skip_statement(&mut self) -> Result<(), ParseError> {
         loop {
             match self.peek() {
@@ -247,43 +322,81 @@ pub(crate) fn build(bytes: &[u8]) -> Result<StepIndex<'_>, ParseError> {
     let mut type_lookup: HashMap<String, u32> = HashMap::new();
     let mut by_type: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut duplicates: Vec<u32> = Vec::new();
+    let mut skipped: Vec<ParseError> = Vec::new();
+
+    // Header and data section tracking. A bare `DATA;` fragment is accepted so
+    // that callers can index snippets, but a file that declares itself as
+    // ISO-10303-21 must contain a HEADER statement.
+    let mut iso_declared = false;
+    let mut header_found = false;
+    let mut data_found = false;
+    let mut in_data = false;
 
     loop {
-        scanner.skip_ws_comments()?;
+        if let Err(err) = scanner.skip_ws_comments() {
+            // An unterminated comment consumes the rest of the file. Keep what
+            // was already indexed; whether that is enough is decided below.
+            skipped.push(err);
+            break;
+        }
         let byte = match scanner.peek() {
             Some(byte) => byte,
             None => break,
         };
 
         if byte == b'#' {
-            let record = scanner.scan_entity()?;
+            let record_start = scanner.pos;
+            match scanner.scan_entity() {
+                Ok(record) => {
+                    if in_data {
+                        if by_id.contains_key(&record.id) {
+                            duplicates.push(record.id);
+                            continue;
+                        }
 
-            if by_id.contains_key(&record.id) {
-                duplicates.push(record.id);
-                continue;
-            }
+                        let mut primary_type_idx = None;
+                        for type_name in &record.type_names {
+                            let type_idx = match type_lookup.get(type_name).copied() {
+                                Some(idx) => idx,
+                                None => {
+                                    let idx = u32::try_from(types.len()).map_err(|_| {
+                                        scanner.error(ErrorKind::IdentifierOverflow)
+                                    })?;
+                                    type_lookup.insert(type_name.clone(), idx);
+                                    types.push(type_name.clone());
+                                    idx
+                                }
+                            };
+                            if primary_type_idx.is_none() {
+                                primary_type_idx = Some(type_idx);
+                            }
+                            let ids = by_type.entry(type_idx).or_default();
+                            if ids.last() != Some(&record.id) {
+                                ids.push(record.id);
+                            }
+                        }
 
-            let type_idx = match type_lookup.get(&record.type_name).copied() {
-                Some(idx) => idx,
-                None => {
-                    let idx = u32::try_from(types.len())
-                        .map_err(|_| scanner.error(ErrorKind::IdentifierOverflow))?;
-                    type_lookup.insert(record.type_name.clone(), idx);
-                    types.push(record.type_name);
-                    idx
+                        let type_idx = primary_type_idx
+                            .ok_or_else(|| scanner.error(ErrorKind::MalformedEntity))?;
+                        let entry_idx = u32::try_from(entries.len())
+                            .map_err(|_| scanner.error(ErrorKind::IdentifierOverflow))?;
+                        entries.push(Entry {
+                            id: record.id,
+                            type_idx,
+                            start: record.start,
+                            end: record.end,
+                        });
+                        by_id.insert(record.id, entry_idx);
+                    }
                 }
-            };
-
-            let entry_idx =
-                u32::try_from(entries.len()).map_err(|_| scanner.error(ErrorKind::IdentifierOverflow))?;
-            entries.push(Entry {
-                id: record.id,
-                type_idx,
-                start: record.start,
-                end: record.end,
-            });
-            by_id.insert(record.id, entry_idx);
-            by_type.entry(type_idx).or_default().push(record.id);
+                Err(err) => {
+                    skipped.push(err);
+                    scanner.pos = record_start;
+                    if !scanner.resync_to_statement_end() {
+                        break;
+                    }
+                }
+            }
             continue;
         }
 
@@ -293,20 +406,61 @@ pub(crate) fn build(bytes: &[u8]) -> Result<StepIndex<'_>, ParseError> {
             continue;
         }
 
-        let word = scanner.read_word()?;
-        scanner.skip_ws_comments()?;
-
-        if word == "FILE_SCHEMA" {
-            if scanner.peek() != Some(b'(') {
-                return Err(scanner.error(ErrorKind::MalformedEntity));
+        let word = match scanner.read_word() {
+            Ok(word) => word,
+            Err(err) => {
+                skipped.push(err);
+                if !scanner.resync_to_statement_end() {
+                    break;
+                }
+                continue;
             }
-            let mut parser = Parser::new(bytes, scanner.pos, bytes.len());
-            let params = parser.parse_outer_params()?;
-            collect_schemas(&params, &mut schemas);
-            scanner.pos = parser.position();
+        };
+        if let Err(err) = scanner.skip_ws_comments() {
+            skipped.push(err);
+            break;
         }
 
-        scanner.skip_statement()?;
+        let starts_data = word == "DATA";
+        match word.as_str() {
+            "ISO-10303-21" => iso_declared = true,
+            "HEADER" => header_found = true,
+            "ENDSEC" => in_data = false,
+            _ => {}
+        }
+
+        if word == "FILE_SCHEMA" {
+            if scanner.peek() == Some(b'(') {
+                let mut parser = Parser::new(bytes, scanner.pos, bytes.len());
+                match parser.parse_outer_params() {
+                    Ok(params) => {
+                        collect_schemas(&params, &mut schemas);
+                        scanner.pos = parser.position();
+                    }
+                    Err(err) => skipped.push(err),
+                }
+            }
+        }
+
+        match scanner.skip_statement() {
+            Ok(()) => {
+                if starts_data {
+                    data_found = true;
+                    in_data = true;
+                }
+            }
+            Err(err) => {
+                skipped.push(err);
+                break;
+            }
+        }
+    }
+
+    if !data_found {
+        return Err(ParseError::new(bytes.len(), ErrorKind::MalformedEntity));
+    }
+    if iso_declared && !header_found {
+        return Err(ParseError::new(0, ErrorKind::MalformedEntity));
     }
 
     Ok(StepIndex {
@@ -318,13 +472,15 @@ pub(crate) fn build(bytes: &[u8]) -> Result<StepIndex<'_>, ParseError> {
         type_lookup,
         by_type,
         duplicates,
+        skipped,
     })
 }
 
 fn collect_schemas(params: &[Value], out: &mut Vec<String>) {
-    for param in params {
+    let mut stack: Vec<&Value> = params.iter().rev().collect();
+    while let Some(param) = stack.pop() {
         match param {
-            Value::List(values) => collect_schemas(values, out),
+            Value::List(values) => stack.extend(values.iter().rev()),
             Value::String(schema) => out.push(schema.clone()),
             _ => {}
         }

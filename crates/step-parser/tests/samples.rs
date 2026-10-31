@@ -163,11 +163,16 @@ fn dangling_reference_decodes_as_a_reference() {
 }
 
 #[test]
-fn malformed_input_returns_errors_with_offsets() {
+fn malformed_records_are_skipped_and_reported() {
     let unterminated = b"DATA;\n#1=IFCA('oops);\nENDSEC;";
-    let err = index(unterminated).unwrap_err();
-    assert_eq!(err.kind, step_parser::ErrorKind::UnterminatedString);
-    assert!(err.offset >= 12);
+    let parsed = index(unterminated).unwrap();
+    assert_eq!(parsed.entity_count(), 0);
+    assert_eq!(parsed.skipped().len(), 1);
+    assert_eq!(
+        parsed.skipped()[0].kind,
+        step_parser::ErrorKind::UnterminatedString
+    );
+    assert!(parsed.skipped()[0].offset >= 12);
 
     let missing = index(b"DATA;\n#1=IFCA($);\nENDSEC;").unwrap();
     assert_eq!(
@@ -175,6 +180,16 @@ fn malformed_input_returns_errors_with_offsets() {
         step_parser::ErrorKind::UnknownEntity(404)
     );
 
-    let no_paren = index(b"DATA;\n#1=IFCA;\nENDSEC;");
-    assert!(no_paren.is_err());
+    // A malformed record no longer fails the whole file, but a file without a
+    // usable DATA section still does.
+    let no_paren = index(b"DATA;\n#1=IFCA;\nENDSEC;").unwrap();
+    assert_eq!(no_paren.entity_count(), 0);
+    assert_eq!(no_paren.skipped().len(), 1);
+    assert_eq!(
+        no_paren.skipped()[0].kind,
+        step_parser::ErrorKind::MalformedEntity
+    );
+
+    let no_data = index(b"HEADER;\nENDSEC;\n").unwrap_err();
+    assert_eq!(no_data.kind, step_parser::ErrorKind::MalformedEntity);
 }
