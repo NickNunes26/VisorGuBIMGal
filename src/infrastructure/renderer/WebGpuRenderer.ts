@@ -1,0 +1,1534 @@
+import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/ModelRecord';
+import {
+  MESH_RECORD_WORDS,
+  MeshField,
+  MeshFlag,
+  findBatchError,
+  type GeometryBatch
+} from '../../domain/kernel/GeometryBatch';
+import type {
+  RendererEventHandlers,
+  RendererPort,
+  ViewPreset
+} from '../../domain/kernel/RendererPort';
+import { Camera } from './Camera';
+import { RENDERER_WGSL } from './shaders';
+
+const FLAG_VISIBLE = 8;
+const FLAG_SELECTED = 16;
+
+interface GpuBatchEntry {
+  origin: readonly [number, number, number];
+  recordOffsetInModel: number;
+  recordCount: number;
+  opaqueIndexCount: number;
+  transparentIndexCount: number;
+  positionBuffer: GPUBuffer;
+  normalBuffer: GPUBuffer;
+  recordIndexBuffer: GPUBuffer;
+  opaqueIndexBuffer: GPUBuffer | null;
+  transparentIndexBuffer: GPUBuffer | null;
+  gpuBytes: number;
+}
+
+interface ModelEntry {
+  modelId: ModelId;
+  numericId: number;
+  visible: boolean;
+  batches: GpuBatchEntry[];
+  /** 4 u32 words per record: [expressId, modelNumericId, rgba, stateFlags]. */
+  recordWords: number[];
+  /** Maps expressId -> list of record indices (0..recordCount-1) within this model. */
+  expressIdToRecords: Map<number, number[]>;
+  /** Visibility overrides set via setElementVisibility. */
+  visibilityOverrides: Map<number, boolean>;
+  /** Starting record index in the global GPU record buffer. */
+  recordBaseOffset: number;
+  bounds: {
+    minX: number;
+    minY: number;
+    minZ: number;
+    maxX: number;
+    maxY: number;
+    maxZ: number;
+    valid: boolean;
+  };
+}
+
+interface PreInitOp {
+  kind: 'batch';
+  batch: GeometryBatch;
+}
+
+export interface RendererDebugStats {
+  modelCount: number;
+  batchCount: number;
+  recordCount: number;
+  liveGpuBuffers: number;
+  allocatedGpuBytes: number;
+  renderCount: number;
+  lastFrameCpuMs: number;
+}
+
+export class WebGpuRenderer implements RendererPort {
+  private canvas: HTMLCanvasElement | null = null;
+  private device: GPUDevice | null = null;
+  private context: GPUCanvasContext | null = null;
+  private canvasFormat: GPUTextureFormat = 'bgra8unorm';
+
+  private bindGroupLayout: GPUBindGroupLayout | null = null;
+  private sceneBindGroup: GPUBindGroup | null = null;
+  private opaquePipeline: GPURenderPipeline | null = null;
+  private transparentPipeline: GPURenderPipeline | null = null;
+  private pickPipeline: GPURenderPipeline | null = null;
+
+  private sceneUniformBuffer: GPUBuffer | null = null;
+  private batchGpuBuffer: GPUBuffer | null = null;
+  private batchGpuCapacity = 0; // in batches
+  private recordGpuBuffer: GPUBuffer | null = null;
+  private recordGpuCapacity = 0; // in records
+  private pickReadBuffer: GPUBuffer | null = null;
+
+  private depthTexture: GPUTexture | null = null;
+  private depthTextureView: GPUTextureView | null = null;
+  private idTexture: GPUTexture | null = null;
+  private idTextureView: GPUTextureView | null = null;
+
+  private readonly camera = new Camera();
+  private readonly sceneUniformData = new Float32Array(32);
+
+  private batchCpuBuffer = new ArrayBuffer(64 * 16);
+  private batchF32 = new Float32Array(this.batchCpuBuffer);
+  private batchU32 = new Uint32Array(this.batchCpuBuffer);
+
+  private recordCpuWords = new Uint32Array(64 * 4);
+  private recordLayoutDirty = true;
+
+  private models: Map<ModelId, ModelEntry> = new Map();
+  private numToModelId: Map<number, ModelId> = new Map();
+  private nextModelNumericId = 1;
+
+  private preInitQueue: PreInitOp[] = [];
+  private pendingFinishBounds: Map<ModelId, ModelBounds | undefined> = new Map();
+
+  private selectedRef: ElementRef | null = null;
+  private handlers: RendererEventHandlers = {};
+  private hasFramedInitialModel = false;
+
+  private rafId: number | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  private cleanupListeners: (() => void) | null = null;
+  private deviceLostBanner: HTMLDivElement | null = null;
+  private isDestroyed = false;
+  private isPicking = false;
+  private initGeneration = 0;
+
+  // Telemetry for verification and performance checks
+  private renderCount = 0;
+  private lastFrameCpuMs = 0;
+
+  setHandlers(handlers: RendererEventHandlers): void {
+    this.handlers = handlers;
+  }
+
+  async initialize(canvas: HTMLCanvasElement): Promise<void> {
+    const gen = ++this.initGeneration;
+    this.releaseGpuDeviceAndListeners();
+    this.isDestroyed = false;
+    this.canvas = canvas;
+
+    if (typeof navigator === 'undefined' || !('gpu' in navigator) || !navigator.gpu) {
+      throw new Error(
+        'WebGPU no está disponible en este navegador o equipo. Por favor, utiliza un navegador compatible (Chrome o Edge) con aceleración gráfica habilitada.'
+      );
+    }
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error(
+        'No se pudo obtener un adaptador gráfico WebGPU compatible en este equipo. Verifica que los controladores de tu tarjeta gráfica estén actualizados.'
+      );
+    }
+
+    let device: GPUDevice;
+    try {
+      device = await adapter.requestDevice();
+    } catch (err) {
+      throw new Error(
+        `No se pudo inicializar el dispositivo gráfico WebGPU: ${err instanceof Error ? err.message : 'Error desconocido'}`
+      );
+    }
+
+    if (this.isDestroyed || gen !== this.initGeneration) {
+      device.destroy();
+      return;
+    }
+
+    const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
+    if (!context) {
+      device.destroy();
+      throw new Error('No se pudo crear el contexto WebGPU en el lienzo 3D.');
+    }
+
+    this.device = device;
+    this.context = context;
+    this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+    context.configure({
+      device,
+      format: this.canvasFormat,
+      alphaMode: 'opaque'
+    });
+
+    void device.lost.then((info) => {
+      if (this.isDestroyed || info.reason === 'destroyed') return;
+      const msg = `Se perdió la conexión con el dispositivo gráfico WebGPU${info.message ? ` (${info.message})` : ''}. Recarga la página para restaurar el visor 3D.`;
+      console.error(msg);
+      this.showDeviceLostBanner(msg);
+    });
+
+    this.createPipelinesAndBuffers(device);
+    this.setupListeners(canvas);
+    this.syncCanvasSize();
+
+    if (import.meta.env.DEV && typeof window !== 'undefined') {
+      (window as unknown as Record<string, unknown>).__gubim_dev__ = {
+        renderer: this,
+        findBatchError
+      };
+    }
+
+    // Drain any batches and finishModel calls that arrived before initialize resolved
+    if (this.preInitQueue.length > 0) {
+      const queued = this.preInitQueue.splice(0, this.preInitQueue.length);
+      for (const op of queued) {
+        if (op.kind === 'batch' && this.models.has(op.batch.modelId)) {
+          this.uploadBatchInternal(op.batch);
+        }
+      }
+    }
+
+    if (this.pendingFinishBounds.size > 0) {
+      const entries = Array.from(this.pendingFinishBounds.entries());
+      this.pendingFinishBounds.clear();
+      for (const [modelId, bounds] of entries) {
+        this.finishModel(modelId, bounds);
+      }
+    }
+
+    this.requestRender();
+  }
+
+  private createPipelinesAndBuffers(device: GPUDevice): void {
+    const shaderModule = device.createShaderModule({
+      label: 'gubim-renderer-shader',
+      code: RENDERER_WGSL
+    });
+
+    this.bindGroupLayout = device.createBindGroupLayout({
+      label: 'gubim-scene-bgl',
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: 'uniform' }
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'read-only-storage' }
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'read-only-storage' }
+        }
+      ]
+    });
+
+    const pipelineLayout = device.createPipelineLayout({
+      label: 'gubim-pipeline-layout',
+      bindGroupLayouts: [this.bindGroupLayout]
+    });
+
+    const vertexBuffers: GPUVertexBufferLayout[] = [
+      {
+        arrayStride: 12,
+        stepMode: 'vertex',
+        attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }]
+      },
+      {
+        arrayStride: 12,
+        stepMode: 'vertex',
+        attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 1 }]
+      },
+      {
+        arrayStride: 4,
+        stepMode: 'vertex',
+        attributes: [{ format: 'uint32', offset: 0, shaderLocation: 2 }]
+      }
+    ];
+
+    this.opaquePipeline = device.createRenderPipeline({
+      label: 'gubim-opaque-pipeline',
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule,
+        entryPoint: 'vs_main',
+        buffers: vertexBuffers
+      },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'fs_main',
+        targets: [{ format: this.canvasFormat }]
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'none'
+      },
+      depthStencil: {
+        format: 'depth32float',
+        depthWriteEnabled: true,
+        depthCompare: 'greater'
+      }
+    });
+
+    this.transparentPipeline = device.createRenderPipeline({
+      label: 'gubim-transparent-pipeline',
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule,
+        entryPoint: 'vs_main',
+        buffers: vertexBuffers
+      },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'fs_main',
+        targets: [
+          {
+            format: this.canvasFormat,
+            blend: {
+              color: {
+                srcFactor: 'src-alpha',
+                dstFactor: 'one-minus-src-alpha',
+                operation: 'add'
+              },
+              alpha: {
+                srcFactor: 'one',
+                dstFactor: 'one-minus-src-alpha',
+                operation: 'add'
+              }
+            }
+          }
+        ]
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'none'
+      },
+      depthStencil: {
+        format: 'depth32float',
+        depthWriteEnabled: false,
+        depthCompare: 'greater'
+      }
+    });
+
+    this.pickPipeline = device.createRenderPipeline({
+      label: 'gubim-pick-pipeline',
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule,
+        entryPoint: 'vs_pick',
+        buffers: vertexBuffers
+      },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'fs_pick',
+        targets: [{ format: 'rg32uint' }]
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'none'
+      },
+      depthStencil: {
+        format: 'depth32float',
+        depthWriteEnabled: true,
+        depthCompare: 'greater'
+      }
+    });
+
+    this.sceneUniformBuffer = device.createBuffer({
+      label: 'gubim-scene-uniforms',
+      size: 128,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    this.batchGpuCapacity = 64;
+    this.batchGpuBuffer = device.createBuffer({
+      label: 'gubim-batch-buffer',
+      size: this.batchGpuCapacity * 16,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+
+    this.recordGpuCapacity = 64;
+    this.recordGpuBuffer = device.createBuffer({
+      label: 'gubim-record-buffer',
+      size: this.recordGpuCapacity * 16,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+
+    this.pickReadBuffer = device.createBuffer({
+      label: 'gubim-pick-read-buffer',
+      size: 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+
+    this.recreateBindGroup();
+    this.recordLayoutDirty = true;
+  }
+
+  private recreateBindGroup(): void {
+    if (
+      !this.device ||
+      !this.bindGroupLayout ||
+      !this.sceneUniformBuffer ||
+      !this.batchGpuBuffer ||
+      !this.recordGpuBuffer
+    ) {
+      return;
+    }
+
+    this.sceneBindGroup = this.device.createBindGroup({
+      label: 'gubim-scene-bg',
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.sceneUniformBuffer } },
+        { binding: 1, resource: { buffer: this.batchGpuBuffer } },
+        { binding: 2, resource: { buffer: this.recordGpuBuffer } }
+      ]
+    });
+  }
+
+  private syncCanvasSize(): void {
+    if (!this.canvas || !this.device) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.max(1, Math.floor((rect.width || this.canvas.clientWidth || 800) * dpr));
+    const height = Math.max(1, Math.floor((rect.height || this.canvas.clientHeight || 600) * dpr));
+
+    if (
+      this.canvas.width === width &&
+      this.canvas.height === height &&
+      this.depthTexture &&
+      this.idTexture
+    ) {
+      return;
+    }
+
+    this.canvas.width = width;
+    this.canvas.height = height;
+    this.camera.setAspect(width / height);
+
+    this.depthTexture?.destroy();
+    this.idTexture?.destroy();
+
+    this.depthTexture = this.device.createTexture({
+      label: 'gubim-depth-texture',
+      size: { width, height, depthOrArrayLayers: 1 },
+      format: 'depth32float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT
+    });
+    this.depthTextureView = this.depthTexture.createView();
+
+    this.idTexture = this.device.createTexture({
+      label: 'gubim-id-texture',
+      size: { width, height, depthOrArrayLayers: 1 },
+      format: 'rg32uint',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
+    });
+    this.idTextureView = this.idTexture.createView();
+
+    this.requestRender();
+  }
+
+  private setupListeners(canvas: HTMLCanvasElement): void {
+    const onResize = () => {
+      this.syncCanvasSize();
+    };
+
+    window.addEventListener('resize', onResize);
+
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        this.syncCanvasSize();
+      });
+      this.resizeObserver.observe(canvas);
+      if (canvas.parentElement) {
+        this.resizeObserver.observe(canvas.parentElement);
+      }
+    }
+
+    let isDragging = false;
+    let isPanning = false;
+    let startX = 0;
+    let startY = 0;
+    let hasMoved = false;
+
+    const onMouseDown = (e: MouseEvent) => {
+      isDragging = true;
+      hasMoved = false;
+      isPanning = e.button === 1 || e.button === 2 || e.shiftKey;
+      startX = e.clientX;
+      startY = e.clientY;
+      canvas.style.cursor = isPanning ? 'move' : 'grabbing';
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isDragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+        hasMoved = true;
+      }
+
+      startX = e.clientX;
+      startY = e.clientY;
+
+      if (isPanning) {
+        this.camera.pan(dx, dy);
+      } else {
+        this.camera.orbit(dx, dy);
+      }
+      this.requestRender();
+    };
+
+    const onMouseUp = (e: MouseEvent) => {
+      if (!isDragging) return;
+      const wasLeftClick = !hasMoved && e.button === 0;
+      isDragging = false;
+      isPanning = false;
+      canvas.style.cursor = 'grab';
+
+      if (wasLeftClick) {
+        const rect = canvas.getBoundingClientRect();
+        const cssX = e.clientX - rect.left;
+        const cssY = e.clientY - rect.top;
+        void this.pick(cssX, cssY).then((hit) => {
+          this.setSelection(hit);
+          this.handlers.onSelect?.(hit);
+        });
+      }
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      this.camera.zoom(e.deltaY);
+      this.requestRender();
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+
+    canvas.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('contextmenu', onContextMenu);
+    canvas.style.cursor = 'grab';
+
+    this.cleanupListeners = () => {
+      window.removeEventListener('resize', onResize);
+      canvas.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('contextmenu', onContextMenu);
+    };
+  }
+
+  private showDeviceLostBanner(message: string): void {
+    const parent = this.canvas?.parentElement;
+    if (!parent) return;
+    if (this.deviceLostBanner) {
+      this.deviceLostBanner.textContent = message;
+      return;
+    }
+    const div = document.createElement('div');
+    div.style.cssText =
+      'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(15,23,42,0.95);border:1px solid #ef4444;padding:20px;border-radius:8px;color:#f8fafc;font-size:13px;max-width:420px;text-align:center;z-index:40;';
+    div.textContent = message;
+    parent.appendChild(div);
+    this.deviceLostBanner = div;
+  }
+
+  private getOrCreateModel(modelId: ModelId): ModelEntry {
+    let model = this.models.get(modelId);
+    if (!model) {
+      const numericId = this.nextModelNumericId++;
+      model = {
+        modelId,
+        numericId,
+        visible: true,
+        batches: [],
+        recordWords: [],
+        expressIdToRecords: new Map(),
+        visibilityOverrides: new Map(),
+        recordBaseOffset: 0,
+        bounds: {
+          minX: Infinity,
+          minY: Infinity,
+          minZ: Infinity,
+          maxX: -Infinity,
+          maxY: -Infinity,
+          maxZ: -Infinity,
+          valid: false
+        }
+      };
+      this.models.set(modelId, model);
+      this.numToModelId.set(numericId, modelId);
+    }
+    return model;
+  }
+
+  addModel(modelId: ModelId): void {
+    this.getOrCreateModel(modelId);
+  }
+
+  addBatch(batch: GeometryBatch): void {
+    this.getOrCreateModel(batch.modelId);
+    if (!this.device) {
+      this.preInitQueue.push({ kind: 'batch', batch });
+      return;
+    }
+    this.uploadBatchInternal(batch);
+    this.requestRender();
+  }
+
+  private uploadBatchInternal(batch: GeometryBatch): void {
+    if (!this.device) return;
+    const model = this.getOrCreateModel(batch.modelId);
+    const { positions, normals, indices, meshTable, origin } = batch;
+
+    const vertexCount = positions.length / 3;
+    const recordCount = meshTable.length / MESH_RECORD_WORDS;
+    if (vertexCount === 0 || indices.length === 0 || recordCount === 0) {
+      return;
+    }
+
+    const recordOffsetInModel = model.recordWords.length / 4;
+    const localRecordIndexArray = new Uint32Array(vertexCount);
+
+    let opaqueIndexCount = 0;
+    let transparentIndexCount = 0;
+
+    const ox = origin[0];
+    const oy = origin[1];
+    const oz = origin[2];
+
+    for (let r = 0; r < recordCount; r++) {
+      const base = r * MESH_RECORD_WORDS;
+      const expressId = meshTable[base + MeshField.expressId] >>> 0;
+      const firstVertex = meshTable[base + MeshField.firstVertex] >>> 0;
+      const vCount = meshTable[base + MeshField.vertexCount] >>> 0;
+      const iCount = meshTable[base + MeshField.indexCount] >>> 0;
+      const rgba = meshTable[base + MeshField.rgba] >>> 0;
+      const rawFlags = meshTable[base + MeshField.flags] >>> 0;
+
+      localRecordIndexArray.fill(r, firstVertex, firstVertex + vCount);
+
+      const isTransparent = (rawFlags & MeshFlag.Transparent) !== 0 || (rgba & 0xff) < 255;
+      if (isTransparent) {
+        transparentIndexCount += iCount;
+      } else {
+        opaqueIndexCount += iCount;
+      }
+
+      const hiddenByDefault = (rawFlags & MeshFlag.HiddenByDefault) !== 0;
+      if (!hiddenByDefault) {
+        const endVert = firstVertex + vCount;
+        for (let v = firstVertex; v < endVert; v++) {
+          const pIdx = v * 3;
+          const wx = ox + positions[pIdx];
+          const wy = oy + positions[pIdx + 1];
+          const wz = oz + positions[pIdx + 2];
+          if (wx < model.bounds.minX) model.bounds.minX = wx;
+          if (wy < model.bounds.minY) model.bounds.minY = wy;
+          if (wz < model.bounds.minZ) model.bounds.minZ = wz;
+          if (wx > model.bounds.maxX) model.bounds.maxX = wx;
+          if (wy > model.bounds.maxY) model.bounds.maxY = wy;
+          if (wz > model.bounds.maxZ) model.bounds.maxZ = wz;
+          model.bounds.valid = true;
+        }
+      }
+
+      const visOverride = model.visibilityOverrides.get(expressId);
+      const isCurrentlyVisible = visOverride !== undefined ? visOverride : !hiddenByDefault;
+      const isSelected =
+        this.selectedRef !== null &&
+        this.selectedRef.modelId === model.modelId &&
+        this.selectedRef.expressId === expressId;
+
+      const stateFlags =
+        ((rawFlags & 0x7) |
+          (isCurrentlyVisible ? FLAG_VISIBLE : 0) |
+          (isSelected ? FLAG_SELECTED : 0)) >>>
+        0;
+
+      const recIdxInModel = recordOffsetInModel + r;
+      model.recordWords.push(expressId, model.numericId >>> 0, rgba, stateFlags);
+
+      let list = model.expressIdToRecords.get(expressId);
+      if (!list) {
+        list = [];
+        model.expressIdToRecords.set(expressId, list);
+      }
+      list.push(recIdxInModel);
+    }
+
+    const posByteLen = Math.max(4, positions.byteLength);
+    const positionBuffer = this.device.createBuffer({
+      size: posByteLen,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(
+      positionBuffer,
+      0,
+      positions.buffer,
+      positions.byteOffset,
+      positions.byteLength
+    );
+
+    const normByteLen = Math.max(4, normals.byteLength);
+    const normalBuffer = this.device.createBuffer({
+      size: normByteLen,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(
+      normalBuffer,
+      0,
+      normals.buffer,
+      normals.byteOffset,
+      normals.byteLength
+    );
+
+    const recIdxByteLen = Math.max(4, localRecordIndexArray.byteLength);
+    const recordIndexBuffer = this.device.createBuffer({
+      size: recIdxByteLen,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(
+      recordIndexBuffer,
+      0,
+      localRecordIndexArray.buffer,
+      localRecordIndexArray.byteOffset,
+      localRecordIndexArray.byteLength
+    );
+
+    let opaqueIndexBuffer: GPUBuffer | null = null;
+    let transparentIndexBuffer: GPUBuffer | null = null;
+    let indexGpuBytes = 0;
+
+    if (transparentIndexCount === 0) {
+      opaqueIndexBuffer = this.device.createBuffer({
+        size: Math.max(4, indices.byteLength),
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+      });
+      this.device.queue.writeBuffer(
+        opaqueIndexBuffer,
+        0,
+        indices.buffer,
+        indices.byteOffset,
+        indices.byteLength
+      );
+      indexGpuBytes += opaqueIndexBuffer.size;
+    } else if (opaqueIndexCount === 0) {
+      transparentIndexBuffer = this.device.createBuffer({
+        size: Math.max(4, indices.byteLength),
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+      });
+      this.device.queue.writeBuffer(
+        transparentIndexBuffer,
+        0,
+        indices.buffer,
+        indices.byteOffset,
+        indices.byteLength
+      );
+      indexGpuBytes += transparentIndexBuffer.size;
+    } else {
+      const opaqueIndices = new Uint32Array(opaqueIndexCount);
+      const transparentIndices = new Uint32Array(transparentIndexCount);
+      let opCursor = 0;
+      let trCursor = 0;
+
+      for (let r = 0; r < recordCount; r++) {
+        const base = r * MESH_RECORD_WORDS;
+        const firstIndex = meshTable[base + MeshField.firstIndex] >>> 0;
+        const iCount = meshTable[base + MeshField.indexCount] >>> 0;
+        const rgba = meshTable[base + MeshField.rgba] >>> 0;
+        const rawFlags = meshTable[base + MeshField.flags] >>> 0;
+        const isTransparent = (rawFlags & MeshFlag.Transparent) !== 0 || (rgba & 0xff) < 255;
+
+        if (isTransparent) {
+          transparentIndices.set(indices.subarray(firstIndex, firstIndex + iCount), trCursor);
+          trCursor += iCount;
+        } else {
+          opaqueIndices.set(indices.subarray(firstIndex, firstIndex + iCount), opCursor);
+          opCursor += iCount;
+        }
+      }
+
+      opaqueIndexBuffer = this.device.createBuffer({
+        size: Math.max(4, opaqueIndices.byteLength),
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+      });
+      this.device.queue.writeBuffer(opaqueIndexBuffer, 0, opaqueIndices.buffer, 0, opaqueIndices.byteLength);
+      indexGpuBytes += opaqueIndexBuffer.size;
+
+      transparentIndexBuffer = this.device.createBuffer({
+        size: Math.max(4, transparentIndices.byteLength),
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+      });
+      this.device.queue.writeBuffer(
+        transparentIndexBuffer,
+        0,
+        transparentIndices.buffer,
+        0,
+        transparentIndices.byteLength
+      );
+      indexGpuBytes += transparentIndexBuffer.size;
+    }
+
+    const gpuBytes = positionBuffer.size + normalBuffer.size + recordIndexBuffer.size + indexGpuBytes;
+
+    model.batches.push({
+      origin: [ox, oy, oz],
+      recordOffsetInModel,
+      recordCount,
+      opaqueIndexCount,
+      transparentIndexCount,
+      positionBuffer,
+      normalBuffer,
+      recordIndexBuffer,
+      opaqueIndexBuffer,
+      transparentIndexBuffer,
+      gpuBytes
+    });
+
+    this.recordLayoutDirty = true;
+  }
+
+  finishModel(modelId: ModelId, bounds: ModelBounds | undefined): void {
+    if (!this.device) {
+      this.pendingFinishBounds.set(modelId, bounds);
+      return;
+    }
+
+    const model = this.models.get(modelId);
+    if (model && !model.bounds.valid && bounds) {
+      model.bounds.minX = bounds.min.x;
+      model.bounds.minY = bounds.min.y;
+      model.bounds.minZ = bounds.min.z;
+      model.bounds.maxX = bounds.max.x;
+      model.bounds.maxY = bounds.max.y;
+      model.bounds.maxZ = bounds.max.z;
+      model.bounds.valid = true;
+    }
+
+    if (!this.hasFramedInitialModel && model && model.visible && model.bounds.valid) {
+      this.hasFramedInitialModel = true;
+      this.fitToView();
+    } else {
+      this.requestRender();
+    }
+  }
+
+  removeModel(modelId: ModelId): void {
+    this.preInitQueue = this.preInitQueue.filter(
+      (op) => !(op.kind === 'batch' && op.batch.modelId === modelId)
+    );
+    this.pendingFinishBounds.delete(modelId);
+
+    const model = this.models.get(modelId);
+    if (!model) return;
+
+    for (const b of model.batches) {
+      b.positionBuffer.destroy();
+      b.normalBuffer.destroy();
+      b.recordIndexBuffer.destroy();
+      b.opaqueIndexBuffer?.destroy();
+      b.transparentIndexBuffer?.destroy();
+    }
+    model.batches.length = 0;
+
+    this.numToModelId.delete(model.numericId);
+    this.models.delete(modelId);
+
+    if (this.selectedRef?.modelId === modelId) {
+      this.selectedRef = null;
+    }
+
+    if (this.models.size === 0) {
+      this.hasFramedInitialModel = false;
+      this.shrinkDynamicBuffersIfEmpty();
+    }
+
+    this.recordLayoutDirty = true;
+    this.requestRender();
+  }
+
+  private shrinkDynamicBuffersIfEmpty(): void {
+    if (!this.device) return;
+    let rebind = false;
+
+    if (this.batchGpuCapacity > 64) {
+      this.batchGpuBuffer?.destroy();
+      this.batchGpuCapacity = 64;
+      this.batchGpuBuffer = this.device.createBuffer({
+        label: 'gubim-batch-buffer',
+        size: this.batchGpuCapacity * 16,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      });
+      this.batchCpuBuffer = new ArrayBuffer(64 * 16);
+      this.batchF32 = new Float32Array(this.batchCpuBuffer);
+      this.batchU32 = new Uint32Array(this.batchCpuBuffer);
+      rebind = true;
+    }
+
+    if (this.recordGpuCapacity > 64) {
+      this.recordGpuBuffer?.destroy();
+      this.recordGpuCapacity = 64;
+      this.recordGpuBuffer = this.device.createBuffer({
+        label: 'gubim-record-buffer',
+        size: this.recordGpuCapacity * 16,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      });
+      this.recordCpuWords = new Uint32Array(64 * 4);
+      rebind = true;
+    }
+
+    if (rebind) {
+      this.recreateBindGroup();
+    }
+  }
+
+  setModelVisibility(modelId: ModelId, visible: boolean): void {
+    const model = this.models.get(modelId);
+    if (!model) return;
+    if (model.visible === visible) return;
+    model.visible = visible;
+    this.requestRender();
+  }
+
+  setElementVisibility(refs: readonly ElementRef[], visible: boolean): void {
+    let anyChanged = false;
+    for (const ref of refs) {
+      const model = this.models.get(ref.modelId);
+      if (!model) continue;
+      model.visibilityOverrides.set(ref.expressId, visible);
+      const recIndices = model.expressIdToRecords.get(ref.expressId);
+      if (!recIndices || recIndices.length === 0) continue;
+
+      for (const rIdx of recIndices) {
+        const wordIdx = rIdx * 4 + 3;
+        const prevFlags = model.recordWords[wordIdx];
+        const nextFlags = visible
+          ? ((prevFlags | FLAG_VISIBLE) >>> 0)
+          : ((prevFlags & ~FLAG_VISIBLE) >>> 0);
+        if (prevFlags !== nextFlags) {
+          model.recordWords[wordIdx] = nextFlags;
+          this.writeSingleRecordStateToGpu(model.recordBaseOffset + rIdx, model, rIdx);
+          anyChanged = true;
+        }
+      }
+    }
+
+    if (anyChanged) {
+      this.requestRender();
+    }
+  }
+
+  setSelection(ref: ElementRef | null): void {
+    const prev = this.selectedRef;
+    if (
+      prev === ref ||
+      (prev !== null &&
+        ref !== null &&
+        prev.modelId === ref.modelId &&
+        prev.expressId === ref.expressId)
+    ) {
+      return;
+    }
+
+    this.selectedRef = ref ? { modelId: ref.modelId, expressId: ref.expressId, globalId: ref.globalId } : null;
+
+    if (prev) {
+      this.updateElementSelectionFlag(prev.modelId, prev.expressId, false);
+    }
+    if (ref) {
+      this.updateElementSelectionFlag(ref.modelId, ref.expressId, true);
+    }
+
+    this.requestRender();
+  }
+
+  private updateElementSelectionFlag(modelId: ModelId, expressId: number, selected: boolean): void {
+    const model = this.models.get(modelId);
+    if (!model) return;
+    const recIndices = model.expressIdToRecords.get(expressId);
+    if (!recIndices) return;
+
+    for (const rIdx of recIndices) {
+      const wordIdx = rIdx * 4 + 3;
+      const prevFlags = model.recordWords[wordIdx];
+      const nextFlags = selected
+        ? ((prevFlags | FLAG_SELECTED) >>> 0)
+        : ((prevFlags & ~FLAG_SELECTED) >>> 0);
+      if (prevFlags !== nextFlags) {
+        model.recordWords[wordIdx] = nextFlags;
+        this.writeSingleRecordStateToGpu(model.recordBaseOffset + rIdx, model, rIdx);
+      }
+    }
+  }
+
+  private writeSingleRecordStateToGpu(
+    globalRecordIndex: number,
+    model: ModelEntry,
+    modelRecordIndex: number
+  ): void {
+    if (!this.device || !this.recordGpuBuffer || this.recordLayoutDirty) return;
+    const cpuBase = globalRecordIndex * 4;
+    const modelBase = modelRecordIndex * 4;
+    if (cpuBase + 4 > this.recordCpuWords.length) return;
+
+    this.recordCpuWords[cpuBase] = model.recordWords[modelBase];
+    this.recordCpuWords[cpuBase + 1] = model.recordWords[modelBase + 1];
+    this.recordCpuWords[cpuBase + 2] = model.recordWords[modelBase + 2];
+    this.recordCpuWords[cpuBase + 3] = model.recordWords[modelBase + 3];
+
+    this.device.queue.writeBuffer(
+      this.recordGpuBuffer,
+      globalRecordIndex * 16,
+      this.recordCpuWords.buffer,
+      cpuBase * 4,
+      16
+    );
+  }
+
+  private computeVisibleBounds(): ModelBounds | null {
+    let minX = Infinity;
+    let minY = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxZ = -Infinity;
+    let found = false;
+
+    for (const model of this.models.values()) {
+      if (!model.visible || !model.bounds.valid) continue;
+      if (model.bounds.minX < minX) minX = model.bounds.minX;
+      if (model.bounds.minY < minY) minY = model.bounds.minY;
+      if (model.bounds.minZ < minZ) minZ = model.bounds.minZ;
+      if (model.bounds.maxX > maxX) maxX = model.bounds.maxX;
+      if (model.bounds.maxY > maxY) maxY = model.bounds.maxY;
+      if (model.bounds.maxZ > maxZ) maxZ = model.bounds.maxZ;
+      found = true;
+    }
+
+    if (!found) {
+      for (const model of this.models.values()) {
+        if (!model.bounds.valid) continue;
+        if (model.bounds.minX < minX) minX = model.bounds.minX;
+        if (model.bounds.minY < minY) minY = model.bounds.minY;
+        if (model.bounds.minZ < minZ) minZ = model.bounds.minZ;
+        if (model.bounds.maxX > maxX) maxX = model.bounds.maxX;
+        if (model.bounds.maxY > maxY) maxY = model.bounds.maxY;
+        if (model.bounds.maxZ > maxZ) maxZ = model.bounds.maxZ;
+        found = true;
+      }
+    }
+
+    if (!found) return null;
+    return {
+      min: { x: minX, y: minY, z: minZ },
+      max: { x: maxX, y: maxY, z: maxZ }
+    };
+  }
+
+  setViewPreset(preset: ViewPreset): void {
+    const bounds = this.computeVisibleBounds();
+    this.camera.setPreset(preset, bounds);
+    this.requestRender();
+  }
+
+  fitToView(): void {
+    const bounds = this.computeVisibleBounds();
+    if (bounds) {
+      this.camera.fitToBounds(bounds);
+    }
+    this.requestRender();
+  }
+
+  private requestRender(): void {
+    if (this.isDestroyed || !this.device || this.rafId !== null) return;
+    this.rafId = requestAnimationFrame(() => {
+      this.rafId = null;
+      this.renderFrame();
+    });
+  }
+
+  private updateGpuSceneTables(): number {
+    if (!this.device || !this.sceneUniformBuffer) return 0;
+
+    // 1. Rebuild record storage buffer if any batch was added or model removed
+    if (this.recordLayoutDirty) {
+      let totalRecords = 0;
+      for (const model of this.models.values()) {
+        model.recordBaseOffset = totalRecords;
+        totalRecords += model.recordWords.length / 4;
+      }
+
+      const requiredCapacity = Math.max(64, totalRecords);
+      if (requiredCapacity > this.recordGpuCapacity || !this.recordGpuBuffer) {
+        let nextCap = Math.max(64, this.recordGpuCapacity);
+        while (nextCap < requiredCapacity) nextCap *= 2;
+        this.recordGpuBuffer?.destroy();
+        this.recordGpuCapacity = nextCap;
+        this.recordGpuBuffer = this.device.createBuffer({
+          label: 'gubim-record-buffer',
+          size: this.recordGpuCapacity * 16,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        this.recordCpuWords = new Uint32Array(this.recordGpuCapacity * 4);
+        this.recreateBindGroup();
+      } else if (this.recordCpuWords.length < requiredCapacity * 4) {
+        this.recordCpuWords = new Uint32Array(this.recordGpuCapacity * 4);
+      }
+
+      for (const model of this.models.values()) {
+        const dstStart = model.recordBaseOffset * 4;
+        const words = model.recordWords;
+        for (let i = 0; i < words.length; i++) {
+          this.recordCpuWords[dstStart + i] = words[i];
+        }
+      }
+
+      if (totalRecords > 0 && this.recordGpuBuffer) {
+        this.device.queue.writeBuffer(
+          this.recordGpuBuffer,
+          0,
+          this.recordCpuWords.buffer,
+          0,
+          totalRecords * 16
+        );
+      }
+      this.recordLayoutDirty = false;
+    }
+
+    // 2. Write camera projection + rotation-only view matrix
+    this.camera.writeUniforms(this.sceneUniformData);
+    this.device.queue.writeBuffer(
+      this.sceneUniformBuffer,
+      0,
+      this.sceneUniformData.buffer,
+      0,
+      128
+    );
+
+    // 3. Compute (batch.origin - camera.eye) in f64 on CPU, convert to f32, and write in ONE writeBuffer
+    let totalBatches = 0;
+    for (const model of this.models.values()) {
+      totalBatches += model.batches.length;
+    }
+
+    if (totalBatches === 0) return 0;
+
+    if (totalBatches > this.batchGpuCapacity || !this.batchGpuBuffer) {
+      let nextCap = Math.max(64, this.batchGpuCapacity);
+      while (nextCap < totalBatches) nextCap *= 2;
+      this.batchGpuBuffer?.destroy();
+      this.batchGpuCapacity = nextCap;
+      this.batchGpuBuffer = this.device.createBuffer({
+        label: 'gubim-batch-buffer',
+        size: this.batchGpuCapacity * 16,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      });
+      this.batchCpuBuffer = new ArrayBuffer(this.batchGpuCapacity * 16);
+      this.batchF32 = new Float32Array(this.batchCpuBuffer);
+      this.batchU32 = new Uint32Array(this.batchCpuBuffer);
+      this.recreateBindGroup();
+    }
+
+    const eye = this.camera.getEye();
+    const eyeX = eye[0];
+    const eyeY = eye[1];
+    const eyeZ = eye[2];
+
+    let bIdx = 0;
+    for (const model of this.models.values()) {
+      const visMask = model.visible ? 0x80000000 : 0;
+      const modelRecBase = model.recordBaseOffset;
+
+      for (const batch of model.batches) {
+        const base = bIdx * 4;
+        // Subtract in f64 on CPU, then store as f32
+        this.batchF32[base] = batch.origin[0] - eyeX;
+        this.batchF32[base + 1] = batch.origin[1] - eyeY;
+        this.batchF32[base + 2] = batch.origin[2] - eyeZ;
+
+        const recordBase = (modelRecBase + batch.recordOffsetInModel) & 0x7fffffff;
+        this.batchU32[base + 3] = (recordBase | visMask) >>> 0;
+        bIdx++;
+      }
+    }
+
+    this.device.queue.writeBuffer(this.batchGpuBuffer, 0, this.batchCpuBuffer, 0, totalBatches * 16);
+    return totalBatches;
+  }
+
+  renderFrame(): void {
+    if (
+      this.isDestroyed ||
+      !this.device ||
+      !this.context ||
+      !this.opaquePipeline ||
+      !this.transparentPipeline ||
+      !this.sceneBindGroup ||
+      !this.depthTextureView
+    ) {
+      return;
+    }
+
+    const t0 = performance.now();
+    this.updateGpuSceneTables();
+
+    const colorView = this.context.getCurrentTexture().createView();
+    const encoder = this.device.createCommandEncoder();
+
+    const pass = encoder.beginRenderPass({
+      label: 'gubim-main-render-pass',
+      colorAttachments: [
+        {
+          view: colorView,
+          clearValue: { r: 0.06, g: 0.07, b: 0.09, a: 1.0 },
+          loadOp: 'clear',
+          storeOp: 'store'
+        }
+      ],
+      depthStencilAttachment: {
+        view: this.depthTextureView,
+        depthClearValue: 0.0,
+        depthLoadOp: 'clear',
+        depthStoreOp: 'store'
+      }
+    });
+
+    pass.setBindGroup(0, this.sceneBindGroup);
+
+    // Pass 1: Opaque geometry
+    pass.setPipeline(this.opaquePipeline);
+    let batchIdx = 0;
+    let hasTransparent = false;
+
+    for (const model of this.models.values()) {
+      if (!model.visible) {
+        batchIdx += model.batches.length;
+        continue;
+      }
+      for (const batch of model.batches) {
+        if (batch.transparentIndexCount > 0) {
+          hasTransparent = true;
+        }
+        if (batch.opaqueIndexCount > 0 && batch.opaqueIndexBuffer) {
+          pass.setVertexBuffer(0, batch.positionBuffer);
+          pass.setVertexBuffer(1, batch.normalBuffer);
+          pass.setVertexBuffer(2, batch.recordIndexBuffer);
+          pass.setIndexBuffer(batch.opaqueIndexBuffer, 'uint32');
+          pass.drawIndexed(batch.opaqueIndexCount, 1, 0, 0, batchIdx);
+        }
+        batchIdx++;
+      }
+    }
+
+    // Pass 2: Transparent geometry
+    if (hasTransparent) {
+      pass.setPipeline(this.transparentPipeline);
+      batchIdx = 0;
+      for (const model of this.models.values()) {
+        if (!model.visible) {
+          batchIdx += model.batches.length;
+          continue;
+        }
+        for (const batch of model.batches) {
+          if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+            pass.setVertexBuffer(0, batch.positionBuffer);
+            pass.setVertexBuffer(1, batch.normalBuffer);
+            pass.setVertexBuffer(2, batch.recordIndexBuffer);
+            pass.setIndexBuffer(batch.transparentIndexBuffer, 'uint32');
+            pass.drawIndexed(batch.transparentIndexCount, 1, 0, 0, batchIdx);
+          }
+          batchIdx++;
+        }
+      }
+    }
+
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+
+    this.renderCount++;
+    this.lastFrameCpuMs = performance.now() - t0;
+  }
+
+  /**
+   * Offscreen GPU ID-texture picking at CSS coordinates (cssX, cssY) relative to the canvas.
+   * Returns the picked ElementRef { modelId, expressId }, or null on background.
+   */
+  async pick(cssX: number, cssY: number): Promise<ElementRef | null> {
+    if (
+      this.isDestroyed ||
+      this.isPicking ||
+      !this.device ||
+      !this.canvas ||
+      !this.pickPipeline ||
+      !this.sceneBindGroup ||
+      !this.idTexture ||
+      !this.idTextureView ||
+      !this.depthTextureView ||
+      !this.pickReadBuffer
+    ) {
+      return null;
+    }
+
+    const rect = this.canvas.getBoundingClientRect();
+    const scaleX = rect.width > 0 ? this.canvas.width / rect.width : 1;
+    const scaleY = rect.height > 0 ? this.canvas.height / rect.height : 1;
+    const px = Math.max(0, Math.min(this.canvas.width - 1, Math.floor(cssX * scaleX)));
+    const py = Math.max(0, Math.min(this.canvas.height - 1, Math.floor(cssY * scaleY)));
+
+    this.isPicking = true;
+    try {
+      this.updateGpuSceneTables();
+
+      const encoder = this.device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        label: 'gubim-pick-render-pass',
+        colorAttachments: [
+          {
+            view: this.idTextureView,
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: 'clear',
+            storeOp: 'store'
+          }
+        ],
+        depthStencilAttachment: {
+          view: this.depthTextureView,
+          depthClearValue: 0.0,
+          depthLoadOp: 'clear',
+          depthStoreOp: 'store'
+        }
+      });
+
+      pass.setScissorRect(px, py, 1, 1);
+      pass.setPipeline(this.pickPipeline);
+      pass.setBindGroup(0, this.sceneBindGroup);
+
+      let batchIdx = 0;
+      for (const model of this.models.values()) {
+        if (!model.visible) {
+          batchIdx += model.batches.length;
+          continue;
+        }
+        for (const batch of model.batches) {
+          pass.setVertexBuffer(0, batch.positionBuffer);
+          pass.setVertexBuffer(1, batch.normalBuffer);
+          pass.setVertexBuffer(2, batch.recordIndexBuffer);
+          if (batch.opaqueIndexCount > 0 && batch.opaqueIndexBuffer) {
+            pass.setIndexBuffer(batch.opaqueIndexBuffer, 'uint32');
+            pass.drawIndexed(batch.opaqueIndexCount, 1, 0, 0, batchIdx);
+          }
+          if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+            pass.setIndexBuffer(batch.transparentIndexBuffer, 'uint32');
+            pass.drawIndexed(batch.transparentIndexCount, 1, 0, 0, batchIdx);
+          }
+          batchIdx++;
+        }
+      }
+
+      pass.end();
+
+      encoder.copyTextureToBuffer(
+        { texture: this.idTexture, origin: { x: px, y: py, z: 0 } },
+        { buffer: this.pickReadBuffer, offset: 0, bytesPerRow: 256 },
+        { width: 1, height: 1, depthOrArrayLayers: 1 }
+      );
+
+      this.device.queue.submit([encoder.finish()]);
+
+      await this.pickReadBuffer.mapAsync(GPUMapMode.READ, 0, 16);
+      const u32 = new Uint32Array(this.pickReadBuffer.getMappedRange(0, 16));
+      const modelNum = u32[0];
+      const expressId = u32[1];
+      this.pickReadBuffer.unmap();
+
+      if (modelNum === 0 || expressId === 0) {
+        return null;
+      }
+
+      const modelId = this.numToModelId.get(modelNum);
+      if (!modelId) return null;
+
+      return { modelId, expressId };
+    } catch (err) {
+      console.warn('Pick error:', err);
+      return null;
+    } finally {
+      this.isPicking = false;
+    }
+  }
+
+  /** Used by dev-only harness tests to orbit/inspect camera and GPU resource metrics. */
+  orbitCamera(dx: number, dy: number): void {
+    this.camera.orbit(dx, dy);
+    this.renderFrame();
+  }
+
+  async waitForGpuIdle(): Promise<void> {
+    if (this.device) {
+      await this.device.queue.onSubmittedWorkDone();
+    }
+  }
+
+  getDebugStats(): RendererDebugStats {
+    let batchCount = 0;
+    let recordCount = 0;
+    let liveGpuBuffers = 0;
+    let allocatedGpuBytes = 0;
+
+    if (this.sceneUniformBuffer) {
+      liveGpuBuffers++;
+      allocatedGpuBytes += this.sceneUniformBuffer.size;
+    }
+    if (this.batchGpuBuffer) {
+      liveGpuBuffers++;
+      allocatedGpuBytes += this.batchGpuBuffer.size;
+    }
+    if (this.recordGpuBuffer) {
+      liveGpuBuffers++;
+      allocatedGpuBytes += this.recordGpuBuffer.size;
+    }
+    if (this.pickReadBuffer) {
+      liveGpuBuffers++;
+      allocatedGpuBytes += this.pickReadBuffer.size;
+    }
+
+    for (const model of this.models.values()) {
+      batchCount += model.batches.length;
+      recordCount += model.recordWords.length / 4;
+      for (const b of model.batches) {
+        liveGpuBuffers += 3; // position, normal, recordIndex
+        if (b.opaqueIndexBuffer) liveGpuBuffers++;
+        if (b.transparentIndexBuffer) liveGpuBuffers++;
+        allocatedGpuBytes += b.gpuBytes;
+      }
+    }
+
+    return {
+      modelCount: this.models.size,
+      batchCount,
+      recordCount,
+      liveGpuBuffers,
+      allocatedGpuBytes,
+      renderCount: this.renderCount,
+      lastFrameCpuMs: this.lastFrameCpuMs
+    };
+  }
+
+  private releaseGpuDeviceAndListeners(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+
+    if (this.cleanupListeners) {
+      this.cleanupListeners();
+      this.cleanupListeners = null;
+    }
+
+    if (this.resizeObserver) {
+      this.resizeObserver.disconnect();
+      this.resizeObserver = null;
+    }
+
+    if (this.deviceLostBanner) {
+      this.deviceLostBanner.remove();
+      this.deviceLostBanner = null;
+    }
+
+    for (const model of this.models.values()) {
+      for (const b of model.batches) {
+        b.positionBuffer.destroy();
+        b.normalBuffer.destroy();
+        b.recordIndexBuffer.destroy();
+        b.opaqueIndexBuffer?.destroy();
+        b.transparentIndexBuffer?.destroy();
+      }
+      model.batches.length = 0;
+      model.recordWords.length = 0;
+      model.expressIdToRecords.clear();
+    }
+
+    this.sceneUniformBuffer?.destroy();
+    this.sceneUniformBuffer = null;
+
+    this.batchGpuBuffer?.destroy();
+    this.batchGpuBuffer = null;
+    this.batchGpuCapacity = 0;
+
+    this.recordGpuBuffer?.destroy();
+    this.recordGpuBuffer = null;
+    this.recordGpuCapacity = 0;
+
+    this.pickReadBuffer?.destroy();
+    this.pickReadBuffer = null;
+
+    this.depthTexture?.destroy();
+    this.depthTexture = null;
+    this.depthTextureView = null;
+
+    this.idTexture?.destroy();
+    this.idTexture = null;
+    this.idTextureView = null;
+
+    try {
+      this.context?.unconfigure();
+    } catch {
+      // ignore unconfigure errors on teardown
+    }
+    this.context = null;
+
+    try {
+      this.device?.destroy();
+    } catch {
+      // ignore device destroy errors
+    }
+    this.device = null;
+
+    this.bindGroupLayout = null;
+    this.sceneBindGroup = null;
+    this.opaquePipeline = null;
+    this.transparentPipeline = null;
+    this.pickPipeline = null;
+  }
+
+  destroy(): void {
+    this.isDestroyed = true;
+    this.initGeneration++;
+    this.preInitQueue.length = 0;
+    this.pendingFinishBounds.clear();
+    this.hasFramedInitialModel = false;
+    this.releaseGpuDeviceAndListeners();
+    this.models.clear();
+    this.numToModelId.clear();
+  }
+}
