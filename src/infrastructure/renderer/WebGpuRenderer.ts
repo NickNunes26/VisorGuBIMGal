@@ -133,7 +133,7 @@ export class WebGpuRenderer implements RendererPort {
 
   async initialize(canvas: HTMLCanvasElement): Promise<void> {
     const gen = ++this.initGeneration;
-    this.releaseResourcesOnly();
+    this.releaseGpuDeviceAndListeners();
     this.isDestroyed = false;
     this.canvas = canvas;
 
@@ -1444,7 +1444,7 @@ export class WebGpuRenderer implements RendererPort {
     };
   }
 
-  private releaseResourcesOnly(): void {
+  private releaseGpuDeviceAndListeners(): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
@@ -1473,9 +1473,10 @@ export class WebGpuRenderer implements RendererPort {
         b.opaqueIndexBuffer?.destroy();
         b.transparentIndexBuffer?.destroy();
       }
+      model.batches.length = 0;
+      model.recordWords.length = 0;
+      model.expressIdToRecords.clear();
     }
-    this.models.clear();
-    this.numToModelId.clear();
 
     this.sceneUniformBuffer?.destroy();
     this.sceneUniformBuffer = null;
@@ -1526,6 +1527,8 @@ export class WebGpuRenderer implements RendererPort {
     this.preInitQueue.length = 0;
     this.pendingFinishBounds.clear();
     this.hasFramedInitialModel = false;
-    this.releaseResourcesOnly();
+    this.releaseGpuDeviceAndListeners();
+    this.models.clear();
+    this.numToModelId.clear();
   }
 }
