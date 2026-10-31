@@ -57,9 +57,10 @@ export interface PropertyItem {
   name: string;
   value: PropertyScalar;          // Display value: the raw number, never converted to SI
   type?: string;
-  kind?: 'property' | 'quantity'; // Optional, like `unit` and `structured`, until T-011
+  kind?: 'property' | 'quantity'; // Absent means 'property'. The kernel always sets it
   unit?: string;                  // Effective unit of `value`, when one is known
   structured?: PropertyValue;
+  methodOfMeasurement?: string;   // IfcElementQuantity.MethodOfMeasurement
 }
 
 export interface MaterialLayer {
@@ -67,10 +68,24 @@ export interface MaterialLayer {
   thickness?: number;             // Metres
 }
 
+export interface MaterialProfile {
+  name?: string;
+  material?: string;
+  profile?: string;
+}
+
+export interface MaterialConstituent {
+  name?: string;
+  material?: string;
+  fraction?: number;
+}
+
 export interface MaterialInfo {
   kind: 'material' | 'layer-set' | 'profile-set' | 'constituent-set' | 'list';
   name?: string;
   layers?: MaterialLayer[];
+  profiles?: MaterialProfile[];
+  constituents?: MaterialConstituent[];
   source: 'instance' | 'type';    // An instance assignment wins over its type's
 }
 

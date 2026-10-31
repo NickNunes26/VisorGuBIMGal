@@ -119,7 +119,7 @@ export type DrawingId = string;
 export interface GeneratedDrawing {
   drawingId: DrawingId;
   frame: DrawingFrame;
-  /** CRS of the drawing, for a 'map' frame. */
+  /** The verified CRS shared by every included model, for a 'map' frame. */
   crsId?: string;
   diagnostics: KernelDiagnostic[];
 }

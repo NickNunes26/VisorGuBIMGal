@@ -1,6 +1,6 @@
 # 05 — Contrato del Kernel y del Renderizador
 
-**Estado:** Borrador v1, revisión 2. Incorpora los 12 cambios pedidos por DeepSeek; pendiente de aceptación de Gemini y DeepSeek (T-010).  
+**Estado:** Borrador v1, revisión 3, tras dos rondas de revisión de DeepSeek; pendiente de aceptación final (T-010). `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún.  
 **Propósito:** Fuente única de los límites entre kernel, renderizador y aplicación.  
 **Código normativo:** [`src/domain/kernel/`](../src/domain/kernel/), [`DrawingTypes.ts`](../src/domain/drawings/DrawingTypes.ts) y [`ModelRecord.ts`](../src/domain/models/ModelRecord.ts). Si este documento y los tipos discrepan, es un error que debe corregirse.
 
@@ -49,27 +49,32 @@ Cada lote lleva su propio `origin` en `f64`. No existe un origen por modelo: la 
 
 ### Unidades
 
-- `lengthUnitScale` se resuelve desde `IfcProject.UnitsInContext`, incluidos prefijos de `IfcSIUnit` e `IfcConversionBasedUnit`. Si falta, se asume metro, `lengthUnitSource` es `'default'` y se emite un aviso.
-- Los ángulos planos se resuelven igual, dentro de los crates del kernel, y no se exponen.
+- `lengthUnitScale` se resuelve desde `IfcProject.UnitsInContext`. El prefijo de `IfcSIUnit` se aplica primero. En `IfcConversionBasedUnit`, `ConversionFactor` es un `IfcMeasureWithUnit`: el factor es `ValueComponent` por la escala de `UnitComponent`. Si falta la unidad, se asume metro, `lengthUnitSource` es `'default'` y se emite un aviso.
+- `PLANEANGLEUNIT`, `AREAUNIT` y `VOLUMEUNIT` se resuelven igual dentro de los crates del kernel.
 - Las longitudes de geometría, elevaciones y espesores de capa se entregan en metros.
-- **Propiedades y cantidades conservan su valor bruto** y su unidad efectiva en `unit`. Nunca se convierten usando `lengthUnitScale`. Si no hay unidad conocida, `unit` se omite.
+- **Propiedades y cantidades conservan su valor bruto** y su unidad efectiva en `unit`. Nunca se convierten usando `lengthUnitScale`. La unidad sale de `IfcPropertySingleValue.Unit` o de `IfcPhysicalSimpleQuantity.Unit`; si falta, del tipo de medida a través de `UnitsInContext`. Solo se omite si nada la resuelve, con un diagnóstico.
 - `schema` es canónico (`IFC2X3`, `IFC4`, `IFC4X3`) y `schemaIdentifier` guarda el texto original. Cualquier otro esquema produce `unsupported-schema`.
 
 ### `localToMap`
 
-Matriz 4×4 por columnas, de metros de modelo a metros de mapa, desde `IfcMapConversion`:
+Matriz 4×4 por columnas, de metros de modelo a metros de mapa, desde `IfcMapConversion`. La fórmula normativa de IFC trabaja en unidades del archivo y de mapa, así que el kernel la encierra entre dos conversiones:
 
 ```text
+a = metros por unidad de longitud del archivo (lengthUnitScale)
+b = metros por unidad de MapUnit; si falta, la unidad de longitud del proyecto
 θ = atan2(XAxisOrdinate, XAxisAbscissa), con 0 si faltan
-λ = Scale, con 1 si falta
-E = λ(x·cosθ − y·sinθ) + Eastings
-N = λ(x·sinθ + y·cosθ) + Northings
-H = z + OrthogonalHeight
+λ = Scale; si falta, a/b
+(x, y, z) = coordenadas de modelo en metros, divididas entre a
+
+E = b·(λ·(x·cosθ − y·sinθ) + Eastings)
+N = b·(λ·(x·sinθ + y·cosθ) + Northings)
+H = b·(λ·z + OrthogonalHeight)
 ```
 
-- `Eastings`, `Northings` y `OrthogonalHeight` están en la unidad de `IfcProjectedCRS.MapUnit`, no en la del proyecto. Se convierten a metros.
-- T-022 debe contrastar con la documentación pública del esquema el tratamiento de Z y citarlo, y añadir una prueba numérica de referencia. Si difiere, se corrige aquí.
-- `IfcMapConversionScaled` usa sus factores por eje. Cualquier otro `IfcCoordinateOperation` emite un diagnóstico; nunca se usa la identidad en silencio.
+- `Scale` no se descarta: convierte unidades, pero también puede llevar un factor de escala de cuadrícula.
+- Si falta `Scale`, el esquema indica 1, pero eso multiplicaría por mil un archivo en milímetros con mapa en metros. Se usa `a/b` y se emite un diagnóstico informativo.
+- `IfcMapConversionScaled` sigue el orden `R·F·S`: los factores multiplican los ejes sin rotar (`λ·FactorX·x`, `λ·FactorY·y`, `λ·FactorZ·z`). Cualquier otro `IfcCoordinateOperation` emite un diagnóstico; nunca se usa la identidad en silencio.
+- T-022 añade una prueba numérica de referencia. Fuente: `buildingSMART/IFC4.x-development`, `IfcMapConversion.md`, `IfcMapConversionScaled.md` e `IfcProjectedCRS.md`.
 - `TrueNorth` no se aplica aparte: `localToMap` ya contiene la rotación. El campo `trueNorth` es informativo.
 - `latLng` son grados decimales desde `IfcSite.RefLatitude/RefLongitude`, o derivados de un CRS conocido. El kernel no supone Galicia ni UTM 29N.
 - `crsId` es un resultado de búsqueda, no un atributo IFC. `confidence: 'verified'` exige coincidencia exacta del CRS.
@@ -91,7 +96,7 @@ Definidos en `GeometryBatch.ts`.
 - `rgba` es `0xRRGGBBAA`, sRGB sin premultiplicar.
 - Un elemento puede tener varios registros. Cada índice de un registro apunta dentro de su rango de vértices.
 - Banderas: `Transparent`, `Degraded` (hay un diagnóstico asociado), `HiddenByDefault` (`IfcSpace`).
-- `findBatchError` valida este formato en pruebas y con datos simulados.
+- `findBatchError` valida este formato en pruebas y con datos simulados. El radio máximo lo garantiza el kernel y no se comprueba ahí, porque un elemento `Degraded` puede superarlo.
 - **Los lotes se transfieren, nunca se clonan** (RSK-06). Tras `addBatch`, el renderizador sube los datos a la GPU y no conserva copia en JS (RSK-03).
 - Los lotes son solo para el renderizador. `cad-slicer` trabaja dentro del kernel con la geometría evaluada de `ifc-geometry`, combinando origen y posición en `f64`.
 
@@ -113,7 +118,7 @@ Definidos en `GeometryBatch.ts`.
 ## 5. Planos 2D
 
 - `generateDrawing` se ejecuta dentro del kernel y devuelve `GeneratedDrawing`, con su marco y diagnósticos. La UI ya no maneja mallas.
-- **Marco:** `project` toma las coordenadas absolutas de modelo como compartidas por todos los modelos, igual que la vista 3D. `map` pasa cada modelo por su `localToMap`; los modelos sin georreferencia se omiten con un diagnóstico. Las posiciones de corte se expresan en metros del marco. El CRS del plano sale del dibujo, no de `models[0]`.
+- **Marco:** `project` toma las coordenadas absolutas de modelo como compartidas por todos los modelos, igual que la vista 3D. `map` pasa cada modelo por su `localToMap`; los modelos sin georreferencia se omiten con un diagnóstico. Todos los modelos de un marco `map` deben compartir `crsId` y `verticalDatum`: el que difiera se omite con el diagnóstico `map-frame-crs-mismatch`. `GeneratedDrawing.crsId` es ese CRS común si está verificado, y queda indefinido si no. Las posiciones de corte se expresan en metros del marco. El CRS del plano sale del dibujo, no de `models[0]`.
 - `DrawingCut` sustituye a `DrawingCutType`: `plan` mira hacia −Z; `section` indica eje, posición y `look`. `depth` limita la proyección; si se omite, llega hasta el final de la geometría. La antigua `section-z` del espacio Y arriba corresponde ahora al eje `y`. El adaptador temporal de IFClite traduce esa diferencia, y T-011 elimina los tipos antiguos.
 - **Generar y exportar:** `DrawingOptions` decide qué se calcula. `exportDrawing` solo serializa y puede omitir capas ya calculadas, nunca añadirlas. Las líneas ocultas requieren `includeProjection`.
 - **Tramas:** la trama procede de `IfcFillAreaStyleHatching` si existe. Si no, una regla determinista por material o capa, que define T-050.
@@ -133,6 +138,7 @@ Definidos en `GeometryBatch.ts`.
 - `content` es `Uint8Array`, ya codificado. La descarga usa `new Blob([content])` sin conversión de texto.
 - `$ACADVER = AC1009`, `$DWGCODEPAGE = ANSI_1252`, finales de línea CRLF.
 - Todo valor que entre en un código de grupo se sanea: textos, nombres de capa, bloque y estilo, comentarios 999 y nombre de archivo. Se eliminan CR, LF, NUL y controles, y nunca se emiten los bytes indefinidos `0x81`, `0x8D`, `0x8F`, `0x90` y `0x9D`.
+- Los caracteres fuera de CP1252 se sustituyen por `?`. Nunca se emite UTF-8 bajo `ANSI_1252`. T-050 incluye una prueba con un nombre de capa no representable.
 - Los nombres de capa cumplen las reglas de R12, con truncado sin colisiones.
 
 ---

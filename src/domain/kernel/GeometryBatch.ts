@@ -52,6 +52,8 @@ export function findBatchError(batch: GeometryBatch): string | null {
   if (origin.length !== 3 || !origin.every(Number.isFinite)) return 'origin is not three finite numbers';
   if (positions.length % 3 !== 0) return 'positions length is not a multiple of 3';
   if (normals.length !== positions.length) return 'normals length differs from positions length';
+  // A lone element above the radius is allowed if Degraded, so this checks only finiteness.
+  if (!positions.every(Number.isFinite)) return 'positions contain a non-finite value';
   if (indices.length % 3 !== 0) return 'indices length is not a multiple of 3';
   if (meshTable.length % MESH_RECORD_WORDS !== 0) {
     return `meshTable length is not a multiple of ${MESH_RECORD_WORDS}`;
