@@ -1,0 +1,560 @@
+//! Tokeniser and decoder for ISO 10303-21 parameter values.
+//!
+//! Every access goes through bounds-checked helpers; malformed input produces a
+//! [`ParseError`] and never panics.
+
+use crate::{Entity, ErrorKind, ParseError, Value};
+
+/// Byte length limit guard for escape directives, so a corrupt file cannot make
+/// the decoder allocate without bound. Values this large do not occur in practice.
+const MAX_ESCAPE_UNITS: usize = 1 << 20;
+
+pub(crate) fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// A cursor over one entity record (or a header statement).
+pub(crate) struct Parser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    limit: usize,
+}
+
+impl<'a> Parser<'a> {
+    pub(crate) fn new(bytes: &'a [u8], start: usize, limit: usize) -> Self {
+        let limit = limit.min(bytes.len());
+        Self {
+            bytes,
+            pos: start.min(limit),
+            limit,
+        }
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
+    fn error(&self, kind: ErrorKind) -> ParseError {
+        ParseError::new(self.pos, kind)
+    }
+
+    fn error_at(&self, offset: usize, kind: ErrorKind) -> ParseError {
+        ParseError::new(offset, kind)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        if self.pos < self.limit {
+            self.bytes.get(self.pos).copied()
+        } else {
+            None
+        }
+    }
+
+    fn peek_at(&self, ahead: usize) -> Option<u8> {
+        let at = self.pos.checked_add(ahead)?;
+        if at < self.limit {
+            self.bytes.get(at).copied()
+        } else {
+            None
+        }
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.pos = self.pos.saturating_add(1);
+        Some(byte)
+    }
+
+    fn remaining_starts_with(&self, needle: &[u8]) -> bool {
+        let end = self.pos.saturating_add(needle.len());
+        if end > self.limit {
+            return false;
+        }
+        match self.bytes.get(self.pos..end) {
+            Some(slice) => slice == needle,
+            None => false,
+        }
+    }
+
+    /// Skip whitespace and `/* ... */` comments.
+    pub(crate) fn skip_ws_comments(&mut self) -> Result<(), ParseError> {
+        loop {
+            match self.peek() {
+                Some(byte) if byte.is_ascii_whitespace() => {
+                    self.pos = self.pos.saturating_add(1);
+                }
+                Some(b'/') if self.peek_at(1) == Some(b'*') => {
+                    self.skip_comment()?;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn skip_comment(&mut self) -> Result<(), ParseError> {
+        // Current position is on '/', next is '*'.
+        self.pos = self.pos.saturating_add(2);
+        loop {
+            match self.bump() {
+                None => return Err(self.error(ErrorKind::UnterminatedComment)),
+                Some(b'*') if self.peek() == Some(b'/') => {
+                    self.pos = self.pos.saturating_add(1);
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn expect(&mut self, expected: u8) -> Result<(), ParseError> {
+        match self.bump() {
+            Some(byte) if byte == expected => Ok(()),
+            Some(byte) => Err(self.error_at(
+                self.pos.saturating_sub(1),
+                ErrorKind::UnexpectedByte(byte),
+            )),
+            None => Err(self.error(ErrorKind::UnexpectedEof)),
+        }
+    }
+
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        let mut out = String::new();
+        while let Some(byte) = self.peek() {
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                out.push(byte.to_ascii_uppercase() as char);
+                self.pos = self.pos.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if self.pos == start {
+            Err(self.error(ErrorKind::InvalidIdentifier))
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn parse_u32_digits(&mut self) -> Result<u32, ParseError> {
+        let start = self.pos;
+        let mut value: u64 = 0;
+        while let Some(byte) = self.peek() {
+            let digit = match byte {
+                b'0'..=b'9' => byte - b'0',
+                _ => break,
+            };
+            value = value * 10 + u64::from(digit);
+            if value > u64::from(u32::MAX) {
+                return Err(self.error(ErrorKind::IdentifierOverflow));
+            }
+            self.pos = self.pos.saturating_add(1);
+        }
+        if self.pos == start {
+            Err(self.error(ErrorKind::InvalidIdentifier))
+        } else {
+            Ok(value as u32)
+        }
+    }
+
+    /// Parse `#id = TYPE(...);`.
+    pub(crate) fn parse_entity(&mut self) -> Result<Entity, ParseError> {
+        self.skip_ws_comments()?;
+        self.expect(b'#')?;
+        self.parse_u32_digits()?;
+        self.skip_ws_comments()?;
+        self.expect(b'=')?;
+        self.skip_ws_comments()?;
+        let type_name = self.parse_ident()?;
+        let params = self.parse_outer_params()?;
+        self.skip_ws_comments()?;
+        self.expect(b';')?;
+        Ok(Entity { type_name, params })
+    }
+
+    /// Parse the parenthesised parameter list of an entity or header statement.
+    pub(crate) fn parse_outer_params(&mut self) -> Result<Vec<Value>, ParseError> {
+        self.skip_ws_comments()?;
+        self.expect(b'(')?;
+        let mut values = Vec::new();
+        self.skip_ws_comments()?;
+        if self.peek() == Some(b')') {
+            self.pos = self.pos.saturating_add(1);
+            return Ok(values);
+        }
+        loop {
+            values.push(self.parse_value()?);
+            self.skip_ws_comments()?;
+            match self.bump() {
+                Some(b',') => {
+                    self.skip_ws_comments()?;
+                }
+                Some(b')') => break,
+                Some(byte) => {
+                    return Err(self.error_at(
+                        self.pos.saturating_sub(1),
+                        ErrorKind::UnexpectedByte(byte),
+                    ));
+                }
+                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+            }
+        }
+        Ok(values)
+    }
+
+    fn parse_value(&mut self) -> Result<Value, ParseError> {
+        self.skip_ws_comments()?;
+        let byte = match self.peek() {
+            Some(byte) => byte,
+            None => return Err(self.error(ErrorKind::UnexpectedEof)),
+        };
+        match byte {
+            b'$' => {
+                self.pos = self.pos.saturating_add(1);
+                Ok(Value::Null)
+            }
+            b'*' => {
+                self.pos = self.pos.saturating_add(1);
+                Ok(Value::Derived)
+            }
+            b'\'' => self.parse_string().map(Value::String),
+            b'"' => self.parse_binary().map(Value::Binary),
+            b'#' => {
+                self.pos = self.pos.saturating_add(1);
+                self.parse_u32_digits().map(Value::Ref)
+            }
+            b'(' => self.parse_list().map(Value::List),
+            b'.' if self.peek_at(1).is_some_and(|next| next.is_ascii_digit()) =>
+            {
+                self.parse_number()
+            }
+            b'.' => self.parse_enum().map(Value::Enum),
+            b'+' | b'-' | b'0'..=b'9' => self.parse_number(),
+            byte if byte.is_ascii_alphabetic() => {
+                let name = self.parse_ident()?;
+                self.skip_ws_comments()?;
+                self.expect(b'(')?;
+                let value = self.parse_value()?;
+                self.skip_ws_comments()?;
+                self.expect(b')')?;
+                Ok(Value::Typed {
+                    name,
+                    value: Box::new(value),
+                })
+            }
+            byte => Err(self.error(ErrorKind::UnexpectedByte(byte))),
+        }
+    }
+
+    fn parse_list(&mut self) -> Result<Vec<Value>, ParseError> {
+        self.expect(b'(')?;
+        let mut values = Vec::new();
+        self.skip_ws_comments()?;
+        if self.peek() == Some(b')') {
+            self.pos = self.pos.saturating_add(1);
+            return Ok(values);
+        }
+        loop {
+            values.push(self.parse_value()?);
+            self.skip_ws_comments()?;
+            match self.bump() {
+                Some(b',') => {
+                    self.skip_ws_comments()?;
+                }
+                Some(b')') => break,
+                Some(byte) => {
+                    return Err(self.error_at(
+                        self.pos.saturating_sub(1),
+                        ErrorKind::UnexpectedByte(byte),
+                    ));
+                }
+                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+            }
+        }
+        Ok(values)
+    }
+
+    fn parse_enum(&mut self) -> Result<String, ParseError> {
+        self.expect(b'.')?;
+        let mut value = String::new();
+        loop {
+            match self.bump() {
+                Some(b'.') => break,
+                Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                    value.push(byte.to_ascii_uppercase() as char);
+                }
+                Some(byte) => {
+                    return Err(self.error_at(
+                        self.pos.saturating_sub(1),
+                        ErrorKind::UnexpectedByte(byte),
+                    ));
+                }
+                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+            }
+        }
+        if value.is_empty() {
+            Err(self.error(ErrorKind::InvalidIdentifier))
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<Value, ParseError> {
+        let start = self.pos;
+        if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+            self.pos = self.pos.saturating_add(1);
+        }
+
+        let mut has_digit = false;
+        let mut is_real = false;
+        loop {
+            match self.peek() {
+                Some(b'0'..=b'9') => {
+                    has_digit = true;
+                    self.pos = self.pos.saturating_add(1);
+                }
+                Some(b'.') => {
+                    is_real = true;
+                    self.pos = self.pos.saturating_add(1);
+                }
+                Some(b'e' | b'E') => {
+                    is_real = true;
+                    self.pos = self.pos.saturating_add(1);
+                    if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                        self.pos = self.pos.saturating_add(1);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if !has_digit {
+            return Err(self.error(ErrorKind::InvalidNumber));
+        }
+
+        let text = match self.bytes.get(start..self.pos) {
+            Some(text) => text,
+            None => return Err(self.error(ErrorKind::InvalidNumber)),
+        };
+        let text = std::str::from_utf8(text).map_err(|_| self.error(ErrorKind::InvalidNumber))?;
+
+        if is_real {
+            match text.parse::<f64>() {
+                Ok(value) => Ok(Value::Real(value)),
+                Err(_) => Err(self.error(ErrorKind::InvalidNumber)),
+            }
+        } else {
+            match text.parse::<i64>() {
+                Ok(value) => Ok(Value::Integer(value)),
+                Err(_) => Err(self.error(ErrorKind::IntegerOverflow)),
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, ParseError> {
+        self.expect(b'\'')?;
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                None => return Err(self.error(ErrorKind::UnterminatedString)),
+                Some(b'\'') => {
+                    if self.peek() == Some(b'\'') {
+                        self.pos = self.pos.saturating_add(1);
+                        out.push('\'');
+                    } else {
+                        return Ok(out);
+                    }
+                }
+                Some(b'\\') => self.parse_escape(&mut out)?,
+                // STEP files in the wild are frequently ISO-8859-1. Every raw
+                // byte is therefore a valid Latin-1 scalar, which keeps invalid
+                // UTF-8 from ever reaching `String` construction.
+                Some(byte) => out.push(char::from(byte)),
+            }
+        }
+    }
+
+    fn parse_escape(&mut self, out: &mut String) -> Result<(), ParseError> {
+        let directive = match self.bump() {
+            Some(byte) => byte,
+            None => return Err(self.error(ErrorKind::UnterminatedString)),
+        };
+        match directive {
+            b'\\' => {
+                out.push('\\');
+                Ok(())
+            }
+            b'N' | b'n' => {
+                if self.peek() == Some(b'\\') {
+                    self.pos = self.pos.saturating_add(1);
+                    out.push('\n');
+                    Ok(())
+                } else {
+                    // Be lenient with files that use `\N` without a closing slash.
+                    out.push('\n');
+                    Ok(())
+                }
+            }
+            b'T' | b't' => {
+                if self.peek() == Some(b'\\') {
+                    self.pos = self.pos.saturating_add(1);
+                    out.push('\t');
+                    Ok(())
+                } else {
+                    out.push('\t');
+                    Ok(())
+                }
+            }
+            b'S' | b's' => {
+                self.expect(b'\\')?;
+                let shifted = match self.bump() {
+                    Some(byte) => byte,
+                    None => return Err(self.error(ErrorKind::UnterminatedString)),
+                };
+                if shifted < 0x80 {
+                    out.push(char::from(shifted + 0x80));
+                } else {
+                    out.push(char::from(shifted));
+                }
+                Ok(())
+            }
+            b'X' | b'x' => self.parse_hex_escape(out),
+            b'P' | b'p' => {
+                // Code-page directive: `\P<letter>\`. It changes no character by
+                // itself, so consume up to and including the closing slash.
+                loop {
+                    match self.bump() {
+                        None => return Err(self.error(ErrorKind::UnterminatedString)),
+                        Some(b'\\') => return Ok(()),
+                        Some(_) => {}
+                    }
+                }
+            }
+            other => {
+                // Unknown directive: preserve it rather than losing data.
+                out.push('\\');
+                out.push(char::from(other));
+                Ok(())
+            }
+        }
+    }
+
+    fn parse_hex_escape(&mut self, out: &mut String) -> Result<(), ParseError> {
+        match self.peek() {
+            Some(b'\\') => {
+                self.pos = self.pos.saturating_add(1);
+                let value = self.read_hex_digits(2)?;
+                out.push(char::from(value as u8));
+                Ok(())
+            }
+            Some(b'2') => {
+                self.pos = self.pos.saturating_add(1);
+                self.expect(b'\\')?;
+                let mut units = Vec::new();
+                loop {
+                    if self.remaining_starts_with(b"\\X0\\") {
+                        self.pos = self.pos.saturating_add(4);
+                        break;
+                    }
+                    if units.len() >= MAX_ESCAPE_UNITS {
+                        return Err(self.error(ErrorKind::InvalidEscape));
+                    }
+                    units.push(self.read_hex_digits(4)? as u16);
+                }
+                for decoded in char::decode_utf16(units) {
+                    out.push(decoded.unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
+                Ok(())
+            }
+            Some(b'4') => {
+                self.pos = self.pos.saturating_add(1);
+                self.expect(b'\\')?;
+                let mut count = 0usize;
+                loop {
+                    if self.remaining_starts_with(b"\\X0\\") {
+                        self.pos = self.pos.saturating_add(4);
+                        break;
+                    }
+                    if count >= MAX_ESCAPE_UNITS {
+                        return Err(self.error(ErrorKind::InvalidEscape));
+                    }
+                    let value = self.read_hex_digits(8)?;
+                    out.push(char::from_u32(value).unwrap_or(char::REPLACEMENT_CHARACTER));
+                    count = count.saturating_add(1);
+                }
+                Ok(())
+            }
+            _ => Err(self.error(ErrorKind::InvalidEscape)),
+        }
+    }
+
+    fn read_hex_digits(&mut self, count: usize) -> Result<u32, ParseError> {
+        let mut value: u32 = 0;
+        for _ in 0..count {
+            match self.bump() {
+                Some(byte) => match hex_value(byte) {
+                    Some(nibble) => value = (value << 4) | u32::from(nibble),
+                    None => {
+                        return Err(self.error_at(
+                            self.pos.saturating_sub(1),
+                            ErrorKind::InvalidEscape,
+                        ));
+                    }
+                },
+                None => return Err(self.error(ErrorKind::UnexpectedEof)),
+            }
+        }
+        Ok(value)
+    }
+
+    fn parse_binary(&mut self) -> Result<Vec<u8>, ParseError> {
+        self.expect(b'"')?;
+        let mut nibbles = Vec::new();
+        loop {
+            match self.bump() {
+                None => return Err(self.error(ErrorKind::UnterminatedBinary)),
+                Some(b'"') => break,
+                Some(byte) if byte.is_ascii_whitespace() => {}
+                Some(byte) => match hex_value(byte) {
+                    Some(nibble) => nibbles.push(nibble),
+                    None => {
+                        return Err(self.error_at(
+                            self.pos.saturating_sub(1),
+                            ErrorKind::UnexpectedByte(byte),
+                        ));
+                    }
+                },
+            }
+        }
+
+        if nibbles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The first nibble is the number of unused bits in the final octet.
+        let first = nibbles.first().copied().unwrap_or(0);
+        let data: &[u8] = if first <= 3 {
+            match nibbles.get(1..) {
+                Some(data) => data,
+                None => &[],
+            }
+        } else {
+            nibbles.as_slice()
+        };
+
+        let mut bytes = Vec::with_capacity(data.len() / 2);
+        for pair in data.chunks_exact(2) {
+            if let [high, low] = pair {
+                bytes.push((high << 4) | low);
+            }
+        }
+        if let Some(high) = data.chunks_exact(2).remainder().first() {
+            bytes.push(*high);
+        }
+        Ok(bytes)
+    }
+}
