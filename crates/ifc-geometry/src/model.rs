@@ -5,6 +5,7 @@
 
 use crate::csg::{intersect, subtract, subtract_all, union};
 use crate::mesh::Mesh;
+use crate::nurbs;
 use crate::solids;
 use earcut::Earcut;
 use glam::{DMat4, DVec2, DVec3, DVec4};
@@ -140,6 +141,42 @@ fn triangulate_rings(rings: &[&[DVec2]]) -> Vec<[u32; 3]> {
             }
         })
         .collect()
+}
+
+/// An edge may use only part of its curve: keeps the run between its two vertices.
+fn between_vertices(points: Vec<DVec3>, start: DVec3, end: DVec3) -> Vec<DVec3> {
+    if start.distance_squared(end) <= POINT_TOLERANCE * POINT_TOLERANCE {
+        return points;
+    }
+    let nearest = |to: DVec3| {
+        (0..points.len()).min_by(|a, b| {
+            points[*a].distance_squared(to).total_cmp(&points[*b].distance_squared(to))
+        })
+    };
+    match (nearest(start), nearest(end)) {
+        (Some(first), Some(last)) if first < last => points[first..=last].to_vec(),
+        _ => points,
+    }
+}
+
+fn numbers(value: Option<&Value>) -> Vec<f64> {
+    list(value).iter().filter_map(number).collect()
+}
+
+fn knot_vector(
+    entity: &Entity,
+    def: &EntityDef,
+    knots: &str,
+    multiplicities: &str,
+    degree: usize,
+    count: usize,
+) -> Option<Vec<f64>> {
+    let knots = numbers(attribute(entity, def, knots));
+    let times: Vec<usize> = numbers(attribute(entity, def, multiplicities))
+        .into_iter()
+        .map(|times| times as usize)
+        .collect();
+    nurbs::expand_knots(&knots, &times, degree, count)
 }
 
 /// Separate solids sharing one mesh.
@@ -552,7 +589,7 @@ impl<'a> ModelEvaluator<'a> {
             self.swept_disk(entity, def)
         } else if def.is_a("IfcCsgPrimitive3D") {
             self.primitive(id, entity, def)
-        } else if def.is_a("IfcFacetedBrep") {
+        } else if def.is_a("IfcManifoldSolidBrep") {
             attribute(entity, def, "Outer")
                 .and_then(reference)
                 .and_then(|shell| self.shell(&[shell]))
@@ -933,12 +970,140 @@ impl<'a> ModelEvaluator<'a> {
             Some(path)
         } else if def.is_a("IfcTrimmedCurve") {
             self.trimmed_curve(&entity, &def)
+        } else if def.is_a("IfcBSplineCurveWithKnots") {
+            self.bspline_curve(&entity, &def)
+        } else if def.is_a("IfcSurfaceCurve") {
+            let curve = attribute(&entity, &def, "Curve3D").and_then(reference)?;
+            self.curve_path(curve, depth + 1)
         } else if def.is_a("IfcCircle") || def.is_a("IfcEllipse") {
             let (frame, radii) = self.conic(&entity, &def)?;
             Some(on_conic(frame, radii, 0.0, std::f64::consts::TAU))
         } else {
             self.warn("unsupported-curve", format!("#{id} {}", def.name()));
             None
+        }
+    }
+
+    fn bspline_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let degree = attribute(entity, def, "Degree").and_then(number)? as usize;
+        let points: Vec<DVec3> = list(attribute(entity, def, "ControlPointsList"))
+            .iter()
+            .map(|point| self.point(reference(point)?))
+            .collect::<Option<_>>()?;
+        let knots = knot_vector(entity, def, "Knots", "KnotMultiplicities", degree, points.len())?;
+        let weights = numbers(attribute(entity, def, "WeightsData"));
+        let weights = if weights.is_empty() { vec![1.0; points.len()] } else { weights };
+        if weights.len() != points.len() {
+            return None;
+        }
+        nurbs::Curve { degree, points, weights, knots }.sample()
+    }
+
+    fn bspline_surface(&mut self, entity: &Entity, def: &EntityDef) -> Option<nurbs::Surface> {
+        let u_degree = attribute(entity, def, "UDegree").and_then(number)? as usize;
+        let v_degree = attribute(entity, def, "VDegree").and_then(number)? as usize;
+        let points: Vec<Vec<DVec3>> = list(attribute(entity, def, "ControlPointsList"))
+            .iter()
+            .map(|row| {
+                list(Some(row))
+                    .iter()
+                    .map(|point| self.point(reference(point)?))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<_>>()?;
+        let (rows, columns) = (points.len(), points.first()?.len());
+        if points.iter().any(|row| row.len() != columns) {
+            return None;
+        }
+        let u_knots = knot_vector(entity, def, "UKnots", "UMultiplicities", u_degree, rows)?;
+        let v_knots = knot_vector(entity, def, "VKnots", "VMultiplicities", v_degree, columns)?;
+        let weights: Vec<Vec<f64>> = list(attribute(entity, def, "WeightsData"))
+            .iter()
+            .map(|row| numbers(Some(row)))
+            .collect();
+        let weights = if weights.is_empty() { vec![vec![1.0; columns]; rows] } else { weights };
+        if weights.len() != rows || weights.iter().any(|row| row.len() != columns) {
+            return None;
+        }
+        Some(nurbs::Surface { u_degree, v_degree, points, weights, u_knots, v_knots })
+    }
+
+    fn vertex_point(&self, id: u32) -> Option<DVec3> {
+        let (vertex, def) = self.lookup(id)?;
+        self.point(attribute(&vertex, &def, "VertexGeometry").and_then(reference)?)
+    }
+
+    /// An edge from its start vertex to its end vertex. The vertices are authoritative, so
+    /// faces sharing an edge share its end points exactly.
+    fn edge_points(&mut self, edge: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let start = self.vertex_point(attribute(edge, def, "EdgeStart").and_then(reference)?)?;
+        let end = self.vertex_point(attribute(edge, def, "EdgeEnd").and_then(reference)?)?;
+        let geometry = attribute(edge, def, "EdgeGeometry").and_then(reference)?;
+        let same_sense = flag(attribute(edge, def, "SameSense")).unwrap_or(true);
+        let (curve, curve_def) = self.lookup(geometry)?;
+
+        let mut points = if curve_def.is_a("IfcLine") {
+            vec![start, end]
+        } else if curve_def.is_a("IfcCircle") || curve_def.is_a("IfcEllipse") {
+            let (frame, radii) = self.conic(&curve, &curve_def)?;
+            let inverse = frame.inverse();
+            let angle = |point: DVec3| {
+                let local = inverse.transform_point3(point);
+                (local.y / radii.y).atan2(local.x / radii.x)
+            };
+            let tau = std::f64::consts::TAU;
+            let turn = |amount: f64| match amount.rem_euclid(tau) {
+                amount if amount < 1e-9 => tau,
+                amount => amount,
+            };
+            let sweep = if same_sense { turn(angle(end) - angle(start)) } else { -turn(angle(start) - angle(end)) };
+            on_conic(frame, radii, angle(start), sweep)
+        } else {
+            let mut points = self.curve_path(geometry, 0)?;
+            if !same_sense {
+                points.reverse();
+            }
+            between_vertices(points, start, end)
+        };
+        *points.first_mut()? = start;
+        *points.last_mut()? = end;
+        Some(points)
+    }
+
+    fn edge_loop(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let mut path = Vec::new();
+        for oriented in list(attribute(entity, def, "EdgeList")).iter().filter_map(reference) {
+            let (oriented, oriented_def) = self.lookup(oriented)?;
+            let element = attribute(&oriented, &oriented_def, "EdgeElement").and_then(reference)?;
+            let (edge, edge_def) = self.lookup(element)?;
+            let mut points = self.edge_points(&edge, &edge_def)?;
+            if flag(attribute(&oriented, &oriented_def, "Orientation")) == Some(false) {
+                points.reverse();
+            }
+            join(&mut path, points);
+        }
+        // The loop closes on its first vertex, which should not appear twice.
+        if path.len() > 1 && path[0].distance_squared(path[path.len() - 1]) <= POINT_TOLERANCE * POINT_TOLERANCE {
+            path.pop();
+        }
+        (path.len() >= 3).then_some(path)
+    }
+
+    /// A face on a curved surface, meshed in that surface's parameter space.
+    fn curved_face(
+        &mut self,
+        surface: &nurbs::Surface,
+        loops: &[Vec<DVec3>],
+        same_sense: bool,
+        builder: &mut FaceBuilder,
+    ) {
+        let Some(mesh) = nurbs::mesh_surface(surface, loops) else {
+            self.warn("bad-trim", "face boundary does not lie on its surface".into());
+            return;
+        };
+        for triangle in mesh.triangles {
+            let [a, b, c] = triangle.map(|id| builder.vertex(mesh.positions[id as usize]));
+            builder.mesh.triangles.push(if same_sense { [a, b, c] } else { [a, c, b] });
         }
     }
 
@@ -1265,35 +1430,34 @@ impl<'a> ModelEvaluator<'a> {
 
     fn face(&mut self, id: u32, builder: &mut FaceBuilder) {
         let Some((entity, def)) = self.lookup(id) else { return };
-        let mut outer: Option<Vec<u32>> = None;
-        let mut holes: Vec<Vec<u32>> = Vec::new();
+        let mut outer: Option<Vec<DVec3>> = None;
+        let mut holes: Vec<Vec<DVec3>> = Vec::new();
         for bound in list(attribute(&entity, &def, "Bounds")) {
             let Some((bound, bound_def)) = reference(bound).and_then(|id| self.lookup(id)) else {
                 continue;
             };
-            let forward = !matches!(
-                attribute(&bound, &bound_def, "Orientation"),
-                Some(Value::Enum(flag)) if flag == "F"
-            );
             let Some((poly, poly_def)) = attribute(&bound, &bound_def, "Bound")
                 .and_then(reference)
                 .and_then(|id| self.lookup(id))
             else {
                 continue;
             };
-            if !poly_def.is_a("IfcPolyLoop") {
+            let ring = if poly_def.is_a("IfcPolyLoop") {
+                Some(
+                    list(attribute(&poly, &poly_def, "Polygon"))
+                        .iter()
+                        .filter_map(reference)
+                        .filter_map(|point| self.point(point))
+                        .collect::<Vec<_>>(),
+                )
+            } else if poly_def.is_a("IfcEdgeLoop") {
+                self.edge_loop(&poly, &poly_def)
+            } else {
                 self.warn("unsupported-face-bound", poly_def.name().to_string());
-                continue;
-            }
-            let mut ring: Vec<u32> = list(attribute(&poly, &poly_def, "Polygon"))
-                .iter()
-                .filter_map(reference)
-                .filter_map(|point| {
-                    let position = self.point(point)?;
-                    Some(builder.vertex(position))
-                })
-                .collect();
-            if !forward {
+                None
+            };
+            let Some(mut ring) = ring else { continue };
+            if flag(attribute(&bound, &bound_def, "Orientation")) == Some(false) {
                 ring.reverse();
             }
             if bound_def.is_a("IfcFaceOuterBound") && outer.is_none() {
@@ -1305,9 +1469,37 @@ impl<'a> ModelEvaluator<'a> {
         if outer.is_none() && !holes.is_empty() {
             outer = Some(holes.remove(0));
         }
-        if let Some(outer) = outer {
-            builder.face(&outer, &holes);
+        let Some(outer) = outer else { return };
+
+        let same_sense = flag(attribute(&entity, &def, "SameSense")).unwrap_or(true);
+        let surface = attribute(&entity, &def, "FaceSurface")
+            .and_then(reference)
+            .and_then(|id| self.lookup(id));
+        if let Some((surface, surface_def)) = &surface {
+            if surface_def.is_a("IfcBSplineSurfaceWithKnots") {
+                if let Some(surface) = self.bspline_surface(surface, surface_def) {
+                    let mut loops = vec![outer];
+                    loops.append(&mut holes);
+                    self.curved_face(&surface, &loops, same_sense, builder);
+                    return;
+                }
+                self.warn("bad-surface", format!("#{id} has an unusable surface"));
+            } else if !surface_def.is_a("IfcPlane") {
+                self.warn("unsupported-surface", format!("#{id} {}", surface_def.name()));
+            }
         }
+
+        // Planar, or the nearest we can do: a flat face across the boundary.
+        let mut rings = std::iter::once(outer).chain(holes).map(|ring| {
+            let mut ids: Vec<u32> = ring.into_iter().map(|point| builder.vertex(point)).collect();
+            if !same_sense {
+                ids.reverse();
+            }
+            ids
+        });
+        let first = rings.next().unwrap_or_default();
+        let others: Vec<Vec<u32>> = rings.collect();
+        builder.face(&first, &others);
     }
 
     fn coordinate_list(&self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {

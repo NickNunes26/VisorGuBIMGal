@@ -307,6 +307,111 @@ fn against_the_sense_a_trim_runs_the_short_way_back() {
     close(mesh.volume(), faceted_circle_area(1.0) / 4.0, 1e-9);
 }
 
+/// Weights of cos(45 degrees) make the middle of a quadratic exactly a quarter circle.
+#[test]
+fn rational_splines_draw_true_circles() {
+    let mesh = evaluate(&format!(
+        "#10=IFCCARTESIANPOINT((1.,0.));\n\
+         #11=IFCCARTESIANPOINT((1.,1.));\n\
+         #12=IFCCARTESIANPOINT((0.,1.));\n\
+         #13=IFCCARTESIANPOINT((0.,0.));\n\
+         #14=IFCRATIONALBSPLINECURVEWITHKNOTS(2,(#10,#11,#12),.CIRCULAR_ARC.,.F.,.U.,(3,3),(0.,1.),.UNSPECIFIED.,(1.,0.7071067811865476,1.));\n\
+         #15=IFCPOLYLINE((#12,#13,#10));\n\
+         #16=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#14);\n\
+         #17=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#15);\n\
+         #18=IFCCOMPOSITECURVE((#16,#17),.F.);\n{}",
+        extruded(18)
+    ));
+    // Without the weight this curve is a parabola enclosing 5/6, far outside this margin.
+    close(mesh.volume(), PI / 4.0, 6e-3);
+    assert!(mesh.volume() < PI / 4.0, "chords stay inside the arc");
+}
+
+/// A flat surface in spline form, with a trim, so its area is known exactly.
+#[test]
+fn trimmed_spline_surfaces_follow_their_boundary() {
+    let mesh = evaluate(
+        "#20=IFCCARTESIANPOINT((0.,0.,0.));\n\
+         #21=IFCCARTESIANPOINT((0.,4.,0.));\n\
+         #22=IFCCARTESIANPOINT((4.,0.,0.));\n\
+         #23=IFCCARTESIANPOINT((4.,4.,0.));\n\
+         #24=IFCBSPLINESURFACEWITHKNOTS(1,1,((#20,#21),(#22,#23)),.UNSPECIFIED.,.F.,.F.,.F.,(2,2),(2,2),(0.,1.),(0.,1.),.UNSPECIFIED.);\n\
+         #30=IFCCARTESIANPOINT((1.,1.,0.));\n\
+         #31=IFCCARTESIANPOINT((3.,1.,0.));\n\
+         #32=IFCCARTESIANPOINT((3.,3.,0.));\n\
+         #33=IFCPOLYLOOP((#30,#31,#32));\n\
+         #34=IFCFACEOUTERBOUND(#33,.T.);\n\
+         #35=IFCADVANCEDFACE((#34),#24,.T.);\n\
+         #36=IFCOPENSHELL((#35));\n\
+         #5=IFCSHELLBASEDSURFACEMODEL((#36));\n",
+    );
+    let area: f64 = mesh
+        .triangle_corners()
+        .map(|[a, b, c]| (b - a).cross(c - a).length() / 2.0)
+        .sum();
+    close(area, 2.0, 1e-6);
+}
+
+/// Each edge's polyline overshoots both of its vertices. Only the vertices may count.
+#[test]
+fn edges_use_only_the_part_of_a_curve_between_their_vertices() {
+    let mut body = String::from(
+        "#20=IFCCARTESIANPOINT((0.,0.,0.));\n#21=IFCCARTESIANPOINT((2.,0.,0.));\n\
+         #22=IFCCARTESIANPOINT((2.,2.,0.));\n#23=IFCCARTESIANPOINT((0.,2.,0.));\n\
+         #30=IFCVERTEXPOINT(#20);\n#31=IFCVERTEXPOINT(#21);\n\
+         #32=IFCVERTEXPOINT(#22);\n#33=IFCVERTEXPOINT(#23);\n",
+    );
+    let corners = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)];
+    for side in 0..4usize {
+        let (a, b) = (corners[side], corners[(side + 1) % 4]);
+        let direction = ((b.0 - a.0) / 2.0, (b.1 - a.1) / 2.0);
+        let id = 40 + side * 10;
+        body.push_str(&format!(
+            "#{id}=IFCCARTESIANPOINT(({:.1},{:.1},0.));\n\
+             #{}=IFCCARTESIANPOINT(({:.1},{:.1},0.));\n\
+             #{}=IFCCARTESIANPOINT(({:.1},{:.1},0.));\n\
+             #{}=IFCCARTESIANPOINT(({:.1},{:.1},0.));\n\
+             #{}=IFCPOLYLINE((#{},#{id},#{},#{},#{},#{}));\n\
+             #{}=IFCEDGECURVE(#{},#{},#{},.T.);\n\
+             #{}=IFCORIENTEDEDGE(*,*,#{},.T.);\n",
+            a.0 - direction.0, a.1 - direction.1,
+            id + 1, b.0 + direction.0, b.1 + direction.1,
+            id + 5, a.0 - direction.0 * 2.0, a.1 - direction.1 * 2.0,
+            id + 6, b.0 + direction.0 * 2.0, b.1 + direction.1 * 2.0,
+            id + 2, id + 5, 20 + side, 20 + (side + 1) % 4, id + 1, id + 6,
+            id + 3, 30 + side, 30 + (side + 1) % 4, id + 2,
+            id + 4, id + 3,
+        ));
+    }
+    body.push_str(
+        "#90=IFCEDGELOOP((#44,#54,#64,#74));\n\
+         #91=IFCFACEOUTERBOUND(#90,.T.);\n\
+         #92=IFCPLANE(#903);\n\
+         #93=IFCADVANCEDFACE((#91),#92,.T.);\n\
+         #94=IFCOPENSHELL((#93));\n\
+         #5=IFCSHELLBASEDSURFACEMODEL((#94));\n",
+    );
+    let mesh = evaluate(&body);
+    let (min, max) = bounds(&mesh);
+    assert_eq!((min, max), (DVec3::ZERO, DVec3::new(2.0, 2.0, 0.0)));
+}
+
+#[test]
+fn absurd_spline_data_gives_a_diagnostic_not_a_crash() {
+    for (degree, multiplicities) in [("1000000", "(3,3)"), ("2", "(1,1)"), ("2", "(100000000,100000000)")] {
+        let text = format!(
+            "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}\
+             #10=IFCCARTESIANPOINT((1.,0.));\n#11=IFCCARTESIANPOINT((1.,1.));\n#12=IFCCARTESIANPOINT((0.,1.));\n\
+             #14=IFCBSPLINECURVEWITHKNOTS({degree},(#10,#11,#12),.UNSPECIFIED.,.F.,.U.,{multiplicities},(0.,1.),.UNSPECIFIED.);\n\
+             #50=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#14);\n\
+             #5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\nENDSEC;END-ISO-10303-21;"
+        );
+        let file = index(text.as_bytes()).unwrap();
+        let mut evaluator = ModelEvaluator::new(&file).unwrap();
+        assert!(evaluator.evaluate(2).is_some_and(|element| element.meshes.is_empty()));
+    }
+}
+
 fn profile_area(profile: &str) -> f64 {
     let mesh = evaluate(&format!("{profile}\n#5=IFCEXTRUDEDAREASOLID(#50,#903,#901,1.);\n"));
     assert_eq!(mesh.open_edges(), 0, "{profile}");
@@ -450,7 +555,7 @@ fn fixtures_that_use_these_solids_now_evaluate() {
         codes.dedup();
         println!("{name:<30} {solids:>3}/{:<3} {volume:>12.6}  {:?}", ids.len(), &codes[..codes.len().min(3)]);
 
-        if ["bath-csg-solid", "beam-revolved-solid", "boolean-clipping-halfspace", "reinforcing-stirrup", "geographic-referencing"]
+        if ["bath-csg-solid", "beam-revolved-solid", "boolean-clipping-halfspace", "reinforcing-stirrup", "geographic-referencing", "basin-advanced-brep", "bspline-surface", "bspline-profile-csg"]
             .contains(&name.as_str())
         {
             assert_eq!(solids, ids.len(), "{name}");
