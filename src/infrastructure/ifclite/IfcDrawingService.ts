@@ -8,26 +8,35 @@ import {
   type SVGExportOptions
 } from '@ifc-lite/drawing-2d';
 import type { MeshData } from '@ifc-lite/geometry';
-import type { SectionCutOptions, DrawingExportConfig } from '../../domain/drawings/DrawingTypes';
+import type { DrawingOptions, DrawingExportConfig } from '../../domain/drawings/DrawingTypes';
+import {
+  KernelError,
+  type DrawingId,
+  type ExportedDrawing,
+  type GeneratedDrawing,
+  type ProgressHandler
+} from '../../domain/kernel/KernelPort';
 
 export class IfcDrawingService {
-  private lastDrawing: Drawing2D | null = null;
+  private drawings: Map<DrawingId, Drawing2D> = new Map();
+  private nextDrawingSeq = 0;
 
   async generateDrawing(
     meshes: MeshData[],
-    options: SectionCutOptions,
-    onProgress?: (stage: string, percent: number) => void
-  ): Promise<Drawing2D> {
+    options: DrawingOptions,
+    crsId: string | undefined,
+    onProgress?: ProgressHandler
+  ): Promise<GeneratedDrawing> {
     if (meshes.length === 0) {
-      throw new Error('No hay mallas cargadas para generar el dibujo 2D.');
+      throw new KernelError('internal', 'No hay mallas cargadas para generar el dibujo 2D.');
     }
 
     onProgress?.('Calculando plano de corte 2D', 20);
 
     let drawing: Drawing2D;
 
-    if (options.cutType === 'floorplan') {
-      drawing = await generateFloorPlan(meshes, options.position, {
+    if (options.cut.kind === 'plan') {
+      drawing = await generateFloorPlan(meshes, options.cut.elevation, {
         useGPU: false,
         includeHiddenLines: options.includeHiddenLines,
         includeProjection: options.includeProjection,
@@ -36,8 +45,9 @@ export class IfcDrawingService {
         onProgress: (stage, progress) => onProgress?.(stage, Math.round(progress * 100))
       });
     } else {
-      const axis = options.cutType === 'section-x' ? 'x' : 'z';
-      drawing = await generateSection(meshes, axis, options.position, {
+      // Contract uses Z-up where 'y' is the transverse horizontal axis; IFClite uses Y-up ('z').
+      const axis = options.cut.axis === 'x' ? 'x' : 'z';
+      drawing = await generateSection(meshes, axis, options.cut.position, {
         useGPU: false,
         includeHiddenLines: options.includeHiddenLines,
         includeProjection: options.includeProjection,
@@ -47,17 +57,28 @@ export class IfcDrawingService {
       });
     }
 
-    this.lastDrawing = drawing;
+    const drawingId: DrawingId = `drawing-${++this.nextDrawingSeq}`;
+    this.drawings.set(drawingId, drawing);
     onProgress?.('Plano 2D generado', 100);
-    return drawing;
+
+    return {
+      drawingId,
+      frame: options.frame,
+      crsId,
+      diagnostics: []
+    };
   }
 
-  exportDrawing(
-    drawing: Drawing2D | null = this.lastDrawing,
+  async exportDrawing(
+    drawingId: DrawingId,
     config: DrawingExportConfig
-  ): { content: string; mimeType: string; filename: string } {
+  ): Promise<ExportedDrawing> {
+    const drawing = this.drawings.get(drawingId);
     if (!drawing) {
-      throw new Error('No hay ningún dibujo 2D generado para exportar.');
+      throw new KernelError(
+        'drawing-not-found',
+        'No hay ningún dibujo 2D generado para exportar.'
+      );
     }
 
     if (config.format === 'dxf') {
@@ -71,7 +92,7 @@ export class IfcDrawingService {
 
       const dxfContent = exportToDXF(drawing, dxfOptions);
       return {
-        content: dxfContent,
+        content: new TextEncoder().encode(dxfContent),
         mimeType: 'application/dxf',
         filename: `${config.fileName}.dxf`
       };
@@ -91,20 +112,8 @@ export class IfcDrawingService {
     }
   }
 
-  downloadFile(content: string, mimeType: string, filename: string): void {
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }
-
-  getLastDrawing(): Drawing2D | null {
-    return this.lastDrawing;
+  async discardDrawing(drawingId: DrawingId): Promise<void> {
+    this.drawings.delete(drawingId);
   }
 }
 

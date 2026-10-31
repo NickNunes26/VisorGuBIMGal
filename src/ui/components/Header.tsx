@@ -5,20 +5,20 @@ import {
   MapPin,
   Box,
   Eye,
-  FileDown,
   RefreshCw,
   Compass
 } from 'lucide-react';
-import { BimEngine } from '../../infrastructure/ifclite/BimEngine';
+import type { ViewPreset } from '../../domain/kernel/RendererPort';
 
 interface HeaderProps {
   onOpenFile: (file: File) => void;
   onLoadSample: (samplePath: string, name: string) => void;
-  onSetPreset: (preset: 'iso' | 'top' | 'front' | 'side') => void;
+  onSetPreset: (preset: ViewPreset) => void;
   onFitView: () => void;
   isGisExpanded: boolean;
   onToggleGis: () => void;
   isWorking: boolean;
+  isWebGpuAvailable?: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -28,10 +28,12 @@ export const Header: React.FC<HeaderProps> = ({
   onFitView,
   isGisExpanded,
   onToggleGis,
-  isWorking
+  isWorking,
+  isWebGpuAvailable
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const isWebGpu = BimEngine.isWebGpuSupported();
+  const isWebGpu =
+    isWebGpuAvailable ?? (typeof navigator !== 'undefined' && 'gpu' in navigator);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];

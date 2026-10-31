@@ -1,9 +1,26 @@
 import React from 'react';
 import { Info, Tag, Hash, FileSpreadsheet } from 'lucide-react';
-import type { SelectedElementDetails } from '../../domain/models/ModelRecord';
+import type { AttributeValue, SelectedElementDetails } from '../../domain/models/ModelRecord';
 
 interface PropertiesPanelProps {
   element: SelectedElementDetails | null;
+}
+
+function formatAttributeValue(val: AttributeValue): string {
+  if (val === null) return '-';
+  if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+    return String(val);
+  }
+  if (Array.isArray(val)) {
+    return val.map(formatAttributeValue).join(', ');
+  }
+  if ('ref' in val) {
+    return `#${val.ref}`;
+  }
+  if ('enum' in val) {
+    return `.${val.enum}.`;
+  }
+  return `${val.type}(${formatAttributeValue(val.value)})`;
 }
 
 export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({ element }) => {
@@ -97,7 +114,7 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({ element }) => 
               {Object.entries(element.attributes).map(([key, val], aIdx) => (
                 <tr key={aIdx}>
                   <td>{key}</td>
-                  <td>{String(val)}</td>
+                  <td>{formatAttributeValue(val)}</td>
                 </tr>
               ))}
             </tbody>

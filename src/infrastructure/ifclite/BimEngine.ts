@@ -1,22 +1,22 @@
 import { GeometryProcessor, type MeshData } from '@ifc-lite/geometry';
 import { Renderer } from '@ifc-lite/renderer';
-import type { ModelId, ModelBounds } from '../../domain/models/ModelRecord';
-
-export interface ViewportEventHandlers {
-  onSelectElement?: (modelId: ModelId | null, expressId: number | null) => void;
-  onHoverElement?: (expressId: number | null) => void;
-  onStatusChange?: (status: string) => void;
-}
+import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/ModelRecord';
+import type { GeometryBatch } from '../../domain/kernel/GeometryBatch';
+import type { GeometryEvent } from '../../domain/kernel/KernelPort';
+import type { RendererEventHandlers, ViewPreset } from '../../domain/kernel/RendererPort';
 
 export class BimEngine {
   private canvas: HTMLCanvasElement | null = null;
   private renderer: Renderer | null = null;
   private processor: GeometryProcessor | null = null;
+  private initPromise: Promise<void> | null = null;
   private animFrameId: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  private windowListenersCleanup: (() => void) | null = null;
   private isDestroyed = false;
 
   // Stored meshes per model for 2D section extraction and visibility
+  private pendingBatches: Map<string, MeshData[]> = new Map();
   private modelMeshes: Map<ModelId, MeshData[]> = new Map();
   private modelIndexMap: Map<number, ModelId> = new Map();
   private modelIdToIndex: Map<ModelId, number> = new Map();
@@ -24,25 +24,32 @@ export class BimEngine {
 
   // Visibility and selection sets
   private hiddenModelIds: Set<ModelId> = new Set();
+  private hiddenElementIds: Set<number> = new Set();
   private hiddenExpressIds: Set<number> = new Set();
   private selectedExpressId: number | null = null;
 
-  private handlers: ViewportEventHandlers = {};
+  private handlers: RendererEventHandlers = {};
 
   static isWebGpuSupported(): boolean {
     return typeof navigator !== 'undefined' && 'gpu' in navigator;
   }
 
-  setHandlers(handlers: ViewportEventHandlers) {
+  setHandlers(handlers: RendererEventHandlers): void {
     this.handlers = handlers;
   }
 
-  setSelectedExpressId(expressId: number | null) {
-    this.selectedExpressId = expressId;
+  setSelection(ref: ElementRef | null): void {
+    this.selectedExpressId = ref ? ref.expressId : null;
     this.render();
   }
 
-  async initialize(canvas: HTMLCanvasElement): Promise<void> {
+  initialize(canvas: HTMLCanvasElement): Promise<void> {
+    const p = this.doInitialize(canvas);
+    this.initPromise = p;
+    return p;
+  }
+
+  private async doInitialize(canvas: HTMLCanvasElement): Promise<void> {
     this.canvas = canvas;
     this.isDestroyed = false;
 
@@ -55,6 +62,11 @@ export class BimEngine {
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
       this.animFrameId = null;
+    }
+
+    if (this.windowListenersCleanup) {
+      this.windowListenersCleanup();
+      this.windowListenersCleanup = null;
     }
 
     if (!this.processor) {
@@ -73,12 +85,16 @@ export class BimEngine {
     this.renderer = new Renderer(canvas);
     await this.renderer.init();
 
-    this.setupResize(canvas);
-    this.setupControls(canvas);
+    const cleanupResize = this.setupResize(canvas);
+    const cleanupControls = this.setupControls(canvas);
+    this.windowListenersCleanup = () => {
+      cleanupResize();
+      cleanupControls();
+    };
     this.startRenderLoop();
   }
 
-  private setupResize(canvas: HTMLCanvasElement) {
+  private setupResize(canvas: HTMLCanvasElement): () => void {
     const resize = () => {
       if (!this.renderer || !canvas) return;
       const rect = canvas.getBoundingClientRect();
@@ -97,10 +113,14 @@ export class BimEngine {
       });
       this.resizeObserver.observe(canvas.parentElement);
     }
+
+    return () => {
+      window.removeEventListener('resize', resize);
+    };
   }
 
-  private setupControls(canvas: HTMLCanvasElement) {
-    if (!this.renderer) return;
+  private setupControls(canvas: HTMLCanvasElement): () => void {
+    if (!this.renderer) return () => {};
     const camera = this.renderer.getCamera();
 
     let isDragging = false;
@@ -156,11 +176,16 @@ export class BimEngine {
               (pickResult.modelIndex !== undefined
                 ? this.modelIndexMap.get(pickResult.modelIndex)
                 : undefined) || this.getFirstModelId();
-            this.selectedExpressId = pickResult.expressId;
-            this.handlers.onSelectElement?.(modelId, pickResult.expressId);
+            if (modelId) {
+              this.selectedExpressId = pickResult.expressId;
+              this.handlers.onSelect?.({ modelId, expressId: pickResult.expressId });
+            } else {
+              this.selectedExpressId = null;
+              this.handlers.onSelect?.(null);
+            }
           } else {
             this.selectedExpressId = null;
-            this.handlers.onSelectElement?.(null, null);
+            this.handlers.onSelect?.(null);
           }
           this.render();
         } catch (err) {
@@ -186,6 +211,14 @@ export class BimEngine {
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('contextmenu', onContextMenu);
     canvas.style.cursor = 'grab';
+
+    return () => {
+      canvas.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('contextmenu', onContextMenu);
+    };
   }
 
   private startRenderLoop() {
@@ -205,41 +238,98 @@ export class BimEngine {
     });
   }
 
-  async loadModelGeometry(
+  addModel(modelId: ModelId): void {
+    if (!this.modelIdToIndex.has(modelId)) {
+      const modelIndex = this.nextModelIndex++;
+      this.modelIndexMap.set(modelIndex, modelId);
+      this.modelIdToIndex.set(modelId, modelIndex);
+    }
+    if (!this.modelMeshes.has(modelId)) {
+      this.modelMeshes.set(modelId, []);
+    }
+  }
+
+  addBatch(batch: GeometryBatch): void {
+    const key = `${batch.modelId}:${batch.sequence}`;
+    const meshes = this.pendingBatches.get(key);
+    this.pendingBatches.delete(key);
+    if (!meshes || meshes.length === 0) return;
+
+    let list = this.modelMeshes.get(batch.modelId);
+    if (!list) {
+      list = [];
+      this.modelMeshes.set(batch.modelId, list);
+    }
+    list.push(...meshes);
+
+    if (this.renderer) {
+      this.renderer.addMeshes(meshes, false);
+      this.render();
+    }
+  }
+
+  finishModel(_modelId: ModelId, _bounds: ModelBounds | undefined): void {
+    if (!this.renderer) return;
+    this.renderer.fitToView();
+    this.render();
+  }
+
+  async *streamModelGeometry(
     modelId: ModelId,
     bytes: Uint8Array,
-    onProgress?: (loadedMeshes: number) => void
-  ): Promise<{ meshCount: number; bounds?: ModelBounds }> {
-    if (!this.processor || !this.renderer) {
-      throw new Error('El motor de renderizado no está inicializado.');
+    isModelOpen: () => boolean
+  ): AsyncGenerator<GeometryEvent, void, unknown> {
+    if (this.initPromise) {
+      await this.initPromise;
+    }
+    if (!this.processor) {
+      this.processor = new GeometryProcessor();
+      await this.processor.init();
     }
 
-    const modelIndex = this.nextModelIndex++;
-    this.modelIndexMap.set(modelIndex, modelId);
-    this.modelIdToIndex.set(modelId, modelIndex);
-
-    const accumulatedMeshes: MeshData[] = [];
+    let sequence = 0;
     let totalMeshes = 0;
 
     for await (const event of this.processor.processStreaming(bytes)) {
+      if (!isModelOpen()) {
+        this.clearPendingBatches(modelId);
+        return;
+      }
+
       if (event.type === 'batch') {
-        accumulatedMeshes.push(...event.meshes);
-        this.renderer.addMeshes(event.meshes, false);
+        const seq = ++sequence;
+        this.pendingBatches.set(`${modelId}:${seq}`, event.meshes);
         totalMeshes = event.totalSoFar;
-        this.render();
-        onProgress?.(totalMeshes);
+
+        const batch: GeometryBatch = {
+          modelId,
+          sequence: seq,
+          origin: [0, 0, 0],
+          positions: new Float32Array(0),
+          normals: new Float32Array(0),
+          indices: new Uint32Array(0),
+          meshTable: new Uint32Array(0)
+        };
+
+        yield { type: 'batch', batch };
+        yield {
+          type: 'progress',
+          processedElements: event.totalSoFar,
+          totalElements: event.totalSoFar
+        };
       }
 
       if (event.type === 'complete') {
         totalMeshes = event.totalMeshes;
-        this.renderer.fitToView();
-        this.render();
       }
     }
 
-    this.modelMeshes.set(modelId, accumulatedMeshes);
+    if (!isModelOpen()) {
+      this.clearPendingBatches(modelId);
+      return;
+    }
 
-    const rawBounds = this.renderer.getModelBounds();
+    const rawBounds = this.renderer?.getModelBounds();
     const bounds: ModelBounds | undefined = rawBounds
       ? {
           min: { x: rawBounds.min.x, y: rawBounds.min.y, z: rawBounds.min.z },
@@ -247,7 +337,21 @@ export class BimEngine {
         }
       : undefined;
 
-    return { meshCount: totalMeshes, bounds };
+    yield {
+      type: 'complete',
+      meshCount: totalMeshes,
+      bounds,
+      diagnostics: []
+    };
+  }
+
+  clearPendingBatches(modelId: ModelId): void {
+    const prefix = `${modelId}:`;
+    for (const key of this.pendingBatches.keys()) {
+      if (key.startsWith(prefix)) {
+        this.pendingBatches.delete(key);
+      }
+    }
   }
 
   setModelVisibility(modelId: ModelId, visible: boolean): void {
@@ -261,8 +365,23 @@ export class BimEngine {
     this.render();
   }
 
+  setElementVisibility(refs: readonly ElementRef[], visible: boolean): void {
+    for (const ref of refs) {
+      if (visible) {
+        this.hiddenElementIds.delete(ref.expressId);
+      } else {
+        this.hiddenElementIds.add(ref.expressId);
+      }
+    }
+    this.updateHiddenIds();
+    this.render();
+  }
+
   private updateHiddenIds(): void {
     this.hiddenExpressIds.clear();
+    for (const id of this.hiddenElementIds) {
+      this.hiddenExpressIds.add(id);
+    }
     for (const modelId of this.hiddenModelIds) {
       const meshes = this.modelMeshes.get(modelId);
       if (meshes) {
@@ -276,6 +395,7 @@ export class BimEngine {
   }
 
   removeModel(modelId: ModelId): void {
+    this.clearPendingBatches(modelId);
     this.modelMeshes.delete(modelId);
     this.hiddenModelIds.delete(modelId);
     const idx = this.modelIdToIndex.get(modelId);
@@ -304,15 +424,22 @@ export class BimEngine {
     this.render();
   }
 
-  getModelMeshes(modelId?: ModelId): MeshData[] {
-    if (modelId) {
-      return this.modelMeshes.get(modelId) || [];
+  getMeshesForModels(modelIds: readonly ModelId[]): MeshData[] {
+    if (modelIds.length === 0) {
+      const all: MeshData[] = [];
+      for (const meshes of this.modelMeshes.values()) {
+        all.push(...meshes);
+      }
+      return all;
     }
-    const all: MeshData[] = [];
-    for (const meshes of this.modelMeshes.values()) {
-      all.push(...meshes);
+    const collected: MeshData[] = [];
+    for (const id of modelIds) {
+      const meshes = this.modelMeshes.get(id);
+      if (meshes) {
+        collected.push(...meshes);
+      }
     }
-    return all;
+    return collected;
   }
 
   fitToView(): void {
@@ -321,7 +448,7 @@ export class BimEngine {
     this.render();
   }
 
-  setViewPreset(preset: 'iso' | 'top' | 'front' | 'side'): void {
+  setViewPreset(preset: ViewPreset): void {
     if (!this.renderer) return;
     const camera = this.renderer.getCamera();
     const bounds = this.renderer.getModelBounds();
@@ -367,9 +494,14 @@ export class BimEngine {
 
   destroy(): void {
     this.isDestroyed = true;
+    this.initPromise = null;
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
       this.animFrameId = null;
+    }
+    if (this.windowListenersCleanup) {
+      this.windowListenersCleanup();
+      this.windowListenersCleanup = null;
     }
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
@@ -379,9 +511,12 @@ export class BimEngine {
     this.processor = null;
     this.renderer?.destroy();
     this.renderer = null;
+    this.pendingBatches.clear();
     this.modelMeshes.clear();
     this.modelIndexMap.clear();
+    this.modelIdToIndex.clear();
     this.hiddenModelIds.clear();
+    this.hiddenElementIds.clear();
     this.hiddenExpressIds.clear();
   }
 }
