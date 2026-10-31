@@ -3,5 +3,5 @@
 pub mod csg;
 pub mod mesh;
 
-pub use csg::{CsgError, intersect, subtract};
+pub use csg::{CsgError, intersect, subtract, subtract_all};
 pub use mesh::Mesh;

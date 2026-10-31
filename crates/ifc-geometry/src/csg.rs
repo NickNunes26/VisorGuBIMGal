@@ -15,8 +15,6 @@ use std::fmt;
 const PLANE_TOLERANCE: f64 = 1e-7;
 /// Vertices closer than this are one vertex. Metres.
 const WELD_TOLERANCE: f64 = 1e-6;
-/// Smallest twice-area worth keeping as a triangle. Square metres.
-const MIN_DOUBLE_AREA: f64 = 1e-14;
 /// Bounds recursion, so a pathological mesh gives an error rather than a stack overflow.
 const MAX_TREE_DEPTH: usize = 1024;
 
@@ -37,39 +35,76 @@ impl fmt::Display for CsgError {
 impl std::error::Error for CsgError {}
 
 /// `a` with the volume of `b` removed.
-///
-/// `a`'s tree only classifies. Its faces are clipped directly, and those clear of `b`'s
-/// box stay whole: a face never splits along the infinite extension of a distant plane,
-/// which is what would otherwise make the triangle count explode over repeated cuts.
 pub fn subtract(a: &Mesh, b: &Mesh) -> Result<Mesh, CsgError> {
-    let reach = Bounds::of(b.positions.iter().copied());
-    let mut a_faces = Vec::new();
-    let mut near_faces = Vec::new();
-    for polygon in polygons_of(a) {
-        let flipped = polygon.flipped();
-        if reach.overlaps(&Bounds::of(flipped.vertices.iter().copied())) {
-            near_faces.push(flipped);
-        } else {
-            a_faces.push(flipped);
+    subtract_all(a, std::slice::from_ref(b))
+}
+
+/// `a` with the volume of every cut removed. Prefer this to repeated [`subtract`] calls.
+///
+/// Triangulating between cuts leaves long slivers that the next cut splits again, so
+/// repeated calls grow quadratically. A single pass keeps faces as convex fragments and
+/// stays linear. Cuts whose boxes overlap cannot share a pass, because each must also
+/// remove the other's faces, so they run in successive passes.
+pub fn subtract_all(a: &Mesh, cuts: &[Mesh]) -> Result<Mesh, CsgError> {
+    let mut passes: Vec<(Vec<&Mesh>, Vec<Bounds>)> = Vec::new();
+    for cut in cuts.iter().filter(|cut| !cut.is_empty()) {
+        let reach = Bounds::of(cut.positions.iter().copied());
+        match passes
+            .iter_mut()
+            .find(|(_, reaches)| !reaches.iter().any(|other| other.overlaps(&reach)))
+        {
+            Some((members, reaches)) => {
+                members.push(cut);
+                reaches.push(reach);
+            }
+            None => passes.push((vec![cut], vec![reach])),
         }
     }
 
-    let mut a_tree = Node::from_mesh(a)?;
-    let mut b_tree = Node::from_mesh(b)?;
-    a_tree.invert();
-    a_faces.append(&mut b_tree.clip_polygons(near_faces));
-    b_tree.clip_to(&a_tree);
-    b_tree.invert();
-    b_tree.clip_to(&a_tree);
-    b_tree.invert();
-    b_tree.collect(&mut a_faces);
+    let mut result = a.clone();
+    for (members, reaches) in &passes {
+        // An empty tree clips nothing, so a further pass would keep the cut's walls.
+        if result.is_empty() {
+            break;
+        }
+        result = subtract_disjoint(&result, members, reaches)?;
+    }
+    Ok(result)
+}
 
-    let result: Vec<Polygon> = a_faces.into_iter().map(Polygon::flipped).collect();
+/// One pass of [`subtract_all`]. `a`'s tree only classifies: its faces are clipped directly,
+/// and those clear of a cut's box stay whole.
+fn subtract_disjoint(a: &Mesh, cuts: &[&Mesh], reaches: &[Bounds]) -> Result<Mesh, CsgError> {
+    let mut a_tree = Node::from_mesh(a)?;
+    a_tree.invert();
+
+    let mut faces: Vec<Polygon> = polygons_of(a).into_iter().map(Polygon::flipped).collect();
+    let mut cut_walls = Vec::new();
+    for (cut, reach) in cuts.iter().zip(reaches) {
+        let mut cut_tree = Node::from_mesh(cut)?;
+        let (near, mut far): (Vec<_>, Vec<_>) = faces
+            .into_iter()
+            .partition(|face| reach.overlaps(&Bounds::of(face.vertices.iter().copied())));
+        far.append(&mut cut_tree.clip_polygons(near));
+        faces = far;
+
+        cut_tree.clip_to(&a_tree);
+        cut_tree.invert();
+        cut_tree.clip_to(&a_tree);
+        cut_tree.invert();
+        cut_tree.collect(&mut cut_walls);
+    }
+    faces.append(&mut cut_walls);
+
+    let result: Vec<Polygon> = faces.into_iter().map(Polygon::flipped).collect();
     Ok(assemble(&result))
 }
 
 /// The volume common to `a` and `b`.
 pub fn intersect(a: &Mesh, b: &Mesh) -> Result<Mesh, CsgError> {
+    if a.is_empty() || b.is_empty() {
+        return Ok(Mesh::default());
+    }
     let mut a_tree = Node::from_mesh(a)?;
     let mut b_tree = Node::from_mesh(b)?;
     a_tree.invert();
@@ -396,16 +431,19 @@ impl Welder {
     }
 }
 
-/// Vertex ids sorted along x, for finding the vertices that lie on an edge.
+/// Vertex ids sorted along each axis, for finding the vertices that lie on an edge.
 struct EdgeScanner<'a> {
     positions: &'a [DVec3],
-    sorted: Vec<u32>,
+    sorted: [Vec<u32>; 3],
 }
 
 impl<'a> EdgeScanner<'a> {
     fn new(positions: &'a [DVec3]) -> Self {
-        let mut sorted: Vec<u32> = (0..positions.len() as u32).collect();
-        sorted.sort_by(|a, b| positions[*a as usize].x.total_cmp(&positions[*b as usize].x));
+        let sorted = [0, 1, 2].map(|axis| {
+            let mut ids: Vec<u32> = (0..positions.len() as u32).collect();
+            ids.sort_by(|a, b| positions[*a as usize][axis].total_cmp(&positions[*b as usize][axis]));
+            ids
+        });
         Self { positions, sorted }
     }
 
@@ -417,16 +455,24 @@ impl<'a> EdgeScanner<'a> {
         if length_squared <= WELD_TOLERANCE * WELD_TOLERANCE {
             return Vec::new();
         }
-        let low = start.x.min(end.x) - WELD_TOLERANCE;
-        let high = start.x.max(end.x) + WELD_TOLERANCE;
-        let first = self
-            .sorted
-            .partition_point(|id| self.positions[*id as usize].x < low);
+        // The axis the edge spans least rules out the most vertices.
+        let extent = span.abs();
+        let axis = if extent.x <= extent.y && extent.x <= extent.z {
+            0
+        } else if extent.y <= extent.z {
+            1
+        } else {
+            2
+        };
+        let low = start[axis].min(end[axis]) - WELD_TOLERANCE;
+        let high = start[axis].max(end[axis]) + WELD_TOLERANCE;
+        let sorted = &self.sorted[axis];
+        let first = sorted.partition_point(|id| self.positions[*id as usize][axis] < low);
 
         let mut found: Vec<(f64, u32)> = Vec::new();
-        for id in &self.sorted[first..] {
+        for id in &sorted[first..] {
             let point = self.positions[*id as usize];
-            if point.x > high {
+            if point[axis] > high {
                 break;
             }
             if *id == from || *id == to {
@@ -445,43 +491,58 @@ impl<'a> EdgeScanner<'a> {
     }
 }
 
-fn double_area(a: DVec3, b: DVec3, c: DVec3) -> f64 {
-    (b - a).cross(c - a).length()
+/// Whether `point` lies on the line through `a` and `c`. A distance test, since an area
+/// threshold misreads collinear points on long edges as corners.
+fn on_line(a: DVec3, c: DVec3, point: DVec3) -> bool {
+    let span = c - a;
+    let cross = span.cross(point - a);
+    cross.length_squared() <= WELD_TOLERANCE * WELD_TOLERANCE * span.length_squared()
 }
 
 /// Ear-clips a convex ring whose edges may carry collinear vertices.
+///
+/// Always consumes the whole ring. Topology needs every ring edge used exactly once, so a
+/// sliver with no clean ear still closes, and a zero-area triangle is better than a hole.
 fn triangulate(ring: &mut Vec<u32>, positions: &[DVec3], out: &mut Vec<[u32; 3]>) {
     while ring.len() >= 3 {
         let count = ring.len();
-        let ear = (0..count).find(|&i| {
+        let corners = |i: usize| {
             let (prev, here, next) = (
                 ring[(i + count - 1) % count],
                 ring[i],
                 ring[(i + 1) % count],
             );
-            let (a, b, c) = (
+            (
+                [prev, here, next],
                 positions[prev as usize],
                 positions[here as usize],
                 positions[next as usize],
-            );
-            if double_area(a, b, c) <= MIN_DOUBLE_AREA {
-                return false;
-            }
-            // Cutting along prev-next would orphan any vertex lying on that diagonal.
+            )
+        };
+        let is_corner = |i: usize| {
+            let (_, a, b, c) = corners(i);
+            !on_line(a, c, b)
+        };
+        // A vertex on the diagonal would be left in a zero-area triangle.
+        let clear_diagonal = |i: usize| {
+            let (ids, a, _, c) = corners(i);
             ring.iter()
-                .filter(|id| ![prev, here, next].contains(id))
-                .all(|id| double_area(a, c, positions[*id as usize]) > MIN_DOUBLE_AREA)
-        });
-        let Some(i) = ear else { return };
-        out.push([
-            ring[(i + count - 1) % count],
-            ring[i],
-            ring[(i + 1) % count],
-        ]);
-        ring.remove(i);
+                .filter(|id| !ids.contains(id))
+                .all(|id| !on_line(a, c, positions[*id as usize]))
+        };
+        let ear = (0..count)
+            .find(|&i| is_corner(i) && clear_diagonal(i))
+            .or_else(|| (0..count).find(|&i| is_corner(i)))
+            .unwrap_or(0);
+
+        let (ids, ..) = corners(ear);
+        // Repeated ids come from welding, and their edges cancel out.
+        if ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] {
+            out.push(ids);
+        }
+        ring.remove(ear);
     }
 }
-
 /// Welds fragments into one mesh, removing T-junctions.
 fn assemble(polygons: &[Polygon]) -> Mesh {
     let mut welder = Welder::default();
