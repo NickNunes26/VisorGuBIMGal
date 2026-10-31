@@ -25,7 +25,7 @@ Hilo principal                         Web Worker
 1. La UI solo conoce `KernelPort` y `RendererPort`. Ningún tipo de implementación los atraviesa.
 2. El kernel no conoce el renderizador. El renderizador no conoce IFC: recibe lotes e identidades.
 3. La app conecta ambos: `for await` sobre `streamGeometry` y `addBatch` por cada lote.
-4. Primera versión: WASM de un solo hilo dentro de un Worker. Los hilos serán una optimización posterior, tras medir.
+4. Primera versión: WASM de un solo hilo, con un Worker y una instancia por modelo. Los hilos serán una optimización posterior, tras medir.
 
 ---
 
@@ -151,27 +151,26 @@ Interno entre `wasm-api` y su Worker. Puede cambiar sin tocar `KernelPort`. Prop
 #[wasm_bindgen]
 impl Model {
     #[wasm_bindgen(constructor)]
-    pub fn open(bytes: &[u8]) -> Result<Model, JsError>;
+    pub fn open(bytes: Vec<u8>) -> Result<Model, JsError>;
     pub fn summary_json(&self) -> String;
+    pub fn start_stream(&mut self);
     /// Modelo de extracción: el Worker pide el siguiente lote cuando puede enviarlo.
     pub fn next_batch(&mut self, max_triangles: u32) -> Option<BatchView>;
+    pub fn finish_stream(&mut self) -> String;
     pub fn element_details_json(&self, express_id: u32) -> Option<String>;
     pub fn spatial_tree_json(&self) -> Option<String>;
 }
-
-#[wasm_bindgen]
-impl DrawingStore {
-    pub fn generate(&mut self, models: Vec<ModelHandle>, options_json: &str) -> Result<String, JsError>;
-    pub fn export(&self, drawing_id: &str, config_json: &str) -> Result<Vec<u8>, JsError>;
-    pub fn discard(&mut self, drawing_id: &str);
-}
 ```
+
+**Un Worker por modelo.** La memoria WASM solo crece, y un fallo fatal inutiliza toda la instancia. Con una instancia por modelo, cerrar un modelo termina su Worker y devuelve toda su memoria, detiene al momento un cálculo en curso, y un fallo solo afecta a ese modelo. T-050 define cómo se reparten los planos entre instancias.
+
+**La pila WASM es de 1 MB**, mucho menor que la nativa. Ningún recorrido del kernel puede recurrir con la longitud del archivo: usa un límite de profundidad o una pila explícita.
 
 **Corrección a `docs/03` sección 4:** una vista `Float32Array` sobre `wasmMemory.buffer` queda inválida en cuanto la memoria WASM crece, y la memoria de WASM no se puede transferir entre hilos. Por tanto, el recorrido real es:
 
 1. `next_batch` deja el lote en memoria WASM.
-2. El Worker lo copia a `ArrayBuffer` propios **antes de cualquier otra llamada a WASM**.
-3. Los transfiere al hilo principal, sin más copias.
+2. Cada `take_*` de `BatchView` lo copia a un `ArrayBuffer` propio del Worker.
+3. El Worker los transfiere al hilo principal, sin más copias.
 
 Hay exactamente una copia y ninguna serialización. Los datos no geométricos, poco frecuentes (detalles, árbol, resumen, opciones), pueden viajar como JSON.
 

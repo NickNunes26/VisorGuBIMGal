@@ -126,6 +126,7 @@ name = "wasm-api"
 version = "0.1.0"
 dependencies = [
  "cad-slicer",
+ "glam",
  "ifc-geometry",
  "ifc-schema",
  "spatial-tree",

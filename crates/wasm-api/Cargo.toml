@@ -16,6 +16,7 @@ spatial-tree.workspace = true
 ifc-geometry.workspace = true
 cad-slicer.workspace = true
 wasm-bindgen.workspace = true
+glam.workspace = true
 
 [lints]
 workspace = true
