@@ -119,6 +119,27 @@ pub fn intersect(a: &Mesh, b: &Mesh) -> Result<Mesh, CsgError> {
     Ok(a_tree.into_mesh())
 }
 
+/// The volume of `a` and `b` together.
+pub fn union(a: &Mesh, b: &Mesh) -> Result<Mesh, CsgError> {
+    if a.is_empty() {
+        return Ok(b.clone());
+    }
+    if b.is_empty() {
+        return Ok(a.clone());
+    }
+    let mut a_tree = Node::from_mesh(a)?;
+    let mut b_tree = Node::from_mesh(b)?;
+    a_tree.clip_to(&b_tree);
+    b_tree.clip_to(&a_tree);
+    b_tree.invert();
+    b_tree.clip_to(&a_tree);
+    b_tree.invert();
+    let mut fragments = Vec::new();
+    b_tree.collect(&mut fragments);
+    a_tree.build(fragments, 0)?;
+    Ok(a_tree.into_mesh())
+}
+
 fn polygons_of(mesh: &Mesh) -> Vec<Polygon> {
     mesh.triangle_corners()
         .filter_map(|[a, b, c]| {
