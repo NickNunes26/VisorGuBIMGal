@@ -3,7 +3,7 @@ export type ModelId = string;
 export interface CoordinateReference {
   crsId?: string;                 // e.g. "EPSG:25829" or "EPSG:3857"
   source: 'ifc-map-conversion' | 'user-defined' | 'unknown';
-  localToMap?: number[];          // 4x4 transform matrix
+  localToMap?: number[];          // 4x4 column-major, absolute model metres to map coordinates
   verticalDatum?: string;
   confidence: 'verified' | 'user-supplied' | 'unknown';
   latLng?: [number, number];      // Approximate geographic anchor [lat, lng]

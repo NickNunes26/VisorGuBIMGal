@@ -1,0 +1,76 @@
+import type { ModelId } from '../models/ModelRecord';
+
+/** Bump on any breaking change to this file or to KernelPort/RendererPort. */
+export const CONTRACT_VERSION = 1;
+
+/** Number of u32 words per record in GeometryBatch.meshTable. */
+export const MESH_RECORD_WORDS = 7;
+
+/** Word offsets inside one meshTable record. */
+export const MeshField = {
+  expressId: 0,
+  firstVertex: 1,
+  vertexCount: 2,
+  firstIndex: 3,
+  indexCount: 4,
+  /** 0xRRGGBBAA, non-premultiplied sRGB. */
+  rgba: 5,
+  flags: 6
+} as const;
+
+export const MeshFlag = {
+  /** Alpha below 255: draw in the transparent pass. */
+  Transparent: 1 << 0,
+  /** Kernel could not evaluate it fully (a void was not cut, say). A diagnostic names the element. */
+  Degraded: 1 << 1,
+  /** Pickable, but starts hidden (IfcSpace and similar). */
+  HiddenByDefault: 1 << 2
+} as const;
+
+/**
+ * One transferable block of triangles. Positions are metres, IFC Z-up, as f32 relative to
+ * the model's originShift. Indices are zero-based within this batch. An element may own
+ * several records: one per colour, for instance.
+ */
+export interface GeometryBatch {
+  modelId: ModelId;
+  sequence: number;
+  positions: Float32Array;
+  normals: Float32Array;
+  indices: Uint32Array;
+  meshTable: Uint32Array;
+}
+
+/** Returns the first wire-format violation, or null. For tests and mock data, not hot paths. */
+export function findBatchError(batch: GeometryBatch): string | null {
+  const { positions, normals, indices, meshTable } = batch;
+  if (positions.length % 3 !== 0) return 'positions length is not a multiple of 3';
+  if (normals.length !== positions.length) return 'normals length differs from positions length';
+  if (indices.length % 3 !== 0) return 'indices length is not a multiple of 3';
+  if (meshTable.length % MESH_RECORD_WORDS !== 0) {
+    return `meshTable length is not a multiple of ${MESH_RECORD_WORDS}`;
+  }
+
+  const vertexTotal = positions.length / 3;
+  for (let at = 0; at < meshTable.length; at += MESH_RECORD_WORDS) {
+    const record = at / MESH_RECORD_WORDS;
+    const expressId = meshTable[at + MeshField.expressId];
+    const firstVertex = meshTable[at + MeshField.firstVertex];
+    const vertexCount = meshTable[at + MeshField.vertexCount];
+    const firstIndex = meshTable[at + MeshField.firstIndex];
+    const indexCount = meshTable[at + MeshField.indexCount];
+
+    if (expressId === 0) return `record ${record}: expressId is 0`;
+    if (firstVertex + vertexCount > vertexTotal) return `record ${record}: vertices out of range`;
+    if (firstIndex + indexCount > indices.length) return `record ${record}: indices out of range`;
+    if (indexCount % 3 !== 0) return `record ${record}: indexCount is not a multiple of 3`;
+
+    for (let i = firstIndex; i < firstIndex + indexCount; i++) {
+      const vertex = indices[i];
+      if (vertex < firstVertex || vertex >= firstVertex + vertexCount) {
+        return `record ${record}: index ${i} leaves the record's vertex range`;
+      }
+    }
+  }
+  return null;
+}
