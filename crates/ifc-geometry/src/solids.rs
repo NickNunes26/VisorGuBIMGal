@@ -23,7 +23,9 @@ fn outward(mut mesh: Mesh) -> Mesh {
 
 /// Evenly spaced points of a circular arc in the XY plane, both ends included.
 pub(crate) fn arc(center: DVec2, radius: DVec2, start: f64, sweep: f64) -> Vec<DVec2> {
-    let steps = ((sweep.abs() / (TAU / CIRCLE_SEGMENTS as f64)).ceil() as usize).clamp(1, 4096);
+    // The small margin stops rounding error adding a facet to an exact fraction of a turn.
+    let turns = sweep.abs() / (TAU / CIRCLE_SEGMENTS as f64);
+    let steps = ((turns - 1e-9).ceil() as usize).clamp(1, 4096);
     (0..=steps)
         .map(|step| {
             let angle = start + sweep * step as f64 / steps as f64;
