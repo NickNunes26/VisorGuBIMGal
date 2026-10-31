@@ -634,6 +634,10 @@ fn fixtures_that_use_these_solids_now_evaluate() {
             // A box with windows in two sides, all on one surface wrapped around a seam.
             let box_sides = 2.0 * 15.0 * 7.5 + 2.0 * 7.5 * 7.5;
             assert!(area(102, &mut evaluator) < box_sides - 5.0);
+            // Round shapes, against their areas integrated apart from the kernel: a cone and a
+            // torus whose circles are three rational arcs each.
+            assert!(area(99, &mut evaluator) > 200.529 * 0.995);
+            assert!(area(21, &mut evaluator) > 1062.851 * 0.99);
         }
         if ["bath-csg-solid", "beam-revolved-solid", "boolean-clipping-halfspace", "reinforcing-stirrup", "geographic-referencing", "basin-advanced-brep", "bspline-surface", "bspline-profile-csg"]
             .contains(&name.as_str())

@@ -268,7 +268,9 @@ fn grid_lines(knots: &[f64], degree: usize, start: f64, end: f64) -> Vec<f64> {
 
     let spans = stops.len() - 1;
     let stride = spans.div_ceil(MAX_CELLS_PER_DIRECTION).max(1);
-    let per_span = (MAX_CELLS_PER_DIRECTION / spans).clamp(1, (degree * 2).max(2));
+    // Curved directions are as fine as the boundaries, which are sampled at the same rate.
+    let wanted = if degree > 1 { (degree * 2).max(STEPS_PER_SPAN) } else { 2 };
+    let per_span = (MAX_CELLS_PER_DIRECTION / spans).clamp(1, wanted);
     let mut lines = Vec::new();
     for pair in stops.windows(2).step_by(stride) {
         lines.extend((0..per_span).map(|step| pair[0] + (pair[1] - pair[0]) * step as f64 / per_span as f64));
