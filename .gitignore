@@ -3,6 +3,9 @@ node_modules/
 .pnp
 .pnp.js
 
+# Rust
+target/
+
 # Production build
 dist/
 build/
