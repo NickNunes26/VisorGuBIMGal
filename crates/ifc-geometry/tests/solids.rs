@@ -352,6 +352,73 @@ fn trimmed_spline_surfaces_follow_their_boundary() {
     close(area, 2.0, 1e-6);
 }
 
+fn surface_area(mesh: &Mesh) -> f64 {
+    mesh.triangle_corners().map(|[a, b, c]| (b - a).cross(c - a).length() / 2.0).sum()
+}
+
+/// A slot crossing many grid cells, and a concave outline: both defeat per-cell clipping.
+#[test]
+fn trims_with_slots_and_concave_outlines_keep_their_exact_area() {
+    let surface = "#20=IFCCARTESIANPOINT((0.,0.,0.));\n\
+         #21=IFCCARTESIANPOINT((0.,10.,0.));\n\
+         #22=IFCCARTESIANPOINT((10.,0.,0.));\n\
+         #23=IFCCARTESIANPOINT((10.,10.,0.));\n\
+         #24=IFCBSPLINESURFACEWITHKNOTS(1,1,((#20,#21),(#22,#23)),.UNSPECIFIED.,.F.,.F.,.F.,(2,2),(2,2),(0.,1.),(0.,1.),.UNSPECIFIED.);\n";
+    let ring = |first: u32, points: &[(f64, f64)]| {
+        let mut text = String::new();
+        let mut ids = Vec::new();
+        for (index, (x, y)) in points.iter().enumerate() {
+            let id = first + index as u32;
+            text.push_str(&format!("#{id}=IFCCARTESIANPOINT(({x:?},{y:?},0.));\n"));
+            ids.push(format!("#{id}"));
+        }
+        (text, ids.join(","))
+    };
+
+    // A comb: a 9 by 9 square with a deep notch, whose outline wanders in and out of cells.
+    let (outer, outer_ids) = ring(100, &[(0.5, 0.5), (9.5, 0.5), (9.5, 9.5), (5.5, 9.5), (5.5, 2.5), (4.5, 2.5), (4.5, 9.5), (0.5, 9.5)]);
+    // A thin slot right across the left part.
+    let (slot, slot_ids) = ring(200, &[(1.0, 1.0), (1.2, 1.0), (1.2, 9.0), (1.0, 9.0)]);
+    let mesh = evaluate(&format!(
+        "{surface}{outer}{slot}#30=IFCPOLYLOOP(({outer_ids}));\n\
+         #31=IFCFACEOUTERBOUND(#30,.T.);\n\
+         #32=IFCPOLYLOOP(({slot_ids}));\n\
+         #33=IFCFACEBOUND(#32,.T.);\n\
+         #35=IFCADVANCEDFACE((#31,#33),#24,.T.);\n\
+         #36=IFCOPENSHELL((#35));\n\
+         #5=IFCSHELLBASEDSURFACEMODEL((#36));\n"
+    ));
+    close(surface_area(&mesh), 81.0 - 7.0 - 1.6, 1e-9);
+}
+
+/// A sharp ridge between clustered knots must not fall between grid lines.
+#[test]
+fn clustered_knots_get_their_own_grid_lines() {
+    let mut points = String::new();
+    let mut rows = Vec::new();
+    let heights = [0.0, 0.0, 5.0, 0.0, 0.0];
+    for (i, x) in [0.0, 3.25, 3.3, 3.35, 10.0].iter().enumerate() {
+        let (a, b) = (300 + i * 2, 301 + i * 2);
+        points.push_str(&format!(
+            "#{a}=IFCCARTESIANPOINT(({x:?},0.,{:?}));\n#{b}=IFCCARTESIANPOINT(({x:?},10.,{:?}));\n",
+            heights[i], heights[i]
+        ));
+        rows.push(format!("(#{a},#{b})"));
+    }
+    let mesh = evaluate(&format!(
+        "{points}#24=IFCBSPLINESURFACEWITHKNOTS(1,1,({}),.UNSPECIFIED.,.F.,.F.,.F.,(2,1,1,1,2),(2,2),(0.,0.325,0.33,0.335,1.),(0.,1.),.UNSPECIFIED.);\n\
+         #30=IFCCARTESIANPOINT((0.,0.,0.));\n#31=IFCCARTESIANPOINT((10.,0.,0.));\n\
+         #32=IFCCARTESIANPOINT((10.,10.,0.));\n#33=IFCCARTESIANPOINT((0.,10.,0.));\n\
+         #34=IFCPOLYLOOP((#30,#31,#32,#33));\n\
+         #35=IFCFACEOUTERBOUND(#34,.T.);\n\
+         #36=IFCADVANCEDFACE((#35),#24,.T.);\n\
+         #37=IFCOPENSHELL((#36));\n\
+         #5=IFCSHELLBASEDSURFACEMODEL((#37));\n",
+        rows.join(",")
+    ));
+    close(bounds(&mesh).1.z, 5.0, 1e-6);
+}
+
 /// Each edge's polyline overshoots both of its vertices. Only the vertices may count.
 #[test]
 fn edges_use_only_the_part_of_a_curve_between_their_vertices() {
@@ -555,6 +622,19 @@ fn fixtures_that_use_these_solids_now_evaluate() {
         codes.dedup();
         println!("{name:<30} {solids:>3}/{:<3} {volume:>12.6}  {:?}", ids.len(), &codes[..codes.len().min(3)]);
 
+        if name == "bspline-surface" {
+            // A terrain and a flat plate, both 15 by 15 m. Backwards edges halve them.
+            let area = |id: u32, evaluator: &mut ModelEvaluator<'_>| {
+                surface_area(&evaluator.evaluate(id).unwrap().meshes[0].mesh)
+            };
+            assert!(area(101, &mut evaluator) > 225.0);
+            close(area(96, &mut evaluator), 225.0, 1e-6);
+            // The hole of the plate is 0.2658 of its parameter square.
+            close(area(103, &mut evaluator), 225.0 * (1.0 - 0.2658), 0.05);
+            // A box with windows in two sides, all on one surface wrapped around a seam.
+            let box_sides = 2.0 * 15.0 * 7.5 + 2.0 * 7.5 * 7.5;
+            assert!(area(102, &mut evaluator) < box_sides - 5.0);
+        }
         if ["bath-csg-solid", "beam-revolved-solid", "boolean-clipping-halfspace", "reinforcing-stirrup", "geographic-referencing", "basin-advanced-brep", "bspline-surface", "bspline-profile-csg"]
             .contains(&name.as_str())
         {

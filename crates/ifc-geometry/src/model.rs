@@ -143,6 +143,28 @@ fn triangulate_rings(rings: &[&[DVec2]]) -> Vec<[u32; 3]> {
         .collect()
 }
 
+/// Flips edges so each starts where the last one ended. A loop has to connect, and real
+/// files carry orientation flags that say otherwise, which would fold the whole boundary.
+fn chain_edges(edges: &mut [Vec<DVec3>]) {
+    let ends = |edge: &[DVec3]| (edge[0], edge[edge.len() - 1]);
+    let meets = |a: DVec3, b: DVec3| a.distance_squared(b) <= 1e-12;
+    if edges.len() < 2 || edges.iter().any(Vec::is_empty) {
+        return;
+    }
+    let (second_start, second_end) = ends(&edges[1]);
+    let (_, first_end) = ends(&edges[0]);
+    if !meets(first_end, second_start) && !meets(first_end, second_end) {
+        edges[0].reverse();
+    }
+    for index in 1..edges.len() {
+        let (_, reached) = ends(&edges[index - 1]);
+        let (start, end) = ends(&edges[index]);
+        if !meets(start, reached) && meets(end, reached) {
+            edges[index].reverse();
+        }
+    }
+}
+
 /// An edge may use only part of its curve: keeps the run between its two vertices.
 fn between_vertices(points: Vec<DVec3>, start: DVec3, end: DVec3) -> Vec<DVec3> {
     if start.distance_squared(end) <= POINT_TOLERANCE * POINT_TOLERANCE {
@@ -1071,7 +1093,7 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     fn edge_loop(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
-        let mut path = Vec::new();
+        let mut edges = Vec::new();
         for oriented in list(attribute(entity, def, "EdgeList")).iter().filter_map(reference) {
             let (oriented, oriented_def) = self.lookup(oriented)?;
             let element = attribute(&oriented, &oriented_def, "EdgeElement").and_then(reference)?;
@@ -1080,6 +1102,12 @@ impl<'a> ModelEvaluator<'a> {
             if flag(attribute(&oriented, &oriented_def, "Orientation")) == Some(false) {
                 points.reverse();
             }
+            edges.push(points);
+        }
+        chain_edges(&mut edges);
+
+        let mut path = Vec::new();
+        for points in edges {
             join(&mut path, points);
         }
         // The loop closes on its first vertex, which should not appear twice.

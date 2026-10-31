@@ -1,8 +1,9 @@
 //! B-spline curves and surfaces, rational or not, and meshing of trimmed surfaces.
 //!
 //! Evaluation is the Cox-de Boor recurrence. A trimmed face is meshed in parameter space:
-//! its boundary is mapped onto the surface by Newton iteration, then clipped against a grid
-//! of cells, so the result follows both the curvature and the trim.
+//! its boundary is mapped onto the surface by Newton iteration and triangulated as a whole,
+//! then the triangles are split along a grid that follows the knots, so the result keeps
+//! both the exact trim and the curvature.
 
 use crate::mesh::Mesh;
 use earcut::Earcut;
@@ -13,6 +14,8 @@ const MAX_DEGREE: usize = 32;
 const STEPS_PER_SPAN: usize = 8;
 const MAX_CURVE_POINTS: usize = 4096;
 const MAX_CELLS_PER_DIRECTION: usize = 64;
+/// Triangle and cell pairs one face may test, so a hostile boundary cannot stall the Worker.
+const MAX_CLIPS_PER_FACE: usize = 20_000_000;
 const NEWTON_STEPS: usize = 12;
 /// Grid resolution used to seed Newton iteration.
 const SEED_GRID: usize = 16;
@@ -148,16 +151,12 @@ impl Surface {
         project(sum)
     }
 
-    /// The closest parameters to `target`, from the best of a coarse grid of starts.
-    fn invert(&self, target: DVec3, grid: &[(DVec2, DVec3)]) -> Option<DVec2> {
+    /// Newton iteration towards the point nearest `target`. Gives the parameters and the miss.
+    fn refine(&self, target: DVec3, start: DVec2) -> Option<(DVec2, f64)> {
         let (u_start, u_end) = self.u_domain();
         let (v_start, v_end) = self.v_domain();
-        let closest = |a: &&(DVec2, DVec3), b: &&(DVec2, DVec3)| {
-            a.1.distance_squared(target).total_cmp(&b.1.distance_squared(target))
-        };
-        let mut at = grid.iter().min_by(closest)?.0;
         let (du, dv) = ((u_end - u_start) * 1e-5, (v_end - v_start) * 1e-5);
-
+        let mut at = start;
         for _ in 0..NEWTON_STEPS {
             let here = self.at(at.x, at.y)?;
             let along_u = (self.at(at.x + du, at.y)? - self.at(at.x - du, at.y)?) / (2.0 * du);
@@ -178,7 +177,39 @@ impl Surface {
                 break;
             }
         }
-        Some(at)
+        Some((at, self.at(at.x, at.y)?.distance_squared(target)))
+    }
+
+    /// The parameters of the surface point nearest `target`. Starts from the previous point
+    /// along the boundary and from the nearest of a coarse grid, and keeps the better.
+    fn invert(&self, target: DVec3, grid: &[(DVec2, DVec3)], previous: Option<DVec2>) -> Option<DVec2> {
+        let seed = grid
+            .iter()
+            .min_by(|a, b| a.1.distance_squared(target).total_cmp(&b.1.distance_squared(target)))?
+            .0;
+        let from_seed = self.refine(target, seed)?;
+        let best = match previous.and_then(|start| self.refine(target, start)) {
+            Some(result) if result.1 <= from_seed.1 => result,
+            _ => from_seed,
+        };
+        Some(best.0)
+    }
+
+    /// Whether the two ends of a parameter direction are the same place.
+    fn closes(&self, along_u: bool) -> bool {
+        let (u_start, u_end) = self.u_domain();
+        let (v_start, v_end) = self.v_domain();
+        (0..=8).all(|step| {
+            let share = step as f64 / 8.0;
+            let ends = if along_u {
+                let v = v_start + (v_end - v_start) * share;
+                (self.at(u_start, v), self.at(u_end, v))
+            } else {
+                let u = u_start + (u_end - u_start) * share;
+                (self.at(u, v_start), self.at(u, v_end))
+            };
+            matches!(ends, (Some(a), Some(b)) if a.distance_squared(b) < 1e-12)
+        })
     }
 
     fn seed_grid(&self) -> Vec<(DVec2, DVec3)> {
@@ -227,34 +258,45 @@ fn clip_to_cell(ring: &[DVec2], min: DVec2, max: DVec2) -> Vec<DVec2> {
     clip_ring(&ring, 1, max.y, false)
 }
 
-fn contains(ring: &[DVec2], point: DVec2) -> bool {
-    let mut inside = false;
-    for (index, a) in ring.iter().enumerate() {
-        let b = ring[(index + 1) % ring.len()];
-        if (a.y > point.y) != (b.y > point.y)
-            && point.x < a.x + (point.y - a.y) * (b.x - a.x) / (b.y - a.y)
-        {
-            inside = !inside;
-        }
+/// Grid lines across `[start, end]`, on every knot and between them, so that features
+/// squeezed between close knots still get cells of their own.
+fn grid_lines(knots: &[f64], degree: usize, start: f64, end: f64) -> Vec<f64> {
+    let mut stops = vec![start];
+    stops.extend(knots.iter().copied().filter(|knot| *knot > start && *knot < end));
+    stops.push(end);
+    stops.dedup();
+
+    let spans = stops.len() - 1;
+    let stride = spans.div_ceil(MAX_CELLS_PER_DIRECTION).max(1);
+    let per_span = (MAX_CELLS_PER_DIRECTION / spans).clamp(1, (degree * 2).max(2));
+    let mut lines = Vec::new();
+    for pair in stops.windows(2).step_by(stride) {
+        lines.extend((0..per_span).map(|step| pair[0] + (pair[1] - pair[0]) * step as f64 / per_span as f64));
     }
-    inside
+    lines.push(end);
+    lines
 }
 
-fn touches_cell(ring: &[DVec2], min: DVec2, max: DVec2) -> bool {
-    !clip_to_cell(ring, min, max).is_empty()
+/// The cells of `lines` that `low..high` reaches.
+fn cell_range(lines: &[f64], low: f64, high: f64) -> std::ops::Range<usize> {
+    let first = lines.partition_point(|line| *line <= low).saturating_sub(1);
+    let last = lines.partition_point(|line| *line < high).min(lines.len() - 1);
+    first..last.max(first + 1)
 }
 
-/// Splits `[start, end]` so the cells follow the surface's own spans.
-fn grid_lines(knots: &[f64], degree: usize, count: usize, start: f64, end: f64) -> Vec<f64> {
-    let spans = distinct_spans(knots, degree, count).max(1);
-    let cells = (spans * degree * 2).clamp(4, MAX_CELLS_PER_DIRECTION);
-    (0..=cells).map(|cell| start + (end - start) * cell as f64 / cells as f64).collect()
+/// Whether a ring steps across more than half of a direction: on a closed surface, that is
+/// the seam, not a long edge.
+fn crosses_seam(rings: &[Vec<DVec2>], axis: usize, span: f64) -> bool {
+    rings.iter().any(|ring| {
+        (0..ring.len()).any(|i| (ring[(i + 1) % ring.len()][axis] - ring[i][axis]).abs() > span * 0.5)
+    })
 }
 
-/// Meshes a surface between trimming loops, given as points in space.
+/// Meshes a surface inside trimming loops, given as points in space, the outer one first.
 ///
-/// Returns triangles wound by parameter direction. A loop that wraps around a closed
-/// surface has no interior in parameter space, so such faces keep the band the loops span.
+/// Triangles wind by parameter direction. A loop that wraps around a closed surface has no
+/// interior in parameter space, so such faces keep the whole band that their loops span,
+/// less any loop wound the other way that stays clear of the seam: those are real holes.
 pub(crate) fn mesh_surface(surface: &Surface, loops: &[Vec<DVec3>]) -> Option<Mesh> {
     let seeds = surface.seed_grid();
     let (u_start, u_end) = surface.u_domain();
@@ -262,83 +304,124 @@ pub(crate) fn mesh_surface(surface: &Surface, loops: &[Vec<DVec3>]) -> Option<Me
 
     let mut rings: Vec<Vec<DVec2>> = Vec::with_capacity(loops.len());
     for boundary in loops {
-        let ring: Option<Vec<DVec2>> =
-            boundary.iter().map(|point| surface.invert(*point, &seeds)).collect();
-        rings.push(ring?);
+        let mut ring = Vec::with_capacity(boundary.len());
+        for point in boundary {
+            ring.push(surface.invert(*point, &seeds, ring.last().copied())?);
+        }
+        rings.push(ring);
     }
 
-    let extent = |values: &mut dyn Iterator<Item = f64>| {
-        values.fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)))
-    };
-    let (u_low, u_high) = extent(&mut rings.iter().flatten().map(|uv| uv.x));
-    let (v_low, v_high) = extent(&mut rings.iter().flatten().map(|uv| uv.y));
+    let u_wraps = surface.closes(true) && crosses_seam(&rings, 0, u_end - u_start);
+    let v_wraps = surface.closes(false) && crosses_seam(&rings, 1, v_end - v_start);
 
-    // A jump across most of the domain between neighbours means the loop crossed a seam.
-    let crossing = |ring: &[DVec2], axis: usize, span: f64| {
-        (0..ring.len()).any(|i| (ring[(i + 1) % ring.len()][axis] - ring[i][axis]).abs() > span * 0.5)
+    let extent = |axis: usize| {
+        rings.iter().flatten().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), uv| {
+            (low.min(uv[axis]), high.max(uv[axis]))
+        })
     };
-    let u_wraps = rings.iter().any(|ring| crossing(ring, 0, u_end - u_start));
-    let v_wraps = rings.iter().any(|ring| crossing(ring, 1, v_end - v_start));
-    let trimmed = !(u_wraps || v_wraps);
-
-    let (u_from, u_to) = if u_wraps { (u_start, u_end) } else { (u_low, u_high) };
-    let (v_from, v_to) = if v_wraps { (v_start, v_end) } else { (v_low, v_high) };
-    if !(u_to > u_from && v_to > v_from) {
+    let (u_low, u_high) = if u_wraps { (u_start, u_end) } else { extent(0) };
+    let (v_low, v_high) = if v_wraps { (v_start, v_end) } else { extent(1) };
+    if !(u_high > u_low && v_high > v_low) {
         return None;
     }
-    let us = grid_lines(&surface.u_knots, surface.u_degree, surface.u_count(), u_from, u_to);
-    let vs = grid_lines(&surface.v_knots, surface.v_degree, surface.v_count(), v_from, v_to);
+    let us = grid_lines(&surface.u_knots, surface.u_degree, u_low, u_high);
+    let vs = grid_lines(&surface.v_knots, surface.v_degree, v_low, v_high);
+
+    let signed_area = |ring: &[DVec2]| {
+        (0..ring.len()).map(|i| ring[i].perp_dot(ring[(i + 1) % ring.len()])).sum::<f64>() / 2.0
+    };
+    // A single loop around its whole extent trims nothing, and a plain grid is far lighter.
+    let extent_area = (u_high - u_low) * (v_high - v_low);
+    let untrimmed = rings.len() == 1 && signed_area(&rings[0]).abs() >= extent_area * 0.9999;
 
     let mut mesh = Mesh::default();
-    let mut emit = |corners: &[DVec2], triangles: &[u32]| -> Option<()> {
-        let first = mesh.positions.len() as u32;
-        for corner in corners {
-            mesh.positions.push(surface.at(corner.x, corner.y)?);
-        }
-        for triangle in triangles.chunks_exact(3) {
-            mesh.triangles.push([first + triangle[0], first + triangle[1], first + triangle[2]]);
-        }
-        Some(())
+    let wraps = u_wraps || v_wraps;
+    let band_holes: Vec<&Vec<DVec2>> = if wraps {
+        let largest = rings.iter().map(|ring| signed_area(ring)).max_by(|a, b| a.abs().total_cmp(&b.abs()));
+        let sign = largest.unwrap_or(1.0).signum();
+        let spans = [u_end - u_start, v_end - v_start];
+        rings
+            .iter()
+            .filter(|ring| signed_area(ring) * sign < 0.0)
+            .filter(|ring| !(0..2).any(|axis| crosses_seam(std::slice::from_ref(*ring), axis, spans[axis])))
+            .collect()
+    } else {
+        Vec::new()
     };
 
-    for i in 0..us.len() - 1 {
-        for j in 0..vs.len() - 1 {
-            let (min, max) = (DVec2::new(us[i], vs[j]), DVec2::new(us[i + 1], vs[j + 1]));
-            let square = [min, DVec2::new(max.x, min.y), max, DVec2::new(min.x, max.y)];
-            if !trimmed || !rings.iter().any(|ring| touches_cell(ring, min, max)) {
-                let centre = (min + max) / 2.0;
-                let outside = trimmed
-                    && !rings.is_empty()
-                    && (!contains(&rings[0], centre) || rings[1..].iter().any(|hole| contains(hole, centre)));
-                if !outside {
-                    emit(&square, &[0, 1, 2, 0, 2, 3])?;
-                }
-                continue;
+    if untrimmed || (wraps && band_holes.is_empty()) {
+        for u in us.windows(2) {
+            for v in vs.windows(2) {
+                let square = [
+                    DVec2::new(u[0], v[0]),
+                    DVec2::new(u[1], v[0]),
+                    DVec2::new(u[1], v[1]),
+                    DVec2::new(u[0], v[1]),
+                ];
+                emit_fan(surface, &square, &mut mesh)?;
             }
+        }
+        return (!mesh.is_empty()).then_some(mesh);
+    }
 
-            let outer = clip_to_cell(&rings[0], min, max);
-            if outer.len() < 3 {
-                continue;
-            }
-            let mut points: Vec<DVec2> = outer;
-            let mut hole_starts = Vec::new();
-            for hole in &rings[1..] {
-                let hole = clip_to_cell(hole, min, max);
-                if hole.len() >= 3 {
-                    hole_starts.push(points.len() as u32);
-                    points.extend(hole);
+    let band;
+    let parts: Vec<&Vec<DVec2>> = if wraps {
+        band = vec![
+            DVec2::new(u_low, v_low),
+            DVec2::new(u_high, v_low),
+            DVec2::new(u_high, v_high),
+            DVec2::new(u_low, v_high),
+        ];
+        std::iter::once(&band).chain(band_holes).collect()
+    } else {
+        rings.iter().collect()
+    };
+    let mut points: Vec<DVec2> = Vec::new();
+    let mut hole_starts = Vec::new();
+    for (index, ring) in parts.iter().enumerate() {
+        if index > 0 {
+            hole_starts.push(points.len() as u32);
+        }
+        points.extend_from_slice(ring);
+    }
+    let mut indices: Vec<u32> = Vec::new();
+    Earcut::new().earcut(points.iter().map(|point| [point.x, point.y]), &hole_starts, &mut indices);
+
+    let mut clips = 0;
+    for triangle in indices.chunks_exact(3) {
+        let [a, b, c] = [0, 1, 2].map(|corner| points[triangle[corner] as usize]);
+        let area = (b - a).perp_dot(c - a);
+        if area == 0.0 {
+            continue;
+        }
+        let corners = if area > 0.0 { [a, b, c] } else { [a, c, b] };
+        let (low, high) = (a.min(b).min(c), a.max(b).max(c));
+        for i in cell_range(&us, low.x, high.x) {
+            for j in cell_range(&vs, low.y, high.y) {
+                clips += 1;
+                if clips > MAX_CLIPS_PER_FACE {
+                    return None;
                 }
+                let min = DVec2::new(us[i], vs[j]);
+                let max = DVec2::new(us[i + 1], vs[j + 1]);
+                emit_fan(surface, &clip_to_cell(&corners, min, max), &mut mesh)?;
             }
-            let mut indices: Vec<u32> = Vec::new();
-            Earcut::new().earcut(points.iter().map(|point| [point.x, point.y]), &hole_starts, &mut indices);
-            for triangle in indices.chunks_exact_mut(3) {
-                let [a, b, c] = [0, 1, 2].map(|corner| points[triangle[corner] as usize]);
-                if (b - a).perp_dot(c - a) < 0.0 {
-                    triangle.swap(1, 2);
-                }
-            }
-            emit(&points, &indices)?;
         }
     }
     (!mesh.is_empty()).then_some(mesh)
+}
+
+/// Adds a convex polygon of parameters to the mesh as a triangle fan.
+fn emit_fan(surface: &Surface, polygon: &[DVec2], mesh: &mut Mesh) -> Option<()> {
+    if polygon.len() < 3 {
+        return Some(());
+    }
+    let first = mesh.positions.len() as u32;
+    for corner in polygon {
+        mesh.positions.push(surface.at(corner.x, corner.y)?);
+    }
+    for step in 1..polygon.len() as u32 - 1 {
+        mesh.triangles.push([first, first + step, first + step + 1]);
+    }
+    Some(())
 }
