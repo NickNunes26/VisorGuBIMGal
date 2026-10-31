@@ -20,6 +20,11 @@ cargo run -p ifc-schema --example generate -- \
 
 The EXPRESS files are published by buildingSMART International. This project is not affiliated with or endorsed by buildingSMART.
 
-## Open licence question
+## Rules for this file
 
-The notices differ, and the IFC2X3 one is the most restrictive. Whether tables of names count as a reproduction or an adaptation has not been settled for this project. See Q7 in `COORDINATION.md`. **Resolve it before any push that contains `src/tables.rs`.**
+The notices differ, and the IFC2X3 one is the most restrictive. D-011 in `COORDINATION.md` records why the tables are used anyway. These rules follow from it:
+
+- The tables hold only what is needed to read a file: names, order, inheritance and flags. Never add descriptions, rules or functions.
+- Names are never edited by hand. Regenerate instead.
+- The tables are not covered by the project licence. `NOTICE.md` says so and must travel with any build that includes them.
+- `.exp` files are never committed.
