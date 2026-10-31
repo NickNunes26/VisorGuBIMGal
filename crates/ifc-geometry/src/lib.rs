@@ -3,6 +3,7 @@
 pub mod csg;
 pub mod mesh;
 pub mod model;
+mod nurbs;
 mod solids;
 
 pub use csg::{CsgError, intersect, subtract, subtract_all, union};
