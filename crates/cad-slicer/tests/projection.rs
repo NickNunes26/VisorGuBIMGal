@@ -206,3 +206,18 @@ fn an_occluder_listed_after_what_it_hides_still_hides() {
     assert_eq!(drawn.hidden.len(), 4, "{:?}", drawn.hidden);
     assert!((drawn.hidden.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
 }
+
+#[test]
+fn an_occluder_in_the_same_grid_cells_is_found_whatever_the_order() {
+    // A far marker makes the grid coarse, so the small slab sits in cells beside the box it
+    // hides, rather than in the list of wide triangles. The box is listed first.
+    let meshes = vec![
+        DrawingMesh::new(1, 1, "box", cuboid(v(1.0, 1.0, 0.0), v(2.0, 2.0, 1.0))),
+        DrawingMesh::new(1, 2, "slab", cuboid(v(0.5, 0.5, 1.5), v(2.5, 2.5, 2.0))),
+        DrawingMesh::new(1, 3, "far", cuboid(v(500.0, 500.0, 0.0), v(501.0, 501.0, 1.0))),
+    ];
+    let drawing = draw(&meshes, &options(None));
+    let drawn = layer(&drawing, "box");
+    assert!(drawn.visible.is_empty(), "{:?}", drawn.visible);
+    assert!((drawn.hidden.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
+}
