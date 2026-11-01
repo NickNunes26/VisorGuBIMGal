@@ -4,6 +4,7 @@
 use cad_slicer::{Axis, Cut, DrawingMesh, DrawingOptions, Look, Segment, draw, to_dxf};
 use glam::DVec3;
 use ifc_geometry::Mesh;
+use std::f64::consts::FRAC_PI_6;
 
 fn close(actual: f64, expected: f64, tolerance: f64) {
     assert!((actual - expected).abs() <= tolerance, "{actual} against {expected}");
@@ -48,7 +49,7 @@ fn a_plan_hides_what_lies_under_a_taller_box() {
 
 #[test]
 fn hidden_lines_do_not_depend_on_being_lined_up_with_the_axes() {
-    let (visible, hidden) = lines(&tall_over_low(0.5236), Cut::Plan { z: 10.0 }, None);
+    let (visible, hidden) = lines(&tall_over_low(FRAC_PI_6), Cut::Plan { z: 10.0 }, None);
     close(visible, 14.0, 0.15);
     close(hidden, 4.0, 0.15);
 }
@@ -140,7 +141,7 @@ fn a_triangle_with_a_sliver_of_an_edge_on_the_plane_raises_no_false_alarm() {
 fn groups(bytes: &[u8]) -> Vec<(i32, String)> {
     let text: String = bytes.iter().map(|byte| *byte as char).collect();
     let lines: Vec<&str> = text.split("\r\n").collect();
-    lines.chunks_exact(2).map(|pair| (pair[0].trim().parse().unwrap(), pair[1].to_string())).collect()
+    lines.as_chunks::<2>().0.iter().map(|[code, value]| (code.trim().parse().unwrap(), value.to_string())).collect()
 }
 
 fn hidden_sheet() -> Vec<(i32, String)> {

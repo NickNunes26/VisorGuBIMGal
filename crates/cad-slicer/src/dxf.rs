@@ -142,27 +142,55 @@ impl Writer {
         self.end_section();
     }
 
+    /// Layers can only name a linetype that the file defines.
+    fn linetype_table(&mut self) {
+        self.group(0, b"TABLE");
+        self.text(2, "LTYPE");
+        self.integer(70, 2);
+        self.linetype_entry("CONTINUOUS", "Solid line", &[]);
+        self.linetype_entry("DASHED", "Dashed", &[0.5, -0.25]);
+        self.group(0, b"ENDTAB");
+    }
+
+    /// `pattern` holds dash lengths in drawing units, negative for gaps.
+    fn linetype_entry(&mut self, name: &str, description: &str, pattern: &[f64]) {
+        self.group(0, b"LTYPE");
+        self.text(2, name);
+        self.integer(70, 0);
+        self.text(3, description);
+        self.integer(72, 65);
+        self.integer(73, pattern.len() as i64);
+        self.number(40, pattern.iter().map(|dash| dash.abs()).sum());
+        for dash in pattern {
+            self.number(49, *dash);
+        }
+    }
+
     fn layer_table(&mut self, layers: &[Planned]) {
         self.section("TABLES");
+        self.linetype_table();
         self.group(0, b"TABLE");
         self.text(2, "LAYER");
-        self.integer(70, layers.len() as i64);
+        // A hidden layer is an entry of the table too, so the count covers both kinds.
+        let entries =
+            layers.len() + layers.iter().filter(|planned| planned.hidden.is_some()).count();
+        self.integer(70, entries as i64);
         for planned in layers {
-            self.layer_entry(&planned.name, 7);
+            self.layer_entry(&planned.name, 7, "CONTINUOUS");
             if let Some(hidden) = &planned.hidden {
-                self.layer_entry(hidden, 8);
+                self.layer_entry(hidden, 8, "DASHED");
             }
         }
         self.group(0, b"ENDTAB");
         self.end_section();
     }
 
-    fn layer_entry(&mut self, name: &str, colour: u8) {
+    fn layer_entry(&mut self, name: &str, colour: u8, linetype: &str) {
         self.group(0, b"LAYER");
         self.text(2, name);
         self.integer(70, 0);
         self.integer(62, colour as i64);
-        self.text(6, "CONTINUOUS");
+        self.text(6, linetype);
     }
 
     fn line(&mut self, layer: &str, from: glam::DVec2, to: glam::DVec2) {
