@@ -269,3 +269,46 @@ fn chains_as_long_as_the_file_do_not_exhaust_the_stack() {
             .unwrap();
     });
 }
+
+
+/// A wall with one property per unit label, so each label is checked character by character.
+const UNIT_LABELS: &str = "ISO-10303-21;
+HEADER;FILE_DESCRIPTION((''),'2;1');FILE_NAME('','',(''),(''),'','','');FILE_SCHEMA(('IFC4'));ENDSEC;
+DATA;
+#1=IFCPROJECT('0',$,'p',$,$,$,$,$,#2);
+#2=IFCUNITASSIGNMENT((#3,#4,#5));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#5=IFCSIUNIT(*,.VOLUMEUNIT.,.MILLI.,.CUBIC_METRE.);
+#6=IFCSIUNIT(*,.THERMODYNAMICTEMPERATUREUNIT.,$,.DEGREE_CELSIUS.);
+#7=IFCSIUNIT(*,.LENGTHUNIT.,.MICRO.,.METRE.);
+#8=IFCSIUNIT(*,.PRESSUREUNIT.,.MEGA.,.PASCAL.);
+#10=IFCWALL('1',$,'w',$,$,$,$,$,$);
+#11=IFCPROPERTYSINGLEVALUE('Area',$,IFCAREAMEASURE(1.5),$);
+#12=IFCPROPERTYSINGLEVALUE('Volume',$,IFCVOLUMEMEASURE(1.5),$);
+#13=IFCPROPERTYSINGLEVALUE('Temperature',$,IFCTHERMODYNAMICTEMPERATUREMEASURE(20.),#6);
+#14=IFCPROPERTYSINGLEVALUE('Roughness',$,IFCLENGTHMEASURE(3.),#7);
+#15=IFCPROPERTYSINGLEVALUE('Strength',$,IFCPRESSUREMEASURE(30.),#8);
+#16=IFCPROPERTYSET('2',$,'P',$,(#11,#12,#13,#14,#15));
+#17=IFCRELDEFINESBYPROPERTIES('3',$,$,$,(#10),#16);
+ENDSEC;
+END-ISO-10303-21;
+";
+
+#[test]
+fn unit_labels_are_written_as_their_symbols() {
+    let file = index(UNIT_LABELS.as_bytes()).unwrap();
+    let data = ModelData::open(&file).unwrap();
+    let details = data.element_details(10).unwrap();
+    let unit = |name: &str| {
+        let items = details.property_sets.iter().flat_map(|set| &set.properties);
+        let item = items.into_iter().find(|item| item.name == name).unwrap();
+        item.unit.clone().unwrap()
+    };
+    assert_eq!(unit("Area"), "m\u{b2}");
+    // SI writes a prefix on the unit before its power: mm3 is (mm)3, not a thousandth of m3.
+    assert_eq!(unit("Volume"), "mm\u{b3}");
+    assert_eq!(unit("Temperature"), "\u{b0}C");
+    assert_eq!(unit("Roughness"), "\u{b5}m");
+    assert_eq!(unit("Strength"), "MPa");
+}
