@@ -1502,7 +1502,11 @@ impl<'a> ModelEvaluator<'a> {
                 let placement = attribute(&segment, &segment_def, "Placement").and_then(reference)?;
                 let placement = self.any_placement(placement, depth + 1)?;
                 let parent = self.parent_curve(parent, length.abs())?;
-                curves::segment(&parent, placement, start, length)?
+                let run = curves::segment(&parent, placement, start, length);
+                if run.is_none() {
+                    self.warn("bad-curve", format!("#{id} has no usable points"));
+                }
+                run?
             } else {
                 Stationed::from_path(self.curve_path(parent, depth + 1)?)
             };

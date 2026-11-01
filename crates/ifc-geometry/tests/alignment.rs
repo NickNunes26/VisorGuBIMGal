@@ -601,6 +601,16 @@ fn curves_offset_from_themselves_stop_at_the_depth_limit() {
 }
 
 #[test]
+fn segment_with_no_finite_points_says_so() {
+    let body = "#30=IFCCLOTHOID(#905,1e308);\n\
+        #40=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(1e308),IFCLENGTHMEASURE(1e308),#30);\n\
+        #50=IFCCOMPOSITECURVE((#40),.F.);\n\
+        #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n";
+    let (_, diagnostics) = run(body, "$");
+    assert!(diagnostics.iter().any(|item| item.code == "bad-curve"), "{diagnostics:?}");
+}
+
+#[test]
 fn zero_length_segment_is_skipped() {
     let curves = "#40=IFCCURVESEGMENT(.CONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(0.),#908);\n\
         #41=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#908);\n\
