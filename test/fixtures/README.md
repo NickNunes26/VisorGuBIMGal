@@ -23,14 +23,15 @@ Todos los archivos han sido verificados previamente en cuanto a su licencia (ún
 | `georef-galicia-utm29n.ifc` | `hand-authored` (escrito manualmente según especificación pública ISO 10303-21 / IFC4 ADD2 TC1) | `MIT OR Apache-2.0` (`hand-authored`) | `IFC4` | Georreferenciación en Galicia para `TC-007` (`IfcProjectedCRS` `EPSG:25829` ETRS89 / UTM zone 29N, `IfcMapConversion` con coordenadas UTM de Santiago de Compostela `E=536000.0`, `N=4747000.0`, `H=260.0`, `IfcWall`, `Pset_WallCommon`). |
 | `ifc4x3-building-structural.ifc` | `https://github.com/buildingSMART/Sample-Test-Files/blob/main/IFC%204.3.2.0%20(IFC%204.3%20ADD2)/Simple-Scene/Building-Structural.ifc` | `CC-BY-4.0` | `IFC4X3_ADD2` | Esquema `IFC4X3_ADD2` en edificación estructural (`IfcFooting`, `IfcColumn`, `IfcBeam`, `IfcSlab`, `IfcWall`, `IfcTriangulatedFaceSet`, `IfcMapConversion`, `IfcProjectedCRS`). |
 | `ifc4x3-infra-road.ifc` | `https://github.com/buildingSMART/Sample-Test-Files/blob/main/IFC%204.3.2.0%20(IFC%204.3%20ADD2)/Simple-Scene/Infra-Road.ifc` | `CC-BY-4.0` | `IFC4X3_ADD2` | Esquema `IFC4X3_ADD2` de infraestructura viaria (`IfcRoad`, `IfcRoadPart`, `IfcCourse`, `IfcPavement`, `IfcEarthworksFill`, `IfcTriangulatedFaceSet`, `IfcMapConversion`, `IfcProjectedCRS`). |
+| `alignment-sweeps.ifc` | `hand-authored` (escrito manualmente según la especificación pública IFC 4.3) | `MIT OR Apache-2.0` (`hand-authored`) | `IFC4X3_ADD2` | Alineación (`IfcAlignment`, `IfcCurveSegment`, `IfcClothoid`, `IfcGradientCurve`, `IfcPolynomialCurve`), `IfcSectionedSolidHorizontal`, `IfcLinearPlacement`, `IfcOffsetCurveByDistances`, barridos (`IfcFixedReferenceSweptAreaSolid`, `IfcSurfaceCurveSweptAreaSolid`), sólidos con conicidad, `IfcFacetedBrepWithVoids` y caras sobre superficies analíticas (`IfcCylindricalSurface`, `IfcSphericalSurface`, `IfcToroidalSurface`). |
 
 ---
 
 ## Brechas aún no cubiertas (Gaps pendientes)
 
-1. **Alineaciones lineales e infraestructura paramétrica `IFC4X3` (`IfcAlignment`, `IfcAlignmentHorizontal`, `IfcAlignmentVertical`, `IfcAlignmentCant`, `IfcSectionedSolidHorizontal`, `IfcLinearPlacement`):**
-   - Los modelos de alineación del repositorio oficial `buildingSMART/IFC4.x-specification-models` tienen licencia restrictiva (`CC BY-ND 4.0` / *"All Rights reserved until formal release"*), por lo que fueron descartados en cumplimiento de las reglas de licencias. Cuando `T-060` aborde alineaciones `IFC4X3`, se recomienda añadir un fixture `hand-authored` específico con `IfcAlignment` e `IfcSectionedSolidHorizontal`.
-2. **Barridos sobre superficies (`IfcSurfaceCurveSweptAreaSolid`, `IfcFixedReferenceSweptAreaSolid`, `IfcDirectrixDerivedReferenceSweptAreaSolid`):**
-   - Actualmente están cubiertos los barridos por extrusión (`IfcExtrudedAreaSolid`), revolución (`IfcRevolvedAreaSolid`) y disco sobre directriz 3D (`IfcSweptDiskSolid`), pero no el barrido de un perfil 2D guiado sobre una superficie paramétrica.
+1. **Alineaciones de referencia reales:**
+   - Los modelos de alineación del repositorio oficial `buildingSMART/IFC4.x-specification-models` tienen licencia restrictiva (`CC BY-ND 4.0` / *"All Rights reserved until formal release"*), por lo que fueron descartados en cumplimiento de las reglas de licencias. `alignment-sweeps.ifc` cubre la geometría, pero procede de nuestra lectura de la especificación: aún falta contrastarla con un archivo exportado por una herramienta real.
+2. **Peralte y secciones abiertas:**
+   - `IfcSegmentedReferenceCurve` sigue su curva base sin el peralte (`cant-ignored`), e `IfcSectionedSurface` e `IfcSectionedSpine` aún no están implementadas.
 3. **Modelos de estrés de gran tamaño (50 MB – 200 MB) para `T-061` (RSK-03):**
    - Por límite de repositorio (< 20 MB por archivo y < 100 MB en total), las pruebas de rendimiento y memoria de modelos pesados (`T-061`) requerirán generación sintética local o descarga bajo demanda fuera de Git.

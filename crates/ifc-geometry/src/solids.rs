@@ -12,7 +12,7 @@ const PIPE_SEGMENTS: usize = 12;
 const SPHERE_BANDS: usize = 16;
 
 /// A mesh built inside out is mirrored, not wrong: flip it so its volume is positive.
-fn outward(mut mesh: Mesh) -> Mesh {
+pub(crate) fn outward(mut mesh: Mesh) -> Mesh {
     if mesh.volume() < 0.0 {
         for triangle in &mut mesh.triangles {
             triangle.swap(1, 2);
@@ -128,6 +128,15 @@ pub(crate) fn pyramid(x: f64, y: f64, height: f64) -> Mesh {
     outward(Mesh { positions, triangles })
 }
 
+/// `point` turned about an axis of unit length, positive by the right-hand rule.
+pub(crate) fn turned(point: DVec3, axis_point: DVec3, axis: DVec3, turn: f64) -> DVec3 {
+    let offset = point - axis_point;
+    let along = axis * offset.dot(axis);
+    let radial = offset - along;
+    let (sin, cos) = turn.sin_cos();
+    axis_point + along + radial * cos + axis.cross(radial) * sin
+}
+
 /// Sweeps closed rings around an axis lying in their plane, by `angle` radians.
 ///
 /// `caps` triangulates the rings, indexing them as if laid end to end. A full turn needs none.
@@ -146,12 +155,8 @@ pub(crate) fn revolve(
     let mut positions = Vec::with_capacity(sections * count as usize);
     for section in 0..sections {
         let turn = angle * section as f64 / steps as f64;
-        let (sin, cos) = turn.sin_cos();
         for point in rings.iter().flat_map(|ring| ring.iter()) {
-            let offset = point.extend(0.0) - axis_point;
-            let along = axis * offset.dot(axis);
-            let radial = offset - along;
-            positions.push(axis_point + along + radial * cos + axis.cross(radial) * sin);
+            positions.push(turned(point.extend(0.0), axis_point, axis, turn));
         }
     }
 
@@ -275,6 +280,37 @@ pub(crate) fn pipe(path: &[DVec3], radius: f64, inner: Option<f64>) -> Mesh {
         }
     }
     outward(Mesh { positions, triangles })
+}
+
+/// Rounds the joints of a polyline with arcs of `radius`. A joint with no room for its arc,
+/// or that doubles straight back, stays sharp.
+pub(crate) fn filleted(path: &[DVec3], radius: f64) -> Vec<DVec3> {
+    let Some(last) = path.last() else { return Vec::new() };
+    let mut result = vec![path[0]];
+    for (index, joint) in path.windows(3).enumerate() {
+        let (before, at, after) = (joint[0], joint[1], joint[2]);
+        let (into, out) = (at - before, after - at);
+        // Segments between two joints share their length with the arc at the other end.
+        let room_in = into.length() / if index == 0 { 1.0 } else { 2.0 };
+        let room_out = out.length() / if index + 3 == path.len() { 1.0 } else { 2.0 };
+        let (Some(incoming), Some(outgoing)) = (into.try_normalize(), out.try_normalize()) else {
+            result.push(at);
+            continue;
+        };
+        let turn = incoming.angle_between(outgoing);
+        let reach = radius * (turn / 2.0).tan();
+        let bisector = (outgoing - incoming).try_normalize();
+        match bisector.filter(|_| turn > 1e-6 && reach <= room_in.min(room_out)) {
+            Some(bisector) => {
+                let center = at + bisector * radius / (turn / 2.0).cos();
+                let bend = center - bisector * radius;
+                result.extend(arc_through(at - incoming * reach, bend, at + outgoing * reach));
+            }
+            None => result.push(at),
+        }
+    }
+    result.push(*last);
+    result
 }
 
 /// A corner of a section outline, and how much to round it.

@@ -4,6 +4,7 @@
 //! [`Diagnostic`], and the rest of the model carries on.
 
 use crate::csg::{intersect, subtract, subtract_all, union};
+use crate::curves::{self, Heading, Parent, Stationed};
 use crate::mesh::Mesh;
 use crate::nurbs;
 use crate::solids;
@@ -12,6 +13,7 @@ use glam::{DMat4, DVec2, DVec3, DVec4};
 use ifc_schema::units::{ProjectUnits, project_units};
 use ifc_schema::{EntityDef, Schema, SchemaId, schema};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use step_parser::{Entity, StepIndex, Value};
 
 /// Bounds placement chains and nested mapped items, which a hostile file could make cyclic.
@@ -24,6 +26,19 @@ const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 /// Consecutive profile points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
+/// Points one alignment curve may reach: far beyond a real one, and hostile files can ask
+/// for thousands of segments of thousands of points.
+const MAX_CURVE_POINTS: usize = 200_000;
+/// Face surfaces built as an exact B-spline for each face.
+const ANALYTIC_SURFACES: [&str; 5] = [
+    "IfcCylindricalSurface",
+    "IfcSphericalSurface",
+    "IfcToroidalSurface",
+    "IfcSurfaceOfRevolution",
+    "IfcSurfaceOfLinearExtrusion",
+];
+/// Steps along a ruled wall that twists, where two triangles would not follow it.
+const RULED_STEPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
@@ -52,6 +67,17 @@ pub struct ElementGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsupportedSchema;
 
+/// Where a cross-section stands along a curve.
+struct SectionMark {
+    station: f64,
+    /// To the left, up and along.
+    offsets: DVec3,
+    /// The profile's X and Y axes, relative to the curve: along, left and up.
+    x: DVec3,
+    y: DVec3,
+}
+
+#[derive(Clone)]
 struct Profile {
     outer: Vec<DVec2>,
     holes: Vec<Vec<DVec2>>,
@@ -62,6 +88,7 @@ pub struct ModelEvaluator<'a> {
     schema: &'static Schema,
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
+    curves: HashMap<u32, Rc<Stationed>>,
     openings: HashMap<u32, Vec<u32>>,
     item_colors: HashMap<u32, u32>,
     diagnostics: Vec<Diagnostic>,
@@ -290,6 +317,208 @@ fn prism(profile: Profile, offset: DVec3) -> Mesh {
     Mesh { positions, triangles }
 }
 
+/// One cross-section of a loft: its outer ring, then its holes, placed in space.
+type Section = Vec<Vec<DVec3>>;
+
+/// Triangulates a section on its own plane.
+fn section_cap(section: &Section) -> Option<Vec<[u32; 3]>> {
+    let outer = section.first()?;
+    let normal = (0..outer.len())
+        .fold(DVec3::ZERO, |sum, i| sum + outer[i].cross(outer[(i + 1) % outer.len()]))
+        .try_normalize()?;
+    let u = normal.any_orthonormal_vector();
+    let v = normal.cross(u);
+    let flat: Vec<Vec<DVec2>> = section
+        .iter()
+        .map(|ring| ring.iter().map(|point| DVec2::new(point.dot(u), point.dot(v))).collect())
+        .collect();
+    let rings: Vec<&[DVec2]> = flat.iter().map(Vec::as_slice).collect();
+    Some(triangulate_rings(&rings))
+}
+
+/// Joins corresponding rings of successive sections and caps both ends. Every section needs
+/// the same ring sizes, wound as `wound` leaves them.
+fn loft(sections: &[Section]) -> Option<Mesh> {
+    let (first, last) = (sections.first()?, sections.last()?);
+    let sizes: Vec<u32> = first.iter().map(|ring| ring.len() as u32).collect();
+    let matching = sections.iter().all(|section| {
+        section.iter().map(|ring| ring.len() as u32).eq(sizes.iter().copied())
+    });
+    if sections.len() < 2 || !matching || sizes.iter().any(|size| *size < 3) {
+        return None;
+    }
+    let count: u32 = sizes.iter().sum();
+    let positions: Vec<DVec3> = sections.iter().flatten().flatten().copied().collect();
+
+    let mut triangles = Vec::new();
+    for step in 0..sections.len() as u32 - 1 {
+        let mut start = step * count;
+        for size in &sizes {
+            for i in 0..*size {
+                let (a, b) = (start + i, start + (i + 1) % size);
+                triangles.push([a, b, b + count]);
+                triangles.push([a, b + count, a + count]);
+            }
+            start += size;
+        }
+    }
+    for [a, b, c] in section_cap(first)? {
+        triangles.push([a, c, b]);
+    }
+    let end = (sections.len() as u32 - 1) * count;
+    for [a, b, c] in section_cap(last)? {
+        triangles.push([a + end, b + end, c + end]);
+    }
+    Some(solids::outward(Mesh { positions, triangles }))
+}
+
+/// Gives two rings the same number of points, matched by their share of the perimeter.
+fn matched_rings(a: &[DVec2], b: &[DVec2]) -> (Vec<DVec2>, Vec<DVec2>) {
+    if a.len() == b.len() {
+        return (a.to_vec(), b.to_vec());
+    }
+    // Outlines of different kinds can start anywhere: begin them near each other.
+    let nearest = (0..b.len()).min_by(|i, j| {
+        b[*i].distance_squared(a[0]).total_cmp(&b[*j].distance_squared(a[0]))
+    });
+    let mut b = b.to_vec();
+    b.rotate_left(nearest.unwrap_or(0));
+
+    let shares = |ring: &[DVec2]| {
+        let mut walked = 0.0;
+        let mut result = Vec::with_capacity(ring.len());
+        for i in 0..ring.len() {
+            result.push(walked);
+            walked += ring[i].distance(ring[(i + 1) % ring.len()]);
+        }
+        result.iter_mut().for_each(|share| *share /= walked);
+        result
+    };
+    let (of_a, of_b) = (shares(a), shares(&b));
+    let mut all: Vec<f64> = of_a.iter().chain(&of_b).copied().collect();
+    all.sort_by(f64::total_cmp);
+    all.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
+
+    let at = |ring: &[DVec2], of: &[f64], share: f64| {
+        let index = of.partition_point(|value| *value <= share).saturating_sub(1);
+        let next = of.get(index + 1).copied().unwrap_or(1.0);
+        ring[index].lerp(ring[(index + 1) % ring.len()], (share - of[index]) / (next - of[index]))
+    };
+    (
+        all.iter().map(|share| at(a, &of_a, *share)).collect(),
+        all.iter().map(|share| at(&b, &of_b, *share)).collect(),
+    )
+}
+
+/// Pairs start and end sections point for point, unless a part or a hole has no partner.
+fn section_pairs(start: &[Profile], end: &[Profile]) -> Option<Vec<(Profile, Profile)>> {
+    if start.len() != end.len() {
+        return None;
+    }
+    let pair = |(a, b): (&Profile, &Profile)| {
+        let (a, b) = (wound(a.clone()), wound(b.clone()));
+        if a.holes.len() != b.holes.len() {
+            return None;
+        }
+        let (first_outer, second_outer) = matched_rings(&a.outer, &b.outer);
+        let (first_holes, second_holes) =
+            a.holes.iter().zip(&b.holes).map(|(x, y)| matched_rings(x, y)).unzip();
+        Some((
+            Profile { outer: first_outer, holes: first_holes },
+            Profile { outer: second_outer, holes: second_holes },
+        ))
+    };
+    start.iter().zip(end).map(pair).collect()
+}
+
+/// The section `share` of the way from `a` to `b`, which `section_pairs` matched.
+fn blended(a: &Profile, b: &Profile, share: f64, place: impl Fn(DVec2) -> DVec3) -> Section {
+    let starts = std::iter::once(&a.outer).chain(&a.holes);
+    let ends = std::iter::once(&b.outer).chain(&b.holes);
+    starts
+        .zip(ends)
+        .map(|(start, end)| start.iter().zip(end).map(|(p, q)| place(p.lerp(*q, share))).collect())
+        .collect()
+}
+
+/// Whether every wall from `a` to `b`, moved along `offset`, is flat.
+fn flat_walls(a: &Profile, b: &Profile, offset: DVec3) -> bool {
+    let starts = std::iter::once(&a.outer).chain(&a.holes);
+    let ends = std::iter::once(&b.outer).chain(&b.holes);
+    starts.zip(ends).all(|(start, end)| {
+        (0..start.len()).all(|i| {
+            let next = (i + 1) % start.len();
+            let across = (end[i].extend(0.0) + offset) - start[i].extend(0.0);
+            let (along_start, along_end) = (start[next] - start[i], end[next] - end[i]);
+            let (first, second) = (along_start.extend(0.0), along_end.extend(0.0));
+            let scale = first.length() * second.length() * across.length();
+            first.cross(across).dot(second).abs() <= scale * 1e-9
+        })
+    })
+}
+
+/// The sections of a profile along `path`. Its X axis takes the direction of `hints`, one
+/// for each point, across the path. Joints are mitred at half the angle of the turn.
+fn swept_sections(profile: &Profile, path: &[DVec3], hints: &[DVec3]) -> Option<Vec<Section>> {
+    let runs: Vec<DVec3> = path
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).try_normalize())
+        .collect::<Option<_>>()?;
+    let (first, last) = (*runs.first()?, *runs.last()?);
+    let mut across = None;
+    let mut sections = Vec::with_capacity(path.len());
+    for (index, at) in path.iter().enumerate() {
+        let arriving = if index == 0 { first } else { runs[index - 1] };
+        let leaving = runs.get(index).copied().unwrap_or(last);
+        let mitre = (arriving + leaving).try_normalize().filter(|plane| plane.dot(arriving) > 0.25);
+        let mitre = mitre.unwrap_or(arriving);
+        // A reference along the path gives no direction: keep the last one that did.
+        let hint = hints[index];
+        let x = (hint - arriving * hint.dot(arriving)).try_normalize().or(across)?;
+        across = Some(x);
+        let y = arriving.cross(x);
+        let place = |point: &DVec2| {
+            let flat = *at + x * point.x + y * point.y;
+            flat + arriving * (*at - flat).dot(mitre) / arriving.dot(mitre)
+        };
+        let rings = std::iter::once(&profile.outer).chain(&profile.holes);
+        sections.push(rings.map(|ring| ring.iter().map(place).collect()).collect());
+    }
+    Some(sections)
+}
+
+/// The run of a polyline between two distances along it.
+fn path_between_lengths(path: &[DVec3], start: f64, end: f64) -> Vec<DVec3> {
+    let mut run = Vec::new();
+    let mut walked = 0.0;
+    for pair in path.windows(2) {
+        let length = pair[0].distance(pair[1]);
+        let reach = walked + length;
+        let at = |distance: f64| pair[0].lerp(pair[1], ((distance - walked) / length).clamp(0.0, 1.0));
+        if reach > start && walked < end {
+            if run.is_empty() {
+                run.push(at(start));
+            }
+            run.push(at(end));
+        }
+        walked = reach;
+    }
+    run
+}
+
+/// The run of a polyline between two parameters, which count its segments from zero.
+fn polyline_between(path: &[DVec3], start: f64, end: f64) -> Vec<DVec3> {
+    let at = |t: f64| {
+        let index = (t.floor() as usize).min(path.len() - 2);
+        path[index].lerp(path[index + 1], t - index as f64)
+    };
+    let inner = (start.floor() as usize + 1)..(end.ceil() as usize);
+    let mut run = vec![at(start)];
+    run.extend_from_slice(&path[inner]);
+    run.push(at(end));
+    run
+}
+
 fn transformed(mesh: Mesh, transform: DMat4) -> Mesh {
     let mut result = mesh.map_positions(|point| transform.transform_point3(point));
     if transform.determinant() < 0.0 {
@@ -329,6 +558,7 @@ impl<'a> ModelEvaluator<'a> {
             schema: tables,
             units: project_units(file, tables),
             placements: HashMap::new(),
+            curves: HashMap::new(),
             openings: HashMap::new(),
             item_colors: HashMap::new(),
             diagnostics: Vec::new(),
@@ -598,7 +828,11 @@ impl<'a> ModelEvaluator<'a> {
 
     /// Local geometry of a representation item, before any placement.
     fn solid(&mut self, id: u32, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Mesh> {
-        if def.is_a("IfcExtrudedAreaSolid") {
+        if def.is_a("IfcExtrudedAreaSolidTapered") {
+            self.tapered_extrusion(entity, def)
+        } else if def.is_a("IfcRevolvedAreaSolidTapered") {
+            self.tapered_revolution(entity, def)
+        } else if def.is_a("IfcExtrudedAreaSolid") {
             self.extrusion(entity, def)
         } else if def.is_a("IfcBooleanResult") {
             self.boolean(entity, def, depth)
@@ -609,12 +843,14 @@ impl<'a> ModelEvaluator<'a> {
             self.revolved(entity, def)
         } else if def.is_a("IfcSweptDiskSolid") {
             self.swept_disk(entity, def)
+        } else if def.is_a("IfcFixedReferenceSweptAreaSolid") || def.is_a("IfcSurfaceCurveSweptAreaSolid") {
+            self.area_sweep(entity, def)
+        } else if def.is_a("IfcSectionedSolidHorizontal") {
+            self.sectioned_solid(entity, def)
         } else if def.is_a("IfcCsgPrimitive3D") {
             self.primitive(id, entity, def)
         } else if def.is_a("IfcManifoldSolidBrep") {
-            attribute(entity, def, "Outer")
-                .and_then(reference)
-                .and_then(|shell| self.shell(&[shell]))
+            self.brep(entity, def)
         } else if def.is_a("IfcShellBasedSurfaceModel") {
             let shells: Vec<u32> = list(attribute(entity, def, "SbsmBoundary"))
                 .iter()
@@ -745,9 +981,8 @@ impl<'a> ModelEvaluator<'a> {
         }
     }
 
-    fn revolved(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
-        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
-        let profiles = self.profiles(profile, 0)?;
+    /// The placement of a revolution, a point on its axis, the axis, and how far it turns.
+    fn revolution(&mut self, entity: &Entity, def: &EntityDef) -> Option<(DMat4, DVec3, DVec3, f64)> {
         let position = attribute(entity, def, "Position")
             .and_then(reference)
             .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
@@ -762,11 +997,13 @@ impl<'a> ModelEvaluator<'a> {
             .unwrap_or(DVec3::Z)
             .try_normalize()?;
         let angle = attribute(entity, def, "Angle").and_then(number)? * self.units.plane_angle;
-        if !(angle > 0.0) {
-            return None;
-        }
+        (angle > 0.0).then_some((position, axis_point, direction, angle.min(std::f64::consts::TAU)))
+    }
 
-        let angle = angle.min(std::f64::consts::TAU);
+    fn revolved(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let (position, axis_point, direction, angle) = self.revolution(entity, def)?;
         let parts = profiles.into_iter().map(|profile| {
             let profile = wound(profile);
             let mut rings: Vec<&[DVec2]> = vec![&profile.outer];
@@ -775,6 +1012,173 @@ impl<'a> ModelEvaluator<'a> {
             solids::revolve(&rings, &caps, axis_point, direction, angle)
         });
         Some(transformed(merged(parts), position))
+    }
+
+    /// Start and end sections of a tapered sweep. Unmatched ones sweep the start unchanged.
+    fn taper(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<(Profile, Profile)>> {
+        let start = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let start = self.profiles(start, 0)?;
+        let end = attribute(entity, def, "EndSweptArea").and_then(reference);
+        let end = end.and_then(|id| self.profiles(id, 0));
+        let pairs = end.and_then(|end| section_pairs(&start, &end));
+        if pairs.is_none() {
+            self.warn("taper-ignored", "end section does not match the start".into());
+        }
+        pairs.or_else(|| section_pairs(&start, &start))
+    }
+
+    fn tapered_extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let (offset, position) = self.extrusion_path(entity, def)?;
+        let pairs = self.taper(entity, def)?;
+        let mut parts = Vec::with_capacity(pairs.len());
+        for (start, end) in &pairs {
+            // Flat walls are exact. Twisted ones are ruled surfaces, so follow them in steps.
+            let steps = if flat_walls(start, end, offset) { 1 } else { RULED_STEPS };
+            let sections: Vec<Section> = (0..=steps)
+                .map(|step| {
+                    let share = step as f64 / steps as f64;
+                    blended(start, end, share, |point| point.extend(0.0) + offset * share)
+                })
+                .collect();
+            parts.push(loft(&sections)?);
+        }
+        Some(transformed(merged(parts.into_iter()), position))
+    }
+
+    fn tapered_revolution(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let (position, axis_point, axis, angle) = self.revolution(entity, def)?;
+        let pairs = self.taper(entity, def)?;
+        let step_angle = std::f64::consts::TAU / solids::CIRCLE_SEGMENTS as f64;
+        let steps = ((angle / step_angle).ceil() as usize).max(1);
+        let mut parts = Vec::with_capacity(pairs.len());
+        for (start, end) in &pairs {
+            let sections: Vec<Section> = (0..=steps)
+                .map(|step| {
+                    let share = step as f64 / steps as f64;
+                    blended(start, end, share, |point| {
+                        solids::turned(point.extend(0.0), axis_point, axis, angle * share)
+                    })
+                })
+                .collect();
+            parts.push(loft(&sections)?);
+        }
+        Some(transformed(merged(parts.into_iter()), position))
+    }
+
+    /// The part of a directrix that a sweep's `StartParam` and `EndParam` select.
+    fn directrix_path(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let directrix = attribute(entity, def, "Directrix").and_then(reference)?;
+        let start = attribute(entity, def, "StartParam");
+        let end = attribute(entity, def, "EndParam");
+        let by_length = |value: Option<&Value>| {
+            matches!(value, Some(Value::Typed { name, .. }) if name.contains("LENGTHMEASURE"))
+        };
+        let (from, to) = (start.and_then(number), end.and_then(number));
+
+        if from.is_some() || to.is_some() {
+            if let Some((curve, curve_def)) = self.lookup(directrix) {
+                if !by_length(start) && !by_length(end) && (curve_def.is_a("IfcCircle") || curve_def.is_a("IfcEllipse")) {
+                    let (frame, radii) = self.conic(&curve, &curve_def)?;
+                    let angle = self.units.plane_angle;
+                    let begin = from.unwrap_or(0.0) * angle;
+                    let finish = to.map_or(std::f64::consts::TAU, |to| to * angle);
+                    return (finish > begin).then(|| on_conic(frame, radii, begin, finish - begin));
+                }
+            }
+        }
+
+        let mut path = self.curve_path(directrix, 0)?;
+        if from.is_some() || to.is_some() {
+            let last = path.len().saturating_sub(1) as f64;
+            if by_length(start) || by_length(end) {
+                let scale = self.units.length;
+                let begin = from.unwrap_or(0.0) * scale;
+                let finish = to.map_or(f64::INFINITY, |to| to * scale);
+                path = path_between_lengths(&path, begin, finish);
+            } else if self.is_polyline(directrix) {
+                let (begin, finish) = (from.unwrap_or(0.0).clamp(0.0, last), to.unwrap_or(last).clamp(0.0, last));
+                if finish > begin {
+                    path = polyline_between(&path, begin, finish);
+                }
+            } else {
+                self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
+            }
+        }
+        path.dedup_by(|a, b| a.distance_squared(*b) <= POINT_TOLERANCE * POINT_TOLERANCE);
+        (path.len() >= 2).then_some(path)
+    }
+
+    /// The direction of the profile's X axis at each point of a sweep's path.
+    fn sweep_hints(&mut self, entity: &Entity, def: &EntityDef, path: &[DVec3]) -> Option<Vec<DVec3>> {
+        if let Some(fixed) = attribute(entity, def, "FixedReference").and_then(reference) {
+            return Some(vec![self.direction(fixed)?; path.len()]);
+        }
+        let surface = attribute(entity, def, "ReferenceSurface").and_then(reference)?;
+        let (surface, surface_def) = self.lookup(surface)?;
+        if surface_def.is_a("IfcPlane") {
+            let frame = attribute(&surface, &surface_def, "Position")
+                .and_then(reference)
+                .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+            return Some(vec![frame.z_axis.truncate(); path.len()]);
+        }
+        let loops = [path.to_vec()];
+        let curved = if surface_def.is_a("IfcBSplineSurfaceWithKnots") {
+            self.bspline_surface(&surface, &surface_def)
+        } else if ANALYTIC_SURFACES.iter().any(|name| surface_def.is_a(name)) {
+            self.analytic_surface(&surface, &surface_def, &loops)
+        } else {
+            self.warn("unsupported-surface", surface_def.name().to_string());
+            return None;
+        };
+        let normals = curved.and_then(|curved| curved.normals_at(path));
+        if normals.is_none() {
+            self.warn("bad-surface", "reference surface gives no normal along the directrix".into());
+        }
+        normals
+    }
+
+    fn area_sweep(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let path = self.directrix_path(entity, def)?;
+        let hints = self.sweep_hints(entity, def, &path)?;
+        let mut parts = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            let sections = swept_sections(&wound(profile), &path, &hints)?;
+            parts.push(loft(&sections)?);
+        }
+        Some(transformed(merged(parts.into_iter()), position))
+    }
+
+    /// Voids are shells too. Their normals should point into the void, but files differ.
+    fn brep(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let outer = attribute(entity, def, "Outer").and_then(reference)?;
+        let outer = self.shell(&[outer])?;
+        let voids: Vec<u32> = list(attribute(entity, def, "Voids")).iter().filter_map(reference).collect();
+        if voids.is_empty() {
+            return Some(outer);
+        }
+        let mut parts = vec![solids::outward(outer)];
+        for void in voids {
+            if let Some(mut mesh) = self.shell(&[void]) {
+                if mesh.volume() > 0.0 {
+                    mesh.triangles.iter_mut().for_each(|triangle| triangle.swap(1, 2));
+                }
+                parts.push(mesh);
+            }
+        }
+        Some(merged(parts.into_iter()))
+    }
+
+    /// Whether a directrix is a polyline, the one curve whose parameters are simple to apply.
+    fn is_polyline(&self, id: u32) -> bool {
+        self.lookup(id).is_some_and(|(curve, def)| {
+            def.is_a("IfcPolyline")
+                || (def.is_a("IfcIndexedPolyCurve") && attribute(&curve, &def, "Segments").is_none())
+        })
     }
 
     fn swept_disk(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
@@ -788,12 +1192,25 @@ impl<'a> ModelEvaluator<'a> {
         if !(radius > 0.0) {
             return None;
         }
-        let trimmed = |name: &str| attribute(entity, def, name).and_then(number).is_some();
-        if trimmed("StartParam") || trimmed("EndParam") {
-            self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
-        }
         let mut path = self.curve_path(directrix, 0)?;
+        let bound = |name: &str| attribute(entity, def, name).and_then(number);
+        let (start, end) = (bound("StartParam"), bound("EndParam"));
+        if start.is_some() || end.is_some() {
+            let last = path.len().saturating_sub(1) as f64;
+            let (from, to) = (start.unwrap_or(0.0).clamp(0.0, last), end.unwrap_or(last).clamp(0.0, last));
+            // Exactly 0 to 1 over many segments may mean the whole curve. Too much bar beats
+            // a missing one, as with booleans.
+            let ambiguous = last > 1.0 && from == 0.0 && to == 1.0;
+            if self.is_polyline(directrix) && to > from && !ambiguous {
+                path = polyline_between(&path, from, to);
+            } else {
+                self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
+            }
+        }
         path.dedup_by(|a, b| a.distance_squared(*b) <= POINT_TOLERANCE * POINT_TOLERANCE);
+        if let Some(fillet) = attribute(entity, def, "FilletRadius").and_then(number) {
+            path = solids::filleted(&path, fillet * scale);
+        }
         (path.len() >= 2).then(|| solids::pipe(&path, radius, inner))
     }
 
@@ -941,7 +1358,8 @@ impl<'a> ModelEvaluator<'a> {
         let Some((entity, def)) = self.lookup(id) else {
             return DMat4::IDENTITY;
         };
-        if !def.is_a("IfcLocalPlacement") {
+        let along_curve = def.is_a("IfcLinearPlacement");
+        if !def.is_a("IfcLocalPlacement") && !along_curve {
             self.warn("unsupported-placement", format!("#{id} {}", def.name()));
             return DMat4::IDENTITY;
         }
@@ -949,10 +1367,16 @@ impl<'a> ModelEvaluator<'a> {
             Some(parent) => self.placement(parent, depth + 1),
             None => DMat4::IDENTITY,
         };
-        let relative = attribute(&entity, &def, "RelativePlacement")
-            .and_then(reference)
-            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
-        let world = parent * relative;
+        let relative = attribute(&entity, &def, "RelativePlacement").and_then(reference);
+        let relative = if along_curve {
+            relative.and_then(|id| self.linear_matrix(id)).or_else(|| {
+                let fallback = attribute(&entity, &def, "CartesianPosition").and_then(reference);
+                fallback.map(|id| self.placement_matrix(id))
+            })
+        } else {
+            relative.map(|id| self.placement_matrix(id))
+        };
+        let world = parent * relative.unwrap_or(DMat4::IDENTITY);
         self.placements.insert(id, world);
         world
     }
@@ -971,6 +1395,12 @@ impl<'a> ModelEvaluator<'a> {
             return None;
         }
         let (entity, def) = self.lookup(id)?;
+        if self.is_segmented(&entity, &def) {
+            return self.stationed(id, depth).map(|curve| curve.points.clone());
+        }
+        if def.is_a("IfcOffsetCurve2D") || def.is_a("IfcOffsetCurve3D") || def.is_a("IfcOffsetCurveByDistances") {
+            return self.offset_curve(&entity, &def, depth);
+        }
         if def.is_a("IfcPolyline") {
             list(attribute(&entity, &def, "Points"))
                 .iter()
@@ -1004,6 +1434,277 @@ impl<'a> ModelEvaluator<'a> {
             self.warn("unsupported-curve", format!("#{id} {}", def.name()));
             None
         }
+    }
+
+    /// Whether a curve is made of `IfcCurveSegment`s, as alignment curves are.
+    fn is_segmented(&self, entity: &Entity, def: &EntityDef) -> bool {
+        def.is_a("IfcGradientCurve")
+            || def.is_a("IfcSegmentedReferenceCurve")
+            || (def.is_a("IfcCompositeCurve")
+                && list(attribute(entity, def, "Segments"))
+                    .iter()
+                    .filter_map(reference)
+                    .any(|id| self.lookup(id).is_some_and(|(_, segment)| segment.is_a("IfcCurveSegment"))))
+    }
+
+    /// A curve with the true distance along it, which composites of segments know exactly.
+    fn stationed(&mut self, id: u32, depth: usize) -> Option<Rc<Stationed>> {
+        if let Some(curve) = self.curves.get(&id) {
+            return Some(curve.clone());
+        }
+        self.items_used += 1;
+        if depth >= MAX_DEPTH || self.items_used > MAX_ITEMS_PER_ELEMENT {
+            self.warn("nesting-too-deep", format!("#{id} is nested too deeply"));
+            return None;
+        }
+        let (entity, def) = self.lookup(id)?;
+        let base = attribute(&entity, &def, "BaseCurve").and_then(reference);
+        let curve = if def.is_a("IfcSegmentedReferenceCurve") {
+            self.warn("cant-ignored", format!("#{id} follows its base curve without its cant"));
+            (*self.stationed(base?, depth + 1)?).clone()
+        } else if def.is_a("IfcGradientCurve") {
+            let base = self.stationed(base?, depth + 1)?;
+            let profile = self.curve_segments(&entity, &def)?;
+            let mut profile: Vec<DVec2> = profile.points.iter().map(|point| point.truncate()).collect();
+            base.lifted(&mut profile)
+        } else if self.is_segmented(&entity, &def) {
+            self.curve_segments(&entity, &def)?
+        } else {
+            Stationed::from_path(self.curve_path(id, depth)?)
+        };
+        let curve = Rc::new(curve);
+        self.curves.insert(id, curve.clone());
+        Some(curve)
+    }
+
+    fn curve_segments(&mut self, entity: &Entity, def: &EntityDef) -> Option<Stationed> {
+        let scale = self.units.length;
+        let mut whole = Stationed::default();
+        for id in list(attribute(entity, def, "Segments")).iter().filter_map(reference) {
+            let (segment, segment_def) = self.lookup(id)?;
+            let parent = attribute(&segment, &segment_def, "ParentCurve").and_then(reference)?;
+            let run = if segment_def.is_a("IfcCurveSegment") {
+                let measure = |name: &str| attribute(&segment, &segment_def, name).and_then(number);
+                let (start, length) = (measure("SegmentStart")? * scale, measure("SegmentLength")? * scale);
+                if length == 0.0 {
+                    continue;
+                }
+                let placement = attribute(&segment, &segment_def, "Placement").and_then(reference)?;
+                let placement = self.any_placement(placement)?;
+                let parent = self.parent_curve(parent, length.abs())?;
+                curves::segment(&parent, placement, start, length)?
+            } else {
+                Stationed::from_path(self.curve_path(parent, 1)?)
+            };
+            if whole.points.len() + run.points.len() > MAX_CURVE_POINTS {
+                self.warn("curve-too-long", format!("#{id} goes past {MAX_CURVE_POINTS} points"));
+                return None;
+            }
+            whole.extend(run);
+        }
+        (whole.points.len() >= 2).then_some(whole)
+    }
+
+    /// The curve a segment cuts from. `length` is the length of that segment.
+    fn parent_curve(&mut self, id: u32, length: f64) -> Option<Parent> {
+        let (entity, def) = self.lookup(id)?;
+        let scale = self.units.length;
+        let term = |name: &str| attribute(&entity, &def, name).and_then(number).map(|value| value * scale);
+        let frame = attribute(&entity, &def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let spiral = |heading: Heading| Some(Parent::Spiral { frame, heading });
+
+        if def.is_a("IfcLine") {
+            let origin = attribute(&entity, &def, "Pnt").and_then(reference).and_then(|id| self.point(id))?;
+            let vector = attribute(&entity, &def, "Dir").and_then(reference)?;
+            let (vector, vector_def) = self.lookup(vector)?;
+            let direction = attribute(&vector, &vector_def, "Orientation")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))?
+                .try_normalize()?;
+            Some(Parent::Line { origin, direction })
+        } else if def.is_a("IfcCircle") {
+            let radius = term("Radius").filter(|radius| *radius > 0.0)?;
+            Some(Parent::Circle { frame, radius })
+        } else if def.is_a("IfcClothoid") {
+            spiral(Heading::polynomial(&[None, term("ClothoidConstant")]))
+        } else if def.is_a("IfcSecondOrderPolynomialSpiral") {
+            spiral(Heading::polynomial(&["ConstantTerm", "LinearTerm", "QuadraticTerm"].map(term)))
+        } else if def.is_a("IfcThirdOrderPolynomialSpiral") {
+            spiral(Heading::polynomial(&["ConstantTerm", "LinearTerm", "QuadraticTerm", "CubicTerm"].map(term)))
+        } else if def.is_a("IfcSeventhOrderPolynomialSpiral") {
+            spiral(Heading::polynomial(
+                &[
+                    "ConstantTerm",
+                    "LinearTerm",
+                    "QuadraticTerm",
+                    "CubicTerm",
+                    "QuarticTerm",
+                    "QuinticTerm",
+                    "SexticTerm",
+                    "SepticTerm",
+                ]
+                .map(term),
+            ))
+        } else if def.is_a("IfcCosineSpiral") {
+            let cosine = term("CosineTerm")?;
+            spiral(Heading::Cosine { constant: term("ConstantTerm"), cosine, length })
+        } else if def.is_a("IfcSineSpiral") {
+            let sine = term("SineTerm")?;
+            spiral(Heading::Sine { constant: term("ConstantTerm"), linear: term("LinearTerm"), sine, length })
+        } else if def.is_a("IfcPolynomialCurve") {
+            let coefficients = |name: &str| numbers(attribute(&entity, &def, name));
+            let (x, y, z) = (coefficients("CoefficientsX"), coefficients("CoefficientsY"), coefficients("CoefficientsZ"));
+            Some(Parent::Polynomial { frame, x, y, z, unit: scale })
+        } else {
+            self.warn("unsupported-curve", format!("#{id} {}", def.name()));
+            None
+        }
+    }
+
+    /// A placement of any kind, including one along a curve.
+    fn any_placement(&mut self, id: u32) -> Option<DMat4> {
+        let (_, def) = self.lookup(id)?;
+        if def.is_a("IfcAxis2PlacementLinear") {
+            self.linear_matrix(id)
+        } else {
+            Some(self.placement_matrix(id))
+        }
+    }
+
+    /// An `IfcPointByDistanceExpression`: its curve's id, the distance along, and the offsets
+    /// to the left, up and along.
+    fn distance_along(&self, id: u32) -> Option<(Option<u32>, f64, DVec3)> {
+        let (entity, def) = self.lookup(id)?;
+        let scale = self.units.length;
+        let measure = |name: &str| attribute(&entity, &def, name).and_then(number).unwrap_or(0.0) * scale;
+        let station = attribute(&entity, &def, "DistanceAlong").and_then(number)? * scale;
+        let offsets = DVec3::new(measure("OffsetLateral"), measure("OffsetVertical"), measure("OffsetLongitudinal"));
+        Some((attribute(&entity, &def, "BasisCurve").and_then(reference), station, offsets))
+    }
+
+    /// Where an `IfcAxis2PlacementLinear` lands, its axes taken relative to the curve there.
+    fn linear_matrix(&mut self, id: u32) -> Option<DMat4> {
+        let (entity, def) = self.lookup(id)?;
+        let location = attribute(&entity, &def, "Location").and_then(reference)?;
+        let (basis, station, offsets) = self.distance_along(location)?;
+        let curve = self.stationed(basis?, 0)?;
+        let (point, [along, left, up]) = curve.frame(station)?;
+        let origin = point + left * offsets.x + up * offsets.y + along * offsets.z;
+        let on_curve = DMat4::from_cols(along.extend(0.0), left.extend(0.0), up.extend(0.0), origin.extend(1.0));
+        Some(on_curve * self.placement_matrix(id))
+    }
+
+    fn offset_curve(&mut self, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Vec<DVec3>> {
+        let basis = attribute(entity, def, "BasisCurve").and_then(reference)?;
+        let curve = self.stationed(basis, depth + 1)?;
+        let offsets: Vec<(f64, DVec3)> = list(attribute(entity, def, "OffsetValues"))
+            .iter()
+            .filter_map(reference)
+            .filter_map(|id| self.distance_along(id).map(|(_, station, offsets)| (station, offsets)))
+            .collect();
+        let distance = attribute(entity, def, "Distance").and_then(number).unwrap_or(0.0) * self.units.length;
+        let reference_direction = attribute(entity, def, "RefDirection")
+            .and_then(reference)
+            .and_then(|id| self.direction(id))
+            .and_then(DVec3::try_normalize);
+
+        let mut sorted = offsets;
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let offset_at = |station: f64| {
+            let after = sorted.partition_point(|(at, _)| *at <= station);
+            match (after.checked_sub(1).and_then(|index| sorted.get(index)), sorted.get(after)) {
+                (Some(low), Some(high)) if high.0 > low.0 => {
+                    low.1.lerp(high.1, (station - low.0) / (high.0 - low.0))
+                }
+                (Some(point), _) | (None, Some(point)) => point.1,
+                (None, None) => DVec3::ZERO,
+            }
+        };
+        // Offsets can change between the vertices of the base, so the path bends there too.
+        let (first, last) = (*curve.stations.first()?, *curve.stations.last()?);
+        let marks = sorted.iter().map(|(at, _)| *at).filter(|at| *at > first && *at < last);
+        let mut stations: Vec<f64> = curve.stations.iter().copied().chain(marks).collect();
+        stations.sort_by(f64::total_cmp);
+        stations.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        stations
+            .iter()
+            .map(|station| {
+                let (point, [along, left, up]) = curve.frame(*station)?;
+                Some(if def.is_a("IfcOffsetCurveByDistances") {
+                    let offsets = offset_at(*station);
+                    point + left * offsets.x + up * offsets.y + along * offsets.z
+                } else if def.is_a("IfcOffsetCurve3D") {
+                    point + along.cross(reference_direction?) * distance
+                } else {
+                    point + left * distance
+                })
+            })
+            .collect()
+    }
+
+    /// One cross-section position: the distance along, the offsets, and the profile's axes
+    /// relative to the curve. X defaults to the axis across the curve, to its left.
+    fn section_mark(&mut self, id: u32) -> Option<SectionMark> {
+        let (entity, def) = self.lookup(id)?;
+        let location = attribute(&entity, &def, "Location").and_then(reference)?;
+        let (_, station, offsets) = self.distance_along(location)?;
+        let vector = |name: &str| {
+            attribute(&entity, &def, name)
+                .and_then(reference)
+                .and_then(|id| self.direction(id))
+                .and_then(DVec3::try_normalize)
+        };
+        let y = vector("Axis").unwrap_or(DVec3::Z);
+        let across = y.cross(DVec3::X).try_normalize().unwrap_or(DVec3::Y);
+        let x = vector("RefDirection")
+            .filter(|hint| hint.x.abs() < 0.999)
+            .and_then(|hint| (hint - y * hint.dot(y)).try_normalize())
+            .unwrap_or(across);
+        Some(SectionMark { station, offsets, x, y })
+    }
+
+    fn sectioned_solid(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let ids = |name: &str| -> Vec<u32> { list(attribute(entity, def, name)).iter().filter_map(reference).collect() };
+        let (sections, positions) = (ids("CrossSections"), ids("CrossSectionPositions"));
+        if sections.len() != positions.len() || sections.len() < 2 {
+            self.warn("bad-sections", "cross sections and positions do not pair up".into());
+            return None;
+        }
+        let directrix = attribute(entity, def, "Directrix").and_then(reference)?;
+        let curve = self.stationed(directrix, 0)?;
+        let marks: Vec<SectionMark> = positions.iter().map(|id| self.section_mark(*id)).collect::<Option<_>>()?;
+        let profiles: Vec<Vec<Profile>> = sections.iter().map(|id| self.profiles(*id, 0)).collect::<Option<_>>()?;
+
+        let mut parts = Vec::new();
+        for span in 0..marks.len() - 1 {
+            let (first, second) = (&marks[span], &marks[span + 1]);
+            let pairs = section_pairs(&profiles[span], &profiles[span + 1]).filter(|_| second.station > first.station);
+            let Some(pairs) = pairs else {
+                self.warn("bad-sections", "consecutive sections do not match or do not advance".into());
+                return None;
+            };
+            let inner = curve.stations.iter().copied().filter(|at| *at > first.station && *at < second.station);
+            let stations: Vec<f64> = std::iter::once(first.station).chain(inner).chain([second.station]).collect();
+            for (start, end) in &pairs {
+                let sections: Vec<Section> = stations
+                    .iter()
+                    .map(|station| {
+                        let share = (station - first.station) / (second.station - first.station);
+                        let (point, [along, left, up]) = curve.frame(*station)?;
+                        let world = |local: DVec3| along * local.x + left * local.y + up * local.z;
+                        let offsets = first.offsets.lerp(second.offsets, share);
+                        let origin = point + left * offsets.x + up * offsets.y + along * offsets.z;
+                        let x = world(first.x.lerp(second.x, share)).try_normalize()?;
+                        let y = world(first.y.lerp(second.y, share)).try_normalize()?;
+                        Some(blended(start, end, share, |flat| origin + x * flat.x + y * flat.y))
+                    })
+                    .collect::<Option<_>>()?;
+                parts.push(loft(&sections)?);
+            }
+        }
+        Some(merged(parts.into_iter()))
     }
 
     fn bspline_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
@@ -1117,6 +1818,105 @@ impl<'a> ModelEvaluator<'a> {
         (path.len() >= 3).then_some(path)
     }
 
+    /// The profile curve of a swept surface, in the XY plane.
+    fn swept_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let profile = attribute(entity, def, "SweptCurve").and_then(reference)?;
+        let (profile, profile_def) = self.lookup(profile)?;
+        let curve = attribute(&profile, &profile_def, "Curve")
+            .or_else(|| attribute(&profile, &profile_def, "OuterCurve"))
+            .and_then(reference)?;
+        self.curve_path(curve, 0)
+    }
+
+    /// An analytic surface as an exact B-spline, built for one face: it covers the angles the
+    /// face's loops reach, so its seam stays out of the face, and the extent they reach on
+    /// directions the surface leaves unbounded.
+    fn analytic_surface(
+        &mut self,
+        entity: &Entity,
+        def: &EntityDef,
+        loops: &[Vec<DVec3>],
+    ) -> Option<nurbs::Surface> {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let scale = self.units.length;
+        let size = |name: &str| attribute(entity, def, name).and_then(number).map(|size| size * scale);
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let around_z = |points: &[DVec3]| {
+            nurbs::covered_arc(points.iter().filter(|point| point.truncate().length() > 1e-9).map(|point| point.y.atan2(point.x)))
+        };
+        let localized = |frame: DMat4| -> Vec<DVec3> {
+            let inverse = frame.inverse();
+            loops.iter().flatten().map(|point| inverse.transform_point3(*point)).collect()
+        };
+        let spread = |values: &[f64]| {
+            values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+                (low.min(*value), high.max(*value))
+            })
+        };
+
+        if def.is_a("IfcCylindricalSurface") {
+            let radius = size("Radius").filter(|radius| *radius > 0.0)?;
+            let local = localized(position);
+            let heights: Vec<f64> = local.iter().map(|point| point.z).collect();
+            let (low, high) = spread(&heights);
+            // A curve at one height still needs a surface with some height, to have a normal.
+            let (low, high) = if high - low < 1e-6 { (low - 1.0, high + 1.0) } else { (low, high) };
+            let edge = nurbs::Curve::polyline(vec![DVec3::new(radius, 0.0, low), DVec3::new(radius, 0.0, high)])?;
+            let (start, sweep) = around_z(&local);
+            Some(nurbs::Surface::revolved(&edge, start, sweep).transformed(position))
+        } else if def.is_a("IfcSphericalSurface") {
+            let radius = size("Radius").filter(|radius| *radius > 0.0)?;
+            let meridian = nurbs::Curve::arc_in_xz(0.0, radius, -FRAC_PI_2, PI);
+            let (start, sweep) = around_z(&localized(position));
+            Some(nurbs::Surface::revolved(&meridian, start, sweep).transformed(position))
+        } else if def.is_a("IfcToroidalSurface") {
+            let major = size("MajorRadius").filter(|radius| *radius > 0.0)?;
+            let minor = size("MinorRadius").filter(|radius| *radius > 0.0)?;
+            let local = localized(position);
+            let tube = |point: &DVec3| point.z.atan2(point.truncate().length() - major);
+            let (tube_start, tube_sweep) = nurbs::covered_arc(local.iter().map(tube));
+            let section = nurbs::Curve::arc_in_xz(major, minor, tube_start, tube_sweep);
+            let (start, sweep) = around_z(&local);
+            Some(nurbs::Surface::revolved(&section, start, sweep).transformed(position))
+        } else if def.is_a("IfcSurfaceOfRevolution") {
+            let curve = self.swept_curve(entity, def)?;
+            let axis = attribute(entity, def, "AxisPosition").and_then(reference)?;
+            let (axis, axis_def) = self.lookup(axis)?;
+            let origin = attribute(&axis, &axis_def, "Location")
+                .and_then(reference)
+                .and_then(|id| self.point(id))?;
+            let z = attribute(&axis, &axis_def, "Axis")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))
+                .unwrap_or(DVec3::Z)
+                .try_normalize()?;
+            let (x, y) = solids::perpendiculars(z);
+            let axis_frame = DMat4::from_cols(x.extend(0.0), y.extend(0.0), z.extend(0.0), origin.extend(1.0));
+            let frame = position * axis_frame;
+            let to_axis = axis_frame.inverse();
+            let curve = curve.iter().map(|point| to_axis.transform_point3(*point)).collect();
+            let (start, sweep) = around_z(&localized(frame));
+            let revolved = nurbs::Surface::revolved(&nurbs::Curve::polyline(curve)?, start, sweep);
+            Some(revolved.transformed(frame))
+        } else {
+            let direction = attribute(entity, def, "ExtrudedDirection")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))?
+                .try_normalize()?;
+            let depth = size("Depth")?;
+            let curve = nurbs::Curve::polyline(self.swept_curve(entity, def)?)?;
+            // The profile lies in the XY plane, so height tells how far along a point has gone.
+            let climb = direction.z;
+            let travel = |point: &DVec3| if climb.abs() > 1e-9 { point.z / climb } else { point.dot(direction) };
+            let reached: Vec<f64> = localized(position).iter().map(travel).collect();
+            let (low, high) = spread(&reached);
+            let (low, high) = (low.min(0.0), high.max(depth));
+            Some(nurbs::Surface::extruded(&curve, direction * low, direction * high).transformed(position))
+        }
+    }
+
     /// A face on a curved surface, meshed in that surface's parameter space.
     fn curved_face(
         &mut self,
@@ -1125,7 +1925,7 @@ impl<'a> ModelEvaluator<'a> {
         same_sense: bool,
         builder: &mut FaceBuilder,
     ) {
-        let Some(mesh) = nurbs::mesh_surface(surface, loops) else {
+        let Some(mesh) = nurbs::mesh_surface(surface, loops, same_sense) else {
             self.warn("bad-trim", "face boundary does not lie on its surface".into());
             return;
         };
@@ -1427,9 +2227,8 @@ impl<'a> ModelEvaluator<'a> {
             .collect()
     }
 
-    fn extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
-        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
-        let profiles = self.profiles(profile, 0)?;
+    /// What an extrusion moves its section by, and where it stands.
+    fn extrusion_path(&mut self, entity: &Entity, def: &EntityDef) -> Option<(DVec3, DMat4)> {
         let depth = attribute(entity, def, "Depth").and_then(number)? * self.units.length;
         let direction = attribute(entity, def, "ExtrudedDirection")
             .and_then(reference)
@@ -1438,7 +2237,14 @@ impl<'a> ModelEvaluator<'a> {
         let position = attribute(entity, def, "Position")
             .and_then(reference)
             .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
-        let parts = profiles.into_iter().map(|profile| prism(profile, direction * depth));
+        Some((direction * depth, position))
+    }
+
+    fn extrusion(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let (offset, position) = self.extrusion_path(entity, def)?;
+        let parts = profiles.into_iter().map(|profile| prism(profile, offset));
         Some(transformed(merged(parts), position))
     }
 
@@ -1504,11 +2310,18 @@ impl<'a> ModelEvaluator<'a> {
             .and_then(reference)
             .and_then(|id| self.lookup(id));
         if let Some((surface, surface_def)) = &surface {
-            if surface_def.is_a("IfcBSplineSurfaceWithKnots") {
-                if let Some(surface) = self.bspline_surface(surface, surface_def) {
-                    let mut loops = vec![outer];
-                    loops.append(&mut holes);
-                    self.curved_face(&surface, &loops, same_sense, builder);
+            let spline = surface_def.is_a("IfcBSplineSurfaceWithKnots");
+            let analytic = ANALYTIC_SURFACES.iter().any(|name| surface_def.is_a(name));
+            if spline || analytic {
+                let mut loops = vec![outer.clone()];
+                loops.extend(holes.iter().cloned());
+                let curved = if spline {
+                    self.bspline_surface(surface, surface_def)
+                } else {
+                    self.analytic_surface(surface, surface_def, &loops)
+                };
+                if let Some(curved) = curved {
+                    self.curved_face(&curved, &loops, same_sense, builder);
                     return;
                 }
                 self.warn("bad-surface", format!("#{id} has an unusable surface"));

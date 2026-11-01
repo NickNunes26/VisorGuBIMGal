@@ -7,7 +7,8 @@
 
 use crate::mesh::Mesh;
 use earcut::Earcut;
-use glam::{DVec2, DVec3, DVec4};
+use glam::{DMat4, DVec2, DVec3, DVec4};
+use std::f64::consts::{FRAC_PI_2, TAU};
 
 /// Hostile files can claim any size, and evaluation cost grows with the square of the degree.
 const MAX_DEGREE: usize = 32;
@@ -19,6 +20,10 @@ const MAX_CLIPS_PER_FACE: usize = 20_000_000;
 const NEWTON_STEPS: usize = 12;
 /// Grid resolution used to seed Newton iteration.
 const SEED_GRID: usize = 16;
+/// A gap this wide cannot come from sampling a full circle, so the face stops short of a turn.
+const MIN_ANGULAR_GAP: f64 = FRAC_PI_2 / 4.0;
+/// Radians beyond the boundary, so that no point of it sits on the end of a surface.
+const ARC_MARGIN: f64 = 1e-6;
 
 /// Expands `Knots` and `KnotMultiplicities`. `None` unless they suit `count` control points.
 pub(crate) fn expand_knots(
@@ -85,7 +90,68 @@ pub(crate) struct Curve {
     pub knots: Vec<f64>,
 }
 
+/// Rational quadratic arcs of the unit circle, at most a quarter turn each: their control
+/// points, weights and knots.
+fn unit_arc(start: f64, sweep: f64) -> (Vec<DVec2>, Vec<f64>, Vec<f64>) {
+    let arcs = ((sweep.abs() / FRAC_PI_2 - 1e-9).ceil() as usize).max(1);
+    let half = sweep / arcs as f64 / 2.0;
+    let on_circle = |angle: f64| DVec2::new(angle.cos(), angle.sin());
+    let (mut points, mut weights) = (vec![on_circle(start)], vec![1.0]);
+    let mut knots = vec![0.0; 3];
+    for arc in 0..arcs {
+        let angle = start + half * (2 * arc + 1) as f64;
+        points.push(on_circle(angle) / half.cos());
+        points.push(on_circle(angle + half));
+        weights.extend([half.cos(), 1.0]);
+        let knot = (arc + 1) as f64 / arcs as f64;
+        knots.extend([knot, knot]);
+    }
+    knots.push(1.0);
+    (points, weights, knots)
+}
+
+/// The part of a turn that `angles` cover, as a start and a sweep with a little to spare.
+/// A cover with no wide gap is the whole turn. Starting in the gap keeps the seam of a
+/// surface built from it out of the face.
+pub(crate) fn covered_arc(angles: impl Iterator<Item = f64>) -> (f64, f64) {
+    let mut angles: Vec<f64> = angles.map(|angle| angle.rem_euclid(TAU)).collect();
+    angles.sort_by(f64::total_cmp);
+    let widest = (0..angles.len())
+        .map(|i| match angles.get(i + 1) {
+            Some(next) => (next - angles[i], *next),
+            None => (angles[0] + TAU - angles[i], angles[0]),
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    match widest {
+        Some((gap, end)) if gap >= MIN_ANGULAR_GAP => (end - ARC_MARGIN, TAU - gap + 2.0 * ARC_MARGIN),
+        _ => (0.0, TAU),
+    }
+}
+
 impl Curve {
+    /// Straight segments through `points`.
+    pub fn polyline(points: Vec<DVec3>) -> Option<Self> {
+        let count = points.len();
+        if count < 2 {
+            return None;
+        }
+        let spans = (count - 1) as f64;
+        let mut knots = vec![0.0];
+        knots.extend((0..count).map(|i| i as f64 / spans));
+        knots.push(1.0);
+        Some(Self { degree: 1, weights: vec![1.0; count], points, knots })
+    }
+
+    /// An arc of the circle of `radius` around `(center_x, 0, 0)` in the XZ plane.
+    pub fn arc_in_xz(center_x: f64, radius: f64, start: f64, sweep: f64) -> Self {
+        let (points, weights, knots) = unit_arc(start, sweep);
+        let points = points
+            .iter()
+            .map(|point| DVec3::new(center_x + point.x * radius, 0.0, point.y * radius))
+            .collect();
+        Self { degree: 2, points, weights, knots }
+    }
+
     fn at(&self, t: f64) -> Option<DVec3> {
         let (span, values) = basis(&self.knots, self.degree, self.points.len(), t);
         let mut sum = DVec4::ZERO;
@@ -120,6 +186,49 @@ pub(crate) struct Surface {
 }
 
 impl Surface {
+    /// `curve` turned about Z, from `start` by `sweep`. Exact, and U runs by the right-hand
+    /// rule, so a curve rising along V at positive X faces away from the axis.
+    pub fn revolved(curve: &Curve, start: f64, sweep: f64) -> Self {
+        let (turns, turn_weights, u_knots) = unit_arc(start, sweep);
+        let points = turns
+            .iter()
+            .map(|turn| {
+                curve
+                    .points
+                    .iter()
+                    .map(|point| {
+                        let radial = DVec2::new(point.x * turn.x - point.y * turn.y, point.x * turn.y + point.y * turn.x);
+                        radial.extend(point.z)
+                    })
+                    .collect()
+            })
+            .collect();
+        let weights = turn_weights
+            .iter()
+            .map(|turn| curve.weights.iter().map(|weight| turn * weight).collect())
+            .collect();
+        Self { u_degree: 2, v_degree: curve.degree, points, weights, u_knots, v_knots: curve.knots.clone() }
+    }
+
+    /// `curve` moved between two offsets, with U along it and V across.
+    pub fn extruded(curve: &Curve, low: DVec3, high: DVec3) -> Self {
+        Self {
+            u_degree: curve.degree,
+            v_degree: 1,
+            points: curve.points.iter().map(|point| vec![*point + low, *point + high]).collect(),
+            weights: curve.weights.iter().map(|weight| vec![*weight; 2]).collect(),
+            u_knots: curve.knots.clone(),
+            v_knots: vec![0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    pub fn transformed(mut self, frame: DMat4) -> Self {
+        for point in self.points.iter_mut().flatten() {
+            *point = frame.transform_point3(*point);
+        }
+        self
+    }
+
     fn u_count(&self) -> usize {
         self.points.len()
     }
@@ -193,6 +302,25 @@ impl Surface {
             _ => from_seed,
         };
         Some(best.0)
+    }
+
+    /// The unit normal, along U cross V, at the surface point nearest each of `points`.
+    pub fn normals_at(&self, points: &[DVec3]) -> Option<Vec<DVec3>> {
+        let seeds = self.seed_grid();
+        let (u_start, u_end) = self.u_domain();
+        let (v_start, v_end) = self.v_domain();
+        let (du, dv) = ((u_end - u_start) * 1e-5, (v_end - v_start) * 1e-5);
+        let mut previous = None;
+        points
+            .iter()
+            .map(|point| {
+                let uv = self.invert(*point, &seeds, previous)?;
+                previous = Some(uv);
+                let along_u = self.at(uv.x + du, uv.y)? - self.at(uv.x - du, uv.y)?;
+                let along_v = self.at(uv.x, uv.y + dv)? - self.at(uv.x, uv.y - dv)?;
+                along_u.cross(along_v).try_normalize()
+            })
+            .collect()
     }
 
     /// Whether the two ends of a parameter direction are the same place.
@@ -294,12 +422,25 @@ fn crosses_seam(rings: &[Vec<DVec2>], axis: usize, span: f64) -> bool {
     })
 }
 
+/// How many times a ring goes around a closed direction of `span`, with sign.
+fn winding(ring: &[DVec2], axis: usize, span: f64) -> f64 {
+    let travelled: f64 = (0..ring.len())
+        .map(|i| {
+            let step = ring[(i + 1) % ring.len()][axis] - ring[i][axis];
+            step - span * (step / span).round()
+        })
+        .sum();
+    travelled / span
+}
+
 /// Meshes a surface inside trimming loops, given as points in space, the outer one first.
 ///
 /// Triangles wind by parameter direction. A loop that wraps around a closed surface has no
 /// interior in parameter space, so such faces keep the whole band that their loops span,
 /// less any loop wound the other way that stays clear of the seam: those are real holes.
-pub(crate) fn mesh_surface(surface: &Surface, loops: &[Vec<DVec3>]) -> Option<Mesh> {
+/// A lone loop around the surface caps it, reaching from the loop to the end of the surface
+/// on its left, seen from outside the face: `same_sense` says which side of the surface that is.
+pub(crate) fn mesh_surface(surface: &Surface, loops: &[Vec<DVec3>], same_sense: bool) -> Option<Mesh> {
     let seeds = surface.seed_grid();
     let (u_start, u_end) = surface.u_domain();
     let (v_start, v_end) = surface.v_domain();
@@ -321,8 +462,20 @@ pub(crate) fn mesh_surface(surface: &Surface, loops: &[Vec<DVec3>]) -> Option<Me
             (low.min(uv[axis]), high.max(uv[axis]))
         })
     };
-    let (u_low, u_high) = if u_wraps { (u_start, u_end) } else { extent(0) };
-    let (v_low, v_high) = if v_wraps { (v_start, v_end) } else { extent(1) };
+    let (mut u_low, mut u_high) = if u_wraps { (u_start, u_end) } else { extent(0) };
+    let (mut v_low, mut v_high) = if v_wraps { (v_start, v_end) } else { extent(1) };
+    if let [ring] = rings.as_slice() {
+        let side = if same_sense { 1.0 } else { -1.0 };
+        let around_u = winding(ring, 0, u_end - u_start) * side;
+        if u_wraps && !v_wraps && around_u.abs() > 0.9 {
+            // Left of rising U is rising V.
+            if around_u > 0.0 { v_high = v_end } else { v_low = v_start }
+        }
+        let around_v = winding(ring, 1, v_end - v_start) * side;
+        if v_wraps && !u_wraps && around_v.abs() > 0.9 {
+            if around_v > 0.0 { u_low = u_start } else { u_high = u_end }
+        }
+    }
     if !(u_high > u_low && v_high > v_low) {
         return None;
     }
