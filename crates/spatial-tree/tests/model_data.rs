@@ -132,7 +132,7 @@ fn rotation_and_absent_scale_follow_the_contract() {
     let summary = ModelData::open(&file).unwrap().summary();
     let reference = &summary.coordinate_reference;
     assert_eq!(reference.crs_id.as_deref(), Some("EPSG:25832"));
-    assert!(summary.diagnostics.iter().any(|item| item.code == "map-scale-assumed"));
+    assert!(summary.diagnostics.iter().any(|item| item.code == "map-scale-from-units"));
 
     let matrix = reference.local_to_map.unwrap();
     assert_eq!(transform(&matrix, [0.0, 0.0, 0.0]), [458658.78, 5438232.79, 113.7]);
@@ -311,4 +311,100 @@ fn unit_labels_are_written_as_their_symbols() {
     assert_eq!(unit("Temperature"), "\u{b0}C");
     assert_eq!(unit("Roughness"), "\u{b5}m");
     assert_eq!(unit("Strength"), "MPa");
+}
+
+/// A project with a map conversion, for the cases no fixture holds. `length` and `map_unit` are
+/// `IFCSIUNIT` prefixes; `conversion` is everything after the two CRS references.
+fn map_file(length: &str, map_unit: &str, conversion: &str, true_north: &str) -> String {
+    format!(
+        "ISO-10303-21;
+HEADER;FILE_DESCRIPTION((''),'2;1');FILE_NAME('','',(''),(''),'','','');FILE_SCHEMA(('IFC4X3_ADD2'));ENDSEC;
+DATA;
+#1=IFCPROJECT('0',$,'p',$,$,$,$,(#4),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,{length},.METRE.);
+#4=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#5,{true_north});
+#5=IFCAXIS2PLACEMENT3D(#6,$,$);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#7=IFCDIRECTION((1.,0.));
+#8=IFCDIRECTION((-1.,0.));
+#9=IFCDIRECTION((0.,0.));
+#10=IFCPROJECTEDCRS('EPSG:25829',$,$,$,$,$,#11);
+#11=IFCSIUNIT(*,.LENGTHUNIT.,{map_unit},.METRE.);
+#12={conversion};
+ENDSEC;
+END-ISO-10303-21;
+"
+    )
+}
+
+fn summary_of(text: &str) -> spatial_tree::ModelSummary {
+    let file = index(text.as_bytes()).unwrap();
+    ModelData::open(&file).unwrap().summary()
+}
+
+fn codes(summary: &spatial_tree::ModelSummary) -> Vec<&'static str> {
+    summary.diagnostics.iter().map(|item| item.code).collect()
+}
+
+#[test]
+fn a_missing_scale_is_harmless_only_when_the_units_agree() {
+    let same = "IFCMAPCONVERSION(#4,#10,10.,20.,30.,$,$,$)";
+    let summary = summary_of(&map_file("$", "$", same, "$"));
+    assert_eq!(codes(&summary), ["map-scale-default"]);
+    let matrix = summary.coordinate_reference.local_to_map.unwrap();
+    assert_eq!(transform(&matrix, [1.0, 0.0, 0.0]), [11.0, 20.0, 30.0]);
+
+    // A file in millimetres with a map in metres: the literal default of 1 would put one model
+    // metre at 1000 map metres.
+    let summary = summary_of(&map_file(".MILLI.", "$", same, "$"));
+    assert_eq!(codes(&summary), ["map-scale-from-units"]);
+    let matrix = summary.coordinate_reference.local_to_map.unwrap();
+    assert_eq!(transform(&matrix, [1.0, 0.0, 0.0]), [11.0, 20.0, 30.0]);
+}
+
+#[test]
+fn an_incomplete_rotation_is_reported_and_ignored() {
+    for conversion in [
+        "IFCMAPCONVERSION(#4,#10,0.,0.,0.,1.,$,1.)",
+        "IFCMAPCONVERSION(#4,#10,0.,0.,0.,$,1.,1.)",
+        "IFCMAPCONVERSION(#4,#10,0.,0.,0.,0.,0.,1.)",
+    ] {
+        let summary = summary_of(&map_file("$", "$", conversion, "$"));
+        assert_eq!(codes(&summary), ["map-rotation-invalid"], "{conversion}");
+        let matrix = summary.coordinate_reference.local_to_map.unwrap();
+        assert_eq!(transform(&matrix, [1.0, 2.0, 0.0]), [1.0, 2.0, 0.0], "{conversion}");
+    }
+
+    let absent = "IFCMAPCONVERSION(#4,#10,0.,0.,0.,$,$,1.)";
+    assert!(codes(&summary_of(&map_file("$", "$", absent, "$"))).is_empty());
+}
+
+#[test]
+fn a_conversion_that_would_mirror_or_collapse_gives_no_transform() {
+    for conversion in [
+        "IFCMAPCONVERSION(#4,#10,0.,0.,0.,1.,0.,0.)",
+        "IFCMAPCONVERSION(#4,#10,0.,0.,0.,1.,0.,-1.)",
+        "IFCMAPCONVERSIONSCALED(#4,#10,0.,0.,0.,1.,0.,1.,-1.,1.,1.)",
+        "IFCMAPCONVERSIONSCALED(#4,#10,0.,0.,0.,1.,0.,1.,1.,0.,1.)",
+    ] {
+        let summary = summary_of(&map_file("$", "$", conversion, "$"));
+        assert_eq!(codes(&summary), ["map-conversion-invalid"], "{conversion}");
+        assert!(summary.coordinate_reference.local_to_map.is_none(), "{conversion}");
+        assert_eq!(summary.coordinate_reference.source, "unknown", "{conversion}");
+    }
+}
+
+#[test]
+fn true_north_is_an_angle_from_project_y_and_never_moves_the_map() {
+    let conversion = "IFCMAPCONVERSION(#4,#10,0.,0.,0.,1.,0.,1.)";
+    let north = |direction: &str| {
+        summary_of(&map_file("$", "$", conversion, direction)).coordinate_reference
+    };
+    assert_eq!(north("$").true_north, None);
+    // North along +X is 90 degrees clockwise from +Y, and along -X counter-clockwise.
+    assert_eq!(north("#7").true_north, Some(-90.0));
+    assert_eq!(north("#8").true_north, Some(90.0));
+    assert_eq!(north("#9").true_north, None, "a zero vector has no direction");
+    assert_eq!(north("#7").local_to_map, north("$").local_to_map);
 }

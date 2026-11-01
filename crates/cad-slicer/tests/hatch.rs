@@ -151,3 +151,31 @@ fn a_spacing_below_the_floor_is_raised_and_a_wide_element_is_cut_off() {
             .any(|diagnostic| diagnostic.code == "hatch-truncated")
     );
 }
+
+
+#[test]
+fn spanish_and_galician_names_reach_their_patterns() {
+    // Each name, its spacing from Annex A. Lines run across a 2 m square, so the count alone
+    // tells the spacing apart, and an English name with the same pattern must give the same lines.
+    for (name, twin) in [
+        ("Fábrica cara vista", "brick"),
+        ("Formigón armado", "concrete"),
+        ("Aceiro laminado", "steel"),
+        ("Madeira de castiñeiro", "wood"),
+        ("Illamento térmico", "insulation"),
+        ("Vidro temperado", "glass"),
+    ] {
+        let lines = |layer_name: &str| {
+            let item = DrawingMesh::new(1, 1, layer_name, cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)));
+            let options = DrawingOptions {
+                cut: Cut::Plan { z: 0.5 },
+                depth: None,
+                include_projection: false,
+                include_hatching: true,
+            };
+            layer(&draw(&[item], &options), layer_name).hatch.clone()
+        };
+        assert!(!lines(name).is_empty(), "{name}");
+        assert_eq!(lines(name), lines(twin), "{name}");
+    }
+}

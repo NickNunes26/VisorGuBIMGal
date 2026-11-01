@@ -43,21 +43,27 @@ impl HatchStyle {
 }
 
 /// Name keywords, angle in degrees and spacing in metres. Order matters: the first hit wins.
-const KEYWORDS: [(&str, f64, f64); 16] = [
+const KEYWORDS: [(&str, f64, f64); 22] = [
     ("hormig", 45.0, 0.20),
+    ("formig", 45.0, 0.20),
     ("concret", 45.0, 0.20),
     ("ladrill", 45.0, 0.12),
     ("masonry", 45.0, 0.12),
     ("brick", 45.0, 0.12),
     ("fabric", 45.0, 0.12),
+    ("fábric", 45.0, 0.12),
     ("acero", 45.0, 0.05),
+    ("aceiro", 45.0, 0.05),
     ("steel", 45.0, 0.05),
     ("metal", 45.0, 0.05),
     ("mader", 90.0, 0.10),
+    ("madeir", 90.0, 0.10),
     ("wood", 90.0, 0.10),
     ("aisl", 30.0, 0.15),
+    ("illament", 30.0, 0.15),
     ("insulat", 30.0, 0.15),
     ("vidrio", 0.0, 0.25),
+    ("vidro", 0.0, 0.25),
     ("glass", 0.0, 0.25),
     ("terreno", 45.0, 0.30),
 ];
