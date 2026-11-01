@@ -221,3 +221,105 @@ fn an_occluder_in_the_same_grid_cells_is_found_whatever_the_order() {
     assert!(drawn.visible.is_empty(), "{:?}", drawn.visible);
     assert!((drawn.hidden.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
 }
+
+
+/// A plate over x = 0..4, at `low` over x = 0 and `high` over x = 4: one sloped surface.
+fn sloped_plate(low: f64, high: f64) -> ifc_geometry::Mesh {
+    ifc_geometry::Mesh {
+        positions: vec![v(0.0, 0.0, low), v(4.0, 0.0, high), v(4.0, 4.0, high), v(0.0, 4.0, low)],
+        triangles: vec![[0, 1, 2], [0, 2, 3]],
+    }
+}
+
+#[test]
+fn the_part_of_a_slope_above_the_cut_hides_nothing() {
+    // The plate crosses the plane at x = 2. Over x < 2 it is above the cut and gone, so the first
+    // box is in plain sight, while the second lies under what remains of the plate.
+    let meshes = vec![
+        DrawingMesh::new(1, 1, "plate", sloped_plate(3.0, 1.0)),
+        DrawingMesh::new(1, 2, "seen", cuboid(v(0.5, 1.0, 0.0), v(1.5, 2.0, 0.5))),
+        DrawingMesh::new(1, 3, "under", cuboid(v(2.5, 1.0, 0.0), v(3.5, 2.0, 0.5))),
+    ];
+    let drawing = draw(&meshes, &options(None));
+    let seen = layer(&drawing, "seen");
+    assert!(seen.hidden.is_empty(), "{:?}", seen.hidden);
+    assert!((seen.visible.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
+    let under = layer(&drawing, "under");
+    assert!(under.visible.is_empty(), "{:?}", under.visible);
+    assert!((under.hidden.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
+}
+
+#[test]
+fn an_edge_passing_from_under_a_slope_to_beyond_the_cut_splits_where_the_slope_is_cut() {
+    // One long bar under the whole plate: hidden only where the plate survives, x = 2..4.
+    let meshes = vec![
+        DrawingMesh::new(1, 1, "plate", sloped_plate(3.0, 1.0)),
+        DrawingMesh::new(1, 2, "bar", cuboid(v(0.0, 1.0, 0.0), v(4.0, 2.0, 0.5))),
+    ];
+    let drawing = draw(&meshes, &options(None));
+    let bar = layer(&drawing, "bar");
+    let hidden: f64 = bar.hidden.iter().map(Segment::length).sum();
+    // Two sides of 2 m and the far end of 1 m.
+    assert!((hidden - 5.0).abs() < 1e-6, "{hidden}");
+}
+
+#[test]
+fn a_slope_reaching_past_the_depth_limit_still_hides_what_is_under_its_near_part() {
+    // Depth is 2 - z: the plate runs from 0.2 to 4 behind the plane, past the 3 m limit. The box
+    // is 1.5 to 2 behind it, and the plate stays above the box's top over x = 0.2..1.2.
+    let meshes = vec![
+        DrawingMesh::new(1, 1, "plate", sloped_plate(1.8, -2.0)),
+        DrawingMesh::new(1, 2, "under", cuboid(v(0.2, 1.0, 0.0), v(1.2, 2.0, 0.5))),
+    ];
+    let drawing = draw(&meshes, &options(Some(3.0)));
+    let under = layer(&drawing, "under");
+    assert!(under.visible.is_empty(), "{:?}", under.visible);
+    assert!((under.hidden.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
+}
+
+#[test]
+fn an_element_with_too_many_edges_says_so() {
+    // 40,000 separate triangles have 120,000 boundary edges, past the limit of one element.
+    let mut soup = ifc_geometry::Mesh { positions: Vec::new(), triangles: Vec::new() };
+    for index in 0..40_000u32 {
+        let (x, y) = (f64::from(index % 200), f64::from(index / 200));
+        soup.positions.extend([v(x, y, 0.0), v(x + 0.5, y, 0.0), v(x, y + 0.5, 0.0)]);
+        soup.triangles.push([index * 3, index * 3 + 1, index * 3 + 2]);
+    }
+    let drawing = draw(&[DrawingMesh::new(1, 7, "soup", soup)], &options(None));
+    assert!(
+        drawing.diagnostics.iter().any(|item| item.code == "projection-truncated" && item.element_id == 7),
+        "{:?}",
+        drawing.diagnostics
+    );
+}
+
+/// What the two runs of a drawing add up to: visible and hidden length over every layer.
+fn line_lengths(drawing: &cad_slicer::Drawing) -> (f64, f64) {
+    let total = |pick: fn(&Layer) -> &Vec<Segment>| {
+        drawing.layers.iter().flat_map(pick).map(Segment::length).sum::<f64>()
+    };
+    (total(|layer| &layer.visible), total(|layer| &layer.hidden))
+}
+
+#[test]
+fn visibility_does_not_depend_on_where_the_model_sits() {
+    // Slabs flush with the walls under them, so lines lie along the borders of their occluders,
+    // which is where rounding at survey coordinates would show. Map frames work in those.
+    let scene = |x: f64, y: f64| -> Vec<DrawingMesh> {
+        let mut meshes = Vec::new();
+        for index in 0..40 {
+            let shift = f64::from(index) * 3.1;
+            let at = |px: f64, py: f64, pz: f64| v(x + shift + px, y + py, pz);
+            let id = index as u32 * 2;
+            meshes.push(DrawingMesh::new(1, id + 1, "a", cuboid(at(0.0, 0.0, 3.0), at(2.7, 2.9, 3.2))));
+            meshes.push(DrawingMesh::new(1, id + 2, "b", cuboid(at(0.0, 0.0, 0.0), at(0.3, 2.9, 3.0))));
+        }
+        meshes
+    };
+    let near = draw(&scene(0.0, 0.0), &options(None).with_plan(10.0));
+    let far = draw(&scene(500_000.0, 4_700_000.0), &options(None).with_plan(10.0));
+    let (near, far) = (line_lengths(&near), line_lengths(&far));
+    assert!((near.0 - far.0).abs() < 1e-3, "visible {} against {}", near.0, far.0);
+    assert!((near.1 - far.1).abs() < 1e-3, "hidden {} against {}", near.1, far.1);
+}

@@ -177,9 +177,14 @@ impl Occluders {
             let wr = (p - point).perp_dot(q - point) / flat.area;
             wp * flat.depths[0] + wq * flat.depths[1] + wr * flat.depths[2]
         };
-        let behind_start = edge.depth_a - depth_under(edge.a) - OCCLUSION_EPSILON;
-        let behind_end = edge.depth_b - depth_under(edge.b) - OCCLUSION_EPSILON;
+        let (under_start, under_end) = (depth_under(edge.a), depth_under(edge.b));
+        let behind_start = edge.depth_a - under_start - OCCLUSION_EPSILON;
+        let behind_end = edge.depth_b - under_end - OCCLUSION_EPSILON;
         if !behind_start.is_finite() || !behind_end.is_finite() || !clip(behind_start, behind_end) {
+            return None;
+        }
+        // The part of a sloped triangle in front of the plane has been cut away.
+        if !clip(under_start, under_end) {
             return None;
         }
         Some((start, end))
@@ -346,6 +351,7 @@ pub(crate) fn add_occluders(
         return report;
     }
     // A triangle entirely beyond the reach of the projection draws nothing and hides nothing.
+    // One only partly beyond it still hides what lies behind its near part.
     let ceiling = limit.unwrap_or(f64::INFINITY);
     for [a, b, c] in mesh.triangle_corners() {
         if !(a.is_finite() && b.is_finite() && c.is_finite()) {
@@ -353,7 +359,10 @@ pub(crate) fn add_occluders(
             continue;
         }
         let depths = [frame.depth(a), frame.depth(b), frame.depth(c)];
-        if depths.iter().any(|depth| !depth.is_finite() || *depth > ceiling) {
+        if depths.iter().any(|depth| !depth.is_finite()) {
+            continue;
+        }
+        if depths[0].min(depths[1]).min(depths[2]) > ceiling {
             continue;
         }
         if depths[0].max(depths[1]).max(depths[2]) < 0.0 {
@@ -388,8 +397,9 @@ pub(crate) fn project_mesh(
         report.too_large = true;
         return report;
     }
-    let (edges, skipped) = feature_edges(mesh, frame.look);
+    let (edges, skipped, too_many) = feature_edges(mesh, frame.look);
     report.non_finite += skipped;
+    report.truncated = too_many;
 
     for (from, to) in edges {
         // Depth runs linearly along the edge: clip by solving once.
@@ -587,8 +597,9 @@ fn subtract(spans: Vec<(f64, f64)>, cut: &[(f64, f64)]) -> Vec<(f64, f64)> {
     }
     out
 }
-/// The edges worth drawing, welded so two triangles sharing an edge count once.
-fn feature_edges(mesh: &Mesh, look: DVec3) -> (Vec<(DVec3, DVec3)>, usize) {
+/// The edges worth drawing, welded so two triangles sharing an edge count once, the triangles
+/// skipped, and whether the element had more edges than it may contribute.
+fn feature_edges(mesh: &Mesh, look: DVec3) -> (Vec<(DVec3, DVec3)>, usize, bool) {
     let mut welded: BTreeMap<[u64; 3], u32> = BTreeMap::new();
     let mut points: Vec<DVec3> = Vec::new();
     let mut faces: BTreeMap<(u32, u32), EdgeFaces> = BTreeMap::new();
@@ -628,10 +639,8 @@ fn feature_edges(mesh: &Mesh, look: DVec3) -> (Vec<(DVec3, DVec3)>, usize) {
     }
 
     let mut edges = Vec::new();
+    let mut too_many = false;
     for ((from, to), edge) in faces {
-        if edges.len() >= MAX_FEATURE_EDGES {
-            break;
-        }
         let draw = if edge.count < 2 {
             true
         } else {
@@ -647,10 +656,14 @@ fn feature_edges(mesh: &Mesh, look: DVec3) -> (Vec<(DVec3, DVec3)>, usize) {
         }
         let (a, b) = (points[from as usize], points[to as usize]);
         if a.distance(b) > SEGMENT_EPSILON {
+            if edges.len() >= MAX_FEATURE_EDGES {
+                too_many = true;
+                break;
+            }
             edges.push((a, b));
         }
     }
-    (edges, skipped)
+    (edges, skipped, too_many)
 }
 
 #[cfg(test)]

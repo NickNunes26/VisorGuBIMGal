@@ -34,6 +34,7 @@ class ModelWorker {
   private worker = new Worker(new URL('./kernel.worker.ts', import.meta.url), { type: 'module' });
   private nextRequest = 0;
   private pending = new Map<number, Pending>();
+  private closed = false;
 
   constructor() {
     this.worker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
@@ -54,6 +55,10 @@ class ModelWorker {
   }
 
   call<T>(request: WorkerRequest, transfer: Transferable[] = []): Promise<T> {
+    // A terminated Worker never answers: anyone still walking a stream or a relay must hear so.
+    if (this.closed) {
+      return Promise.reject(new KernelError('model-not-open', 'El modelo se ha cerrado.'));
+    }
     const id = this.nextRequest++;
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as Pending['resolve'], reject });
@@ -63,6 +68,7 @@ class ModelWorker {
 
   /** Stops at once, even in the middle of evaluating an element. */
   terminate(): void {
+    this.closed = true;
     this.worker.terminate();
     this.rejectAll(new KernelError('model-not-open', 'El modelo se ha cerrado.'));
   }
