@@ -39,6 +39,7 @@ export default function App() {
   const loadIfcFile = useCallback(
     async (fileInput: File | { name: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> }) => {
       const modelId: ModelId = `model-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      let opened = false;
       setIsWorking(true);
       setStatusText(`Cargando ${fileInput.name}...`);
 
@@ -49,6 +50,7 @@ export default function App() {
         const summary = await kernel.openModel(modelId, buffer, (phase, pct) => {
           setStatusText(`${phase} (${pct}%)`);
         });
+        opened = true;
 
         // 2. Stream geometry from kernel to renderer
         setStatusText('Procesando geometría 3D en WebGPU...');
@@ -56,6 +58,7 @@ export default function App() {
 
         let meshCount = 0;
         let bounds: ModelBounds | undefined;
+        let completed = false;
 
         for await (const event of kernel.streamGeometry(modelId)) {
           if (event.type === 'batch') {
@@ -63,9 +66,15 @@ export default function App() {
           } else if (event.type === 'progress') {
             setStatusText(`Cargadas ${event.processedElements} mallas 3D...`);
           } else if (event.type === 'complete') {
+            completed = true;
             meshCount = event.meshCount;
             bounds = event.bounds;
           }
+        }
+
+        if (!completed) {
+          renderer.removeModel(modelId);
+          return;
         }
 
         renderer.finishModel(modelId, bounds);
@@ -94,6 +103,14 @@ export default function App() {
         setModels((prev) => [...prev, newModel]);
         setStatusText(`${fileInput.name} cargado con ${meshCount} mallas.`);
       } catch (err) {
+        if (opened) {
+          renderer.removeModel(modelId);
+          try {
+            await kernel.closeModel(modelId);
+          } catch {
+            // ignore close error
+          }
+        }
         console.error('Error loading IFC:', err);
         setStatusText(`Error al cargar ${fileInput.name}: ${err instanceof Error ? err.message : 'Error'}`);
       } finally {

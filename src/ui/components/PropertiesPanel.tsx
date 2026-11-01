@@ -89,12 +89,16 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({ element }) => 
           </div>
           <table className="pset-table">
             <tbody>
-              {pset.properties.map((prop, pIdx) => (
-                <tr key={pIdx}>
-                  <td title={prop.name}>{prop.name}</td>
-                  <td title={String(prop.value)}>{String(prop.value ?? '-')}</td>
-                </tr>
-              ))}
+              {pset.properties.map((prop, pIdx) => {
+                const valStr = String(prop.value ?? '-');
+                const text = prop.unit ? `${valStr} ${prop.unit}` : valStr;
+                return (
+                  <tr key={pIdx}>
+                    <td title={prop.name}>{prop.name}</td>
+                    <td title={text}>{text}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -270,6 +270,7 @@ body {
 /* Viewport Center */
 .viewport-center {
   flex: 1;
+  min-height: 0;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -277,6 +278,7 @@ body {
 
 .canvas-container {
   flex: 1;
+  min-height: 0;
   position: relative;
   width: 100%;
   height: 100%;
@@ -309,6 +311,7 @@ canvas.bim-viewport {
 
 /* GIS Split Panel */
 .gis-drawer {
+  flex: none;
   height: 260px;
   border-top: 1px solid var(--border-color);
   background-color: var(--bg-secondary);
