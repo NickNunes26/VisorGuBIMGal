@@ -1,4 +1,5 @@
-// Metres in the drawing frame, IFC Z-up. `depth` limits projection beyond the cut; omit for no limit.
+// Metres in the drawing frame, IFC Z-up. Plans look towards -Z, and 'positive' looks along +axis.
+// `depth` is measured from the plane along the look direction and limits projection only; omit for no limit.
 export type DrawingCut =
   | { kind: 'plan'; elevation: number; depth?: number }
   | {
@@ -16,18 +17,18 @@ export type DrawingFrame = { kind: 'project' } | { kind: 'map' };
 export interface DrawingOptions {
   cut: DrawingCut;
   frame: DrawingFrame;
-  includeProjection: boolean;
+  includeProjection: boolean;     // Visible and hidden lines, which come from one pass
   includeHiddenLines: boolean;    // Requires includeProjection
   includeHatching: boolean;
-  includeEdges: boolean;
-  mergeLines: boolean;
+  includeEdges: boolean;          // IFClite only: the kernel ignores it. Removed by T-051
+  mergeLines: boolean;            // IFClite only: the kernel ignores it. Removed by T-051
 }
 
 export interface DrawingExportConfig {
   format: 'dxf' | 'svg';
   fileName: string;
   crsComment?: string;
-  units: 'm' | 'mm';
+  units: 'm' | 'mm';              // Scales the exported coordinates
   showHiddenLines: boolean;       // Export can omit what was generated, never add to it
   showHatching: boolean;
 }
