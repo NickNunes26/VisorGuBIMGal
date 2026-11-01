@@ -1,5 +1,4 @@
-// One model in one fresh instance, as a Worker holds it. Run 
-pm run kernel first.
+// One model in one fresh instance, as a Worker holds it. Run npm run kernel first.
 // usage: node scripts/measure-kernel.mjs <file.ifc>
 import { readFileSync, statSync } from 'node:fs';
 

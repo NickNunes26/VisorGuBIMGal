@@ -90,8 +90,10 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({ element }) => 
           <table className="pset-table">
             <tbody>
               {pset.properties.map((prop, pIdx) => {
-                const valStr = String(prop.value ?? '-');
-                const text = prop.unit ? `${valStr} ${prop.unit}` : valStr;
+                const hasValue = prop.value !== null && prop.value !== undefined;
+                const text = hasValue
+                  ? [prop.value, prop.unit].filter((part) => part !== undefined).join(' ')
+                  : '-';
                 return (
                   <tr key={pIdx}>
                     <td title={prop.name}>{prop.name}</td>

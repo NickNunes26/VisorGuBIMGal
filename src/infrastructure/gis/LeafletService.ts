@@ -23,15 +23,6 @@ export class LeafletService {
       zoomControl: true
     });
 
-    // Sleek Dark Tile layer
-    const darkTiles = L.tileLayer(
-      'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-      {
-        attribution: '&copy; <a href="https://carto.com/">CARTO</a>, &copy; <a href="https://osm.org/">OSM</a>',
-        maxZoom: 19
-      }
-    );
-
     // OpenStreetMap standard
     const osmTiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors',
@@ -46,14 +37,13 @@ export class LeafletService {
       attribution: '&copy; Instituto Geográfico Nacional de España'
     });
 
-    darkTiles.addTo(map);
+    pnoaWms.addTo(map);
 
     L.control
       .layers(
         {
-          'Carto Voyager': darkTiles,
-          OpenStreetMap: osmTiles,
-          'Ortofoto PNOA (IGN)': pnoaWms
+          'Ortofoto PNOA (IGN)': pnoaWms,
+          OpenStreetMap: osmTiles
         },
         undefined,
         { position: 'topright' }
