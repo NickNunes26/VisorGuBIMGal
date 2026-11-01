@@ -1,0 +1,296 @@
+//! DXF R12 writer, following §5 of `docs/05_kernel_contract.md`.
+//!
+//! The file is bytes, not text: `$ACADVER` is `AC1009`, `$DWGCODEPAGE` is `ANSI_1252`, every
+//! line ends in CRLF and every group value is encoded in CP1252. Nothing that could end a
+//! line early or land on an undefined byte reaches the file.
+
+use crate::text::dxf_bytes;
+use crate::Drawing;
+use std::collections::BTreeSet;
+
+/// Longest R12 group value.
+const MAX_VALUE: usize = 255;
+/// Longest R12 layer name.
+const MAX_LAYER: usize = 31;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DxfOptions {
+    /// Dashed geometry goes on its own layer.
+    pub include_hidden: bool,
+    pub include_hatch: bool,
+}
+
+impl Default for DxfOptions {
+    fn default() -> Self {
+        Self {
+            include_hidden: true,
+            include_hatch: true,
+        }
+    }
+}
+
+pub fn to_dxf(drawing: &Drawing) -> Vec<u8> {
+    to_dxf_with(drawing, &DxfOptions::default())
+}
+
+/// Writes the drawing. Layers with nothing on them are left out of the table.
+pub fn to_dxf_with(drawing: &Drawing, options: &DxfOptions) -> Vec<u8> {
+    let mut names = Names::default();
+    let mut layers: Vec<Planned> = Vec::new();
+    for layer in crate::used_layers(drawing) {
+        let hatch = options.include_hatch && !layer.hatch.is_empty();
+        let hidden = options.include_hidden && !layer.hidden.is_empty();
+        if layer.loops.is_empty() && layer.visible.is_empty() && !hatch && !hidden {
+            continue;
+        }
+        let name = names.assign(&layer.name);
+        let hidden_name = hidden.then(|| names.assign(&format!("{}-HIDDEN", layer.name)));
+        layers.push(Planned {
+            name,
+            hidden: hidden_name,
+            layer,
+        });
+    }
+
+    let mut out = Writer::default();
+    out.header(drawing);
+    out.layer_table(&layers);
+    out.section("ENTITIES");
+    for planned in &layers {
+        for ring in &planned.layer.loops {
+            for (from, to) in ring.segments() {
+                out.line(&planned.name, from, to);
+            }
+        }
+        for segment in &planned.layer.visible {
+            out.line(&planned.name, segment.a, segment.b);
+        }
+        if options.include_hatch {
+            for segment in &planned.layer.hatch {
+                out.line(&planned.name, segment.a, segment.b);
+            }
+        }
+        if let Some(hidden) = &planned.hidden {
+            for segment in &planned.layer.hidden {
+                out.line(hidden, segment.a, segment.b);
+            }
+        }
+    }
+    out.end_section();
+    out.group(0, b"EOF");
+    out.bytes
+}
+
+struct Planned<'a> {
+    name: String,
+    hidden: Option<String>,
+    layer: &'a crate::Layer,
+}
+
+#[derive(Default)]
+struct Writer {
+    bytes: Vec<u8>,
+}
+
+impl Writer {
+    fn group(&mut self, code: i16, value: &[u8]) {
+        self.bytes.extend_from_slice(code.to_string().as_bytes());
+        self.bytes.extend_from_slice(b"\r\n");
+        self.bytes.extend_from_slice(value);
+        self.bytes.extend_from_slice(b"\r\n");
+    }
+
+    fn text(&mut self, code: i16, value: &str) {
+        let bytes = dxf_bytes(value, MAX_VALUE);
+        self.group(code, &bytes);
+    }
+
+    fn number(&mut self, code: i16, value: f64) {
+        let text = format_number(value);
+        self.group(code, text.as_bytes());
+    }
+
+    fn integer(&mut self, code: i16, value: i64) {
+        let text = value.to_string();
+        self.group(code, text.as_bytes());
+    }
+
+    fn section(&mut self, name: &str) {
+        self.group(0, b"SECTION");
+        self.text(2, name);
+    }
+
+    fn end_section(&mut self) {
+        self.group(0, b"ENDSEC");
+    }
+
+    fn header(&mut self, drawing: &Drawing) {
+        let (low, high) = bounds(drawing);
+        self.section("HEADER");
+        self.text(9, "$ACADVER");
+        self.text(1, "AC1009");
+        self.text(9, "$DWGCODEPAGE");
+        self.text(3, "ANSI_1252");
+        self.text(9, "$EXTMIN");
+        self.number(10, low.0);
+        self.number(20, low.1);
+        self.number(30, 0.0);
+        self.text(9, "$EXTMAX");
+        self.number(10, high.0);
+        self.number(20, high.1);
+        self.number(30, 0.0);
+        self.end_section();
+    }
+
+    /// Layers can only name a linetype that the file defines.
+    fn linetype_table(&mut self) {
+        self.group(0, b"TABLE");
+        self.text(2, "LTYPE");
+        self.integer(70, 2);
+        self.linetype_entry("CONTINUOUS", "Solid line", &[]);
+        self.linetype_entry("DASHED", "Dashed", &[0.5, -0.25]);
+        self.group(0, b"ENDTAB");
+    }
+
+    /// `pattern` holds dash lengths in drawing units, negative for gaps.
+    fn linetype_entry(&mut self, name: &str, description: &str, pattern: &[f64]) {
+        self.group(0, b"LTYPE");
+        self.text(2, name);
+        self.integer(70, 0);
+        self.text(3, description);
+        self.integer(72, 65);
+        self.integer(73, pattern.len() as i64);
+        self.number(40, pattern.iter().map(|dash| dash.abs()).sum());
+        for dash in pattern {
+            self.number(49, *dash);
+        }
+    }
+
+    fn layer_table(&mut self, layers: &[Planned]) {
+        self.section("TABLES");
+        self.linetype_table();
+        self.group(0, b"TABLE");
+        self.text(2, "LAYER");
+        // A hidden layer is an entry of the table too, so the count covers both kinds.
+        let entries =
+            layers.len() + layers.iter().filter(|planned| planned.hidden.is_some()).count();
+        self.integer(70, entries as i64);
+        for planned in layers {
+            self.layer_entry(&planned.name, 7, "CONTINUOUS");
+            if let Some(hidden) = &planned.hidden {
+                self.layer_entry(hidden, 8, "DASHED");
+            }
+        }
+        self.group(0, b"ENDTAB");
+        self.end_section();
+    }
+
+    fn layer_entry(&mut self, name: &str, colour: u8, linetype: &str) {
+        self.group(0, b"LAYER");
+        self.text(2, name);
+        self.integer(70, 0);
+        self.integer(62, colour as i64);
+        self.text(6, linetype);
+    }
+
+    fn line(&mut self, layer: &str, from: glam::DVec2, to: glam::DVec2) {
+        self.group(0, b"LINE");
+        self.text(8, layer);
+        self.number(10, from.x);
+        self.number(20, from.y);
+        self.number(30, 0.0);
+        self.number(11, to.x);
+        self.number(21, to.y);
+        self.number(31, 0.0);
+    }
+}
+
+/// Six decimals is a micrometre: far finer than any drawing, and short enough to read.
+fn format_number(value: f64) -> String {
+    if !value.is_finite() {
+        return "0.000000".into();
+    }
+    let rounded = format!("{value:.6}");
+    // -0.000000 is legal but ugly, and it changes between platforms.
+    if rounded.starts_with('-') && rounded[1..].bytes().all(|byte| byte == b'0' || byte == b'.') {
+        return rounded[1..].to_string();
+    }
+    rounded
+}
+
+/// Everything the drawing draws, in drawing coordinates.
+fn bounds(drawing: &Drawing) -> ((f64, f64), (f64, f64)) {
+    let mut low = (f64::MAX, f64::MAX);
+    let mut high = (f64::MIN, f64::MIN);
+    let mut take = |point: glam::DVec2| {
+        if point.is_finite() {
+            low = (low.0.min(point.x), low.1.min(point.y));
+            high = (high.0.max(point.x), high.1.max(point.y));
+        }
+    };
+    for layer in &drawing.layers {
+        for ring in &layer.loops {
+            ring.points.iter().copied().for_each(&mut take);
+        }
+        for segment in layer
+            .visible
+            .iter()
+            .chain(&layer.hidden)
+            .chain(&layer.hatch)
+        {
+            take(segment.a);
+            take(segment.b);
+        }
+    }
+    if low.0 > high.0 {
+        ((0.0, 0.0), (0.0, 0.0))
+    } else {
+        (low, high)
+    }
+}
+
+/// Hands out R12 layer names: cleaned, cut to 31 characters and never shared.
+#[derive(Default)]
+struct Names {
+    used: BTreeSet<String>,
+}
+
+impl Names {
+    fn assign(&mut self, raw: &str) -> String {
+        let base = clean(raw);
+        // AutoCAD compares layer names without case.
+        if self.used.insert(base.to_lowercase()) {
+            return base;
+        }
+        // Cut first, then add the suffix: two long names that share a prefix stay distinct.
+        for suffix in 1..=9999 {
+            let suffix = format!("-{suffix}");
+            let keep = MAX_LAYER.saturating_sub(suffix.len());
+            let mut candidate: String = base.chars().take(keep).collect();
+            candidate.push_str(&suffix);
+            if self.used.insert(candidate.to_lowercase()) {
+                return candidate;
+            }
+        }
+        "LAYER".into()
+    }
+}
+
+/// R12 allows letters, digits and `$ _ - .` in a layer name, up to 31 of them.
+fn clean(raw: &str) -> String {
+    let mut out = String::new();
+    for character in raw.chars() {
+        if out.len() >= MAX_LAYER {
+            break;
+        }
+        if character.is_ascii_alphanumeric() || matches!(character, '$' | '_' | '-' | '.') {
+            out.push(character);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("LAYER");
+    }
+    out
+}

@@ -8,6 +8,10 @@ publish.workspace = true
 
 [dependencies]
 ifc-geometry.workspace = true
+glam.workspace = true
+
+[dev-dependencies]
+step-parser.workspace = true
 
 [lints]
 workspace = true
