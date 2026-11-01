@@ -6,10 +6,12 @@
 
 mod cut;
 mod geom;
+mod hatch;
 mod project;
 
 pub use cut::{Axis, Cut, Frame, Look};
 pub use geom::{Loop, Segment};
+pub use hatch::HatchStyle;
 
 use ifc_geometry::Mesh;
 use glam::DVec2;
@@ -24,13 +26,27 @@ pub struct Diagnostic {
 }
 
 /// One mesh to draw.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DrawingMesh {
     pub model_id: u32,
     pub element_id: u32,
     /// Layer or material name, straight from the file: untrusted text.
     pub layer: String,
     pub mesh: Mesh,
+    /// The caller's `IfcFillAreaStyleHatching`, when it has one.
+    pub hatch: Option<HatchStyle>,
+}
+
+impl DrawingMesh {
+    pub fn new(model_id: u32, element_id: u32, layer: impl Into<String>, mesh: Mesh) -> Self {
+        Self {
+            model_id,
+            element_id,
+            layer: layer.into(),
+            mesh,
+            hatch: None,
+        }
+    }
 }
 
 /// What to compute. Exporters only serialise what this asked for.
@@ -219,6 +235,25 @@ pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
                 "open-cut-loop",
                 "the cut could not close a loop, which a watertight mesh would".into(),
             );
+        }
+        if options.include_hatching {
+            let report = hatch::hatch_loops(&loops, item.hatch, &item.layer, &mut layer.hatch);
+            if report.bad_style {
+                diagnostics.add(
+                    item.model_id,
+                    item.element_id,
+                    "bad-hatch-style",
+                    "the given hatch has no usable angle or spacing".into(),
+                );
+            }
+            if report.truncated {
+                diagnostics.add(
+                    item.model_id,
+                    item.element_id,
+                    "hatch-truncated",
+                    "the hatch reached its line limit and stopped".into(),
+                );
+            }
         }
         layer.loops.extend(loops);
 

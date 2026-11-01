@@ -8,18 +8,8 @@ use common::{cuboid, layer, v};
 /// A slab whose top face is the cut plane, over a small box that it hides completely.
 fn slab_over_box() -> Vec<DrawingMesh> {
     vec![
-        DrawingMesh {
-            model_id: 1,
-            element_id: 1,
-            layer: "slab".into(),
-            mesh: cuboid(v(0.0, 0.0, 1.5), v(4.0, 4.0, 2.0)),
-        },
-        DrawingMesh {
-            model_id: 1,
-            element_id: 2,
-            layer: "slab".into(),
-            mesh: cuboid(v(1.0, 1.0, 0.0), v(2.0, 2.0, 1.0)),
-        },
+        DrawingMesh::new(1, 1, "slab", cuboid(v(0.0, 0.0, 1.5), v(4.0, 4.0, 2.0))),
+        DrawingMesh::new(1, 2, "slab", cuboid(v(1.0, 1.0, 0.0), v(2.0, 2.0, 1.0))),
     ]
 }
 
@@ -109,12 +99,7 @@ fn no_projection_means_no_hidden_lines() {
 fn a_section_projects_towards_its_look_direction() {
     // Looking along +X at x = 0, a wall at x = 1 is behind the plane and visible; the same
     // wall at x = -1 is in front of it and must not appear at all.
-    let wall = |x: f64| DrawingMesh {
-        model_id: 1,
-        element_id: 3,
-        layer: "wall".into(),
-        mesh: cuboid(v(x, 0.0, 0.0), v(x + 0.2, 1.0, 2.0)),
-    };
+    let wall = |x: f64| DrawingMesh::new(1, 3, "wall", cuboid(v(x, 0.0, 0.0), v(x + 0.2, 1.0, 2.0)));
     let mut options = DrawingOptions::cut_only(Cut::Section {
         axis: cad_slicer::Axis::X,
         position: 0.0,

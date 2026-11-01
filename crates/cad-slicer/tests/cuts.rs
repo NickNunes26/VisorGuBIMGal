@@ -9,12 +9,7 @@ use common::{assert_sound, bounds, cuboid, cylinder, layer, pyramid, v};
 use ifc_geometry::{Mesh, subtract};
 
 fn one(mesh: Mesh, cut: Cut) -> cad_slicer::Drawing {
-    let item = DrawingMesh {
-        model_id: 1,
-        element_id: 7,
-        layer: "walls".into(),
-        mesh,
-    };
+    let item = DrawingMesh::new(1, 7, "walls", mesh);
     draw(&[item], &DrawingOptions::cut_only(cut))
 }
 
@@ -130,11 +125,11 @@ fn plane_along_a_shared_edge_keeps_one_loop() {
     // Two boxes touching at z = 1: the plane lies in the shared face, an edge of both.
     let lower = cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0));
     let upper = cuboid(v(0.0, 0.0, 1.0), v(2.0, 2.0, 2.0));
-    let item = DrawingMesh {
-        model_id: 1,
-        element_id: 7,
-        layer: "walls".into(),
-        mesh: Mesh {
+    let item = DrawingMesh::new(
+        1,
+        7,
+        "walls",
+        Mesh {
             positions: [lower.positions, upper.positions].concat(),
             triangles: [
                 lower.triangles,
@@ -146,7 +141,7 @@ fn plane_along_a_shared_edge_keeps_one_loop() {
             ]
             .concat(),
         },
-    };
+    );
     let drawing = draw(&[item], &DrawingOptions::cut_only(Cut::Plan { z: 1.0 }));
     let rings = &layer(&drawing, "walls").loops;
     assert!(rings.len() <= 1, "{rings:?}");
@@ -203,12 +198,7 @@ fn depth_does_not_change_a_cut() {
     let mut options = DrawingOptions::cut_only(Cut::Plan { z: 1.0 });
     options.depth = Some(0.0);
     let drawing = draw(
-        &[DrawingMesh {
-            model_id: 1,
-            element_id: 7,
-            layer: "walls".into(),
-            mesh: cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 2.0)),
-        }],
+        &[DrawingMesh::new(1, 7, "walls", cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 2.0)))],
         &options,
     );
     assert_eq!(layer(&drawing, "walls").loops.len(), 1);
