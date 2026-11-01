@@ -21,22 +21,27 @@ export const MeshField = {
 export const MeshFlag = {
   /** Alpha below 255: draw in the transparent pass. */
   Transparent: 1 << 0,
-  /** Kernel could not evaluate it fully (a void was not cut, say). A diagnostic names the element. */
+  /** Kernel could not evaluate it fully (a void was not cut, say). The 'complete' event names it. */
   Degraded: 1 << 1,
-  /** Pickable, but starts hidden (IfcSpace and similar). */
+  /** Pickable, but starts hidden. Only IfcSpace today. Left out of 'complete' bounds. */
   HiddenByDefault: 1 << 2
 } as const;
 
 /** Largest vertex distance from a batch origin, in metres. f32 keeps about 0.5 mm here. */
 export const MAX_BATCH_RADIUS = 4096;
 
+/** How far a normal's length may stray from 1. */
+const NORMAL_TOLERANCE = 1e-3;
+
 /**
  * One transferable block of triangles. Positions are metres, IFC Z-up, as f32 relative to
- * `origin`. Indices are zero-based within this batch. An element may own several records:
- * one per colour, for instance.
+ * `origin`. Indices are zero-based within this batch. An element may own several records,
+ * one per colour for instance, always in one batch. Triangles run counter-clockwise seen
+ * from the side their normal points to.
  */
 export interface GeometryBatch {
   modelId: ModelId;
+  /** Starts at 1 in each stream and rises by one. */
   sequence: number;
   /** Absolute model coordinates, as f64. Absolute vertex = origin + position. */
   origin: readonly [number, number, number];
@@ -54,6 +59,10 @@ export function findBatchError(batch: GeometryBatch): string | null {
   if (normals.length !== positions.length) return 'normals length differs from positions length';
   // A lone element above the radius is allowed if Degraded, so this checks only finiteness.
   if (!positions.every(Number.isFinite)) return 'positions contain a non-finite value';
+  for (let at = 0; at < normals.length; at += 3) {
+    const length = Math.hypot(normals[at], normals[at + 1], normals[at + 2]);
+    if (!(Math.abs(length - 1) <= NORMAL_TOLERANCE)) return `normal ${at / 3} is not unit length`;
+  }
   if (indices.length % 3 !== 0) return 'indices length is not a multiple of 3';
   if (meshTable.length % MESH_RECORD_WORDS !== 0) {
     return `meshTable length is not a multiple of ${MESH_RECORD_WORDS}`;
