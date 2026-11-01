@@ -6,12 +6,61 @@ mod json;
 pub mod loaded;
 
 use loaded::{LoadedModel, OpenError};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::prelude::*;
+
+static ALLOCATION_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Remembers a failed allocation. Rust then aborts, which in WASM is a bare `unreachable` trap
+/// that JS cannot tell from any other bug.
+struct TrackingAllocator;
+
+impl TrackingAllocator {
+    fn track(pointer: *mut u8) -> *mut u8 {
+        if pointer.is_null() {
+            ALLOCATION_FAILED.store(true, Ordering::Relaxed);
+        }
+        pointer
+    }
+}
+
+// SAFETY: every call forwards to `System` with the caller's own arguments.
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
+        Self::track(unsafe { System.alloc(layout) })
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
+        Self::track(unsafe { System.alloc_zeroed(layout) })
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
+        Self::track(unsafe { System.realloc(pointer, layout, size) })
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
 /// Kernel version, so the app can detect a stale `.wasm` next to newer TypeScript.
 #[wasm_bindgen(js_name = kernelVersion)]
 pub fn kernel_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Whether memory ran out. Safe to call after a trap: it touches no `Model`.
+#[wasm_bindgen(js_name = allocationFailed)]
+pub fn allocation_failed() -> bool {
+    ALLOCATION_FAILED.load(Ordering::Relaxed)
 }
 
 /// Encoded as `code|offset|message`, which the Worker turns into a `KernelError`.

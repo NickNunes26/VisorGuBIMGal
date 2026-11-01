@@ -2,7 +2,7 @@ import type { ModelId } from '../../domain/models/ModelRecord';
 import type { GeometryBatch } from '../../domain/kernel/GeometryBatch';
 import type { KernelDiagnostic, KernelErrorCode, ModelSummary } from '../../domain/kernel/KernelPort';
 import type { StreamStep, WorkerRequest, WorkerResponse } from './protocol';
-import init, { Model } from './pkg/wasm_api';
+import init, { allocationFailed, Model } from './pkg/wasm_api';
 
 /** Large enough to avoid chatter, small enough that the app stays responsive. */
 const MAX_TRIANGLES_PER_BATCH = 65536;
@@ -30,6 +30,13 @@ function current(): { modelId: ModelId; model: Model } {
 function toRequestError(error: unknown): RequestError {
   if (error instanceof RequestError) return error;
   const text = error instanceof Error ? error.message : String(error);
+  // A trap leaves the instance unusable: later calls must not reach it.
+  if (error instanceof WebAssembly.RuntimeError) {
+    open = null;
+    return allocationFailed()
+      ? new RequestError('out-of-memory', 'El modelo no cabe en la memoria disponible.')
+      : new RequestError('internal', `El kernel se ha detenido: ${text}`);
+  }
   const [code, offset, ...message] = text.split('|');
   if ((code === 'parse' || code === 'unsupported-schema') && message.length > 0) {
     return new RequestError(code, message.join('|'), offset ? Number(offset) : undefined);
