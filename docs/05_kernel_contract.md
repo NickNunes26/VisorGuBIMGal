@@ -1,6 +1,6 @@
 # 05 — Contrato del Kernel y del Renderizador
 
-**Estado:** Borrador v1, revisión 4, tras tres rondas de revisión de DeepSeek; pendiente de aceptación final (T-010). `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
+**Estado:** v1, revisión 4, aceptada por Gemini tras una revisión adversaria. Esa revisión sustituye a la de DeepSeek, sin cuota entonces, por decisión de Nick; lo que DeepSeek señale después será un cambio normal. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
 **Propósito:** Fuente única de los límites entre kernel, renderizador y aplicación.  
 **Código normativo:** [`src/domain/kernel/`](../src/domain/kernel/), [`DrawingTypes.ts`](../src/domain/drawings/DrawingTypes.ts) y [`ModelRecord.ts`](../src/domain/models/ModelRecord.ts). Si este documento y los tipos discrepan, es un error que debe corregirse.
 
