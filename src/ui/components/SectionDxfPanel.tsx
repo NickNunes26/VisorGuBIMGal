@@ -222,10 +222,11 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
             VISTA PREVIA 2D
           </div>
           <div
+            className="drawing-preview"
             style={{
               width: '100%',
               height: '180px',
-              backgroundColor: '#090d16',
+              backgroundColor: '#ffffff',
               border: '1px solid #334155',
               borderRadius: '6px',
               overflow: 'hidden',

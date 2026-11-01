@@ -262,7 +262,8 @@ impl Model {
     pub fn total_elements(&self) -> u32;
     pub fn finish_stream(&mut self) -> String;
 
-    pub fn start_drawing(&mut self, request_json: &str);
+    /// `[tipo, posición, mirada, depth, proyección, trama, ocultas, ...localToMap]`.
+    pub fn start_drawing(&mut self, request: Vec<f64>) -> Result<(), JsError>;
     pub fn next_drawing_chunk(&mut self, max_triangles: u32) -> Option<Vec<u8>>;
     pub fn finish_drawing(&mut self) -> String;
 }
@@ -270,11 +271,18 @@ impl Model {
 #[wasm_bindgen]
 impl Sheet {
     #[wasm_bindgen(constructor)]
-    pub fn new(options_json: &str) -> Result<Sheet, JsError>;
+    pub fn new(request: Vec<f64>) -> Result<Sheet, JsError>;
     pub fn add_chunk(&mut self, model_index: u32, chunk: Vec<u8>);
     pub fn drop_model(&mut self, model_index: u32);
     pub fn generate(&mut self) -> String;
-    pub fn export(&self, config_json: &str) -> Result<Vec<u8>, JsError>;
+    pub fn export(
+        &self,
+        svg: bool,
+        scale: f64,
+        show_hidden: bool,
+        show_hatching: bool,
+        comment: Option<String>,
+    ) -> Option<Vec<u8>>;
 }
 ```
 
@@ -326,14 +334,12 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 
 ### Conformidad pendiente
 
-El código aún no cumple esta revisión en los puntos siguientes. Se cierran con el cableado de planos, tras aceptar el contrato.
+El código aún no cumple esta revisión en los puntos siguientes.
 
 | Contrato | Código actual |
 |---|---|
-| Flujo de planos, `Sheet`, `start_drawing` | No existe. `WasmKernelAdapter` rechaza los planos y `HybridKernelAdapter` usa IFClite |
-| `latLng` desde un CRS verificado | El adaptador del kernel solo entrega el de `IfcSite` |
-| `units`, `crsComment`, `showHiddenLines` y `showHatching` en SVG | `cad-slicer` exporta siempre en metros, sin comentario de CRS, y el SVG no puede omitir capas |
-| `includeHiddenLines` | `cad-slicer` siempre calcula las ocultas: el cableado debe descartarlas |
+| Trama desde `IfcFillAreaStyleHatching` | No se lee: todas las tramas salen del anexo A |
+| `crsComment` | Solo llega al DXF. El SVG no admite comentarios en su lista blanca |
 
 ---
 
