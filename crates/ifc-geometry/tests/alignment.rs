@@ -557,6 +557,49 @@ fn hostile_curves_stay_bounded() {
     assert!(diagnostics.iter().any(|item| item.code == "curve-too-long"), "{diagnostics:?}");
 }
 
+/// Evaluates on a stack the size of the WASM one, where unbounded recursion would abort.
+fn on_a_small_stack(body: String) -> Vec<Diagnostic> {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || run(&body, "$").1)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn segment_placed_along_its_own_curve_stops_at_the_depth_limit() {
+    let body = format!(
+        "#60=IFCPOINTBYDISTANCEEXPRESSION(IFCLENGTHMEASURE(1.),$,$,$,#50);\n\
+         #61=IFCAXIS2PLACEMENTLINEAR(#60,$,$);\n\
+         #40=IFCCURVESEGMENT(.DISCONTINUOUS.,#61,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#908);\n\
+         #50=IFCCOMPOSITECURVE((#40),.F.);\n\
+         #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n"
+    );
+    let diagnostics = on_a_small_stack(body);
+    assert!(diagnostics.iter().any(|item| item.code == "nesting-too-deep"), "{diagnostics:?}");
+}
+
+#[test]
+fn composite_holding_itself_stops_at_the_depth_limit() {
+    let body = format!(
+        "#40=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#908);\n\
+         #41=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#50);\n\
+         #50=IFCCOMPOSITECURVE((#40,#41),.F.);\n\
+         #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n"
+    );
+    let diagnostics = on_a_small_stack(body);
+    assert!(diagnostics.iter().any(|item| item.code == "nesting-too-deep"), "{diagnostics:?}");
+}
+
+#[test]
+fn curves_offset_from_themselves_stop_at_the_depth_limit() {
+    let diagnostics = on_a_small_stack("#50=IFCOFFSETCURVE2D(#50,1.,.F.);\n#5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n".into());
+    assert!(diagnostics.iter().any(|item| item.code == "nesting-too-deep"), "{diagnostics:?}");
+    let body = "#50=IFCGRADIENTCURVE((),.F.,#50,$);\n#5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n".to_string();
+    assert!(on_a_small_stack(body).iter().any(|item| item.code == "nesting-too-deep"));
+}
+
 #[test]
 fn zero_length_segment_is_skipped() {
     let curves = "#40=IFCCURVESEGMENT(.CONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(0.),#908);\n\
