@@ -18,6 +18,11 @@ export type ProgressHandler = (phase: string, percent: number) => void;
 
 export type SchemaId = 'IFC2X3' | 'IFC4' | 'IFC4X3';
 
+/**
+ * A problem that does not stop the operation. With `expressId` it concerns that element,
+ * without it the model `modelId`, and without either a whole drawing. `code` comes from an
+ * open set: show unknown ones as they are.
+ */
 export interface KernelDiagnostic {
   severity: 'info' | 'warning' | 'error';
   code: string;
@@ -53,7 +58,7 @@ export interface ModelSummary {
   schemaIdentifier: string;
   /** Every entity in the file. */
   entityCount: number;
-  /** IfcProduct instances with a representation, excluding IfcOpeningElement. */
+  /** IfcProduct instances with a Representation, excluding IfcFeatureElementSubtraction. */
   elementCount: number;
   /** Metres per file length unit, resolved from IfcProject.UnitsInContext. */
   lengthUnitScale: number;
@@ -68,8 +73,9 @@ export type GeometryEvent =
   | { type: 'progress'; processedElements: number; totalElements: number }
   | {
       type: 'complete';
+      /** meshTable records, not elements. */
       meshCount: number;
-      /** Absolute model coordinates, undefined when the model has no geometry. */
+      /** Absolute model coordinates of everything not HiddenByDefault. Undefined if nothing is. */
       bounds?: ModelBounds;
       diagnostics: KernelDiagnostic[];
     };
@@ -92,13 +98,13 @@ export interface SpatialNode {
   elevation?: number;
   /** Ascending expressId. */
   children: SpatialNode[];
-  /** Ascending expressId. Excludes IfcOpeningElement. */
+  /** Ascending expressId. Excludes IfcFeatureElementSubtraction. */
   elements: SpatialElement[];
 }
 
 export interface SpatialTree {
   root: SpatialNode;
-  /** Products with no spatial container, ascending expressId. */
+  /** Products with no 'contains' relation, ascending expressId. */
   unassigned: SpatialElement[];
 }
 
@@ -137,14 +143,21 @@ export interface KernelPort {
     onProgress?: ProgressHandler
   ): Promise<ModelSummary>;
 
-  /** Ends with exactly one 'complete' event. closeModel ends it early without an error. */
+  /**
+   * A stream that runs to its end emits exactly one 'complete' event. closeModel ends it early
+   * with no error and no 'complete', which is how the two cases differ.
+   */
   streamGeometry(modelId: ModelId): AsyncIterable<GeometryEvent>;
 
   getElementDetails(ref: ElementRef): Promise<ElementDetails | null>;
 
   getSpatialTree(modelId: ModelId): Promise<SpatialTree | null>;
 
-  /** Cuts the given models together in the frame named by `options`. */
+  /**
+   * Cuts the given models together in the frame named by `options`, so hidden lines work
+   * across models. An empty list means every open model, in opening order. The same models
+   * in the same order give identical bytes. Rejects only when no model is left: docs/05 section 5.
+   */
   generateDrawing(
     modelIds: readonly ModelId[],
     options: DrawingOptions,

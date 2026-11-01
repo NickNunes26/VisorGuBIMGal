@@ -34,6 +34,8 @@ pub struct CoordinateReference {
     pub map_zone: Option<String>,
     pub map_unit: Option<String>,
     pub geodetic_datum: Option<String>,
+    /// Degrees counter-clockwise from project +Y, when the file declares it.
+    pub true_north: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -502,9 +504,22 @@ impl<'a> ModelData<'a> {
         ])
     }
 
+    /// Degrees counter-clockwise from project +Y. Informative only: it never enters `local_to_map`.
+    fn true_north(&self) -> Option<f64> {
+        let declared = self.file.ids_by_type("IFCGEOMETRICREPRESENTATIONCONTEXT").find_map(|id| {
+            let (context, def) = self.lookup(id)?;
+            reference(attribute(&context, &def, "TrueNorth"))
+        })?;
+        let (direction, def) = self.lookup(declared)?;
+        let ratios = list(attribute(&direction, &def, "DirectionRatios"));
+        let (x, y) = (number(ratios.first())?, number(ratios.get(1))?);
+        (x != 0.0 || y != 0.0).then(|| (-x).atan2(y).to_degrees())
+    }
+
     fn coordinate_reference(&self, diagnostics: &mut Vec<Diagnostic>) -> CoordinateReference {
         let lat_lng = self.site_lat_lng();
         let mut reference_data = CoordinateReference {
+            true_north: self.true_north(),
             crs_id: None,
             source: if lat_lng.is_some() { "ifc-site" } else { "unknown" },
             local_to_map: None,
@@ -563,16 +578,33 @@ impl<'a> ModelData<'a> {
         let abscissa = number(attribute(&conversion, &conversion_def, "XAxisAbscissa"));
         let ordinate = number(attribute(&conversion, &conversion_def, "XAxisOrdinate"));
         let theta = match (abscissa, ordinate) {
-            (Some(abscissa), Some(ordinate)) => ordinate.atan2(abscissa),
-            _ => 0.0,
+            (None, None) => 0.0,
+            (Some(abscissa), Some(ordinate)) if abscissa != 0.0 || ordinate != 0.0 => {
+                ordinate.atan2(abscissa)
+            }
+            _ => {
+                diagnostics.push(Diagnostic {
+                    code: "map-rotation-invalid",
+                    message: "the map conversion's X axis is incomplete; no rotation applied".to_string(),
+                });
+                0.0
+            }
         };
         let file_scale = self.units.length;
         let scale = match number(attribute(&conversion, &conversion_def, "Scale")) {
             Some(scale) => scale,
+            None if file_scale == map_scale => {
+                diagnostics.push(Diagnostic {
+                    code: "map-scale-default",
+                    message: "IfcMapConversion.Scale is absent; the units agree, so 1 applies".to_string(),
+                });
+                1.0
+            }
             None => {
                 diagnostics.push(Diagnostic {
-                    code: "map-scale-assumed",
-                    message: "IfcMapConversion.Scale is absent; derived from the units".to_string(),
+                    code: "map-scale-from-units",
+                    message: "IfcMapConversion.Scale is absent but the units differ; derived from them"
+                        .to_string(),
                 });
                 file_scale / map_scale
             }
@@ -581,6 +613,14 @@ impl<'a> ModelData<'a> {
             number(attribute(&conversion, &conversion_def, name)).unwrap_or(1.0)
         };
         let (factor_x, factor_y, factor_z) = (factor("FactorX"), factor("FactorY"), factor("FactorZ"));
+        // A negative factor mirrors the model, which would turn the drawings' cut loops inside out.
+        if ![scale, factor_x, factor_y, factor_z].iter().all(|value| value.is_finite() && *value > 0.0) {
+            diagnostics.push(Diagnostic {
+                code: "map-conversion-invalid",
+                message: "the map conversion's scale or factors are not positive; ignored".to_string(),
+            });
+            return reference_data;
+        }
         let offset = |name: &str| {
             number(attribute(&conversion, &conversion_def, name)).unwrap_or(0.0) * map_scale
         };

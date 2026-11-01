@@ -11,7 +11,7 @@ use spatial_tree::{
 /// Notes that change nothing the user sees. Everything else is worth a warning.
 fn severity(code: &str) -> &'static str {
     match code {
-        "map-scale-assumed" => "info",
+        "map-scale-default" => "info",
         _ => "warning",
     }
 }
@@ -51,6 +51,7 @@ impl ToJson for CoordinateReference {
             .some("mapZone", &self.map_zone)
             .some("mapUnit", &self.map_unit)
             .some("geodeticDatum", &self.geodetic_datum)
+            .some("trueNorth", &self.true_north)
             .end();
     }
 }
