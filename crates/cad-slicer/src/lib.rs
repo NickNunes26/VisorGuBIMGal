@@ -217,15 +217,16 @@ pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
             }
         }
         let span = if low.x <= high.x { (high - low).max_element() } else { 0.0 };
-        project::Occluders::new(span)
+        let triangles = meshes.iter().map(|item| item.mesh.triangles.len()).sum();
+        project::Occluders::new(span, triangles)
     });
     if let Some(grid) = grid.as_mut() {
         for item in meshes {
             let report = project::add_occluders(&item.mesh, &frame, depth, grid);
             note_projection(&mut diagnostics, item, &report);
         }
+        grid.finish();
     }
-    let mut budget = project::Budget::new();
 
     for item in meshes {
         let layer = layers
@@ -287,7 +288,6 @@ pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
                 &frame,
                 depth,
                 grid,
-                &mut budget,
                 &mut layer.visible,
                 &mut layer.hidden,
             );

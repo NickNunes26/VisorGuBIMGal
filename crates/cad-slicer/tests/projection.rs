@@ -118,3 +118,91 @@ fn a_section_projects_towards_its_look_direction() {
         }
     }
 }
+
+trait AtPlan {
+    fn with_plan(self, z: f64) -> Self;
+}
+
+impl AtPlan for DrawingOptions {
+    fn with_plan(mut self, z: f64) -> Self {
+        self.cut = Cut::Plan { z };
+        self
+    }
+}
+
+/// A row of `count` long walls, each hidden under one slab, so a lost budget shows as solid lines.
+fn stacked_walls(count: usize) -> Vec<DrawingMesh> {
+    let mut meshes = vec![DrawingMesh::new(
+        1,
+        1,
+        "roof",
+        cuboid(v(-1.0, -1.0, 90.0), v(201.0, 1001.0, 91.0)),
+    )];
+    for index in 0..count {
+        let y = index as f64;
+        let wall = cuboid(v(0.0, y, 0.0), v(200.0, y + 0.2, 3.0));
+        meshes.push(DrawingMesh::new(1, 2 + index as u32, "walls", wall));
+    }
+    meshes
+}
+
+#[test]
+fn every_edge_under_a_roof_stays_hidden_however_many_there_are() {
+    let drawing = draw(&stacked_walls(800), &options(None).with_plan(100.0));
+    let walls = layer(&drawing, "walls");
+    assert!(walls.visible.is_empty(), "{} visible runs", walls.visible.len());
+    // Each wall's outline: two 200 m sides and two 0.2 m ends.
+    let length: f64 = walls.hidden.iter().map(Segment::length).sum();
+    assert!((length - 800.0 * 400.4).abs() < 1e-6, "{length}");
+    assert!(drawing.diagnostics.is_empty(), "{:?}", drawing.diagnostics);
+}
+
+#[test]
+fn a_gap_narrower_than_any_sampling_step_is_seen() {
+    // Two slabs 1 mm apart over one long edge: only that millimetre of it is visible.
+    let meshes = vec![
+        DrawingMesh::new(1, 1, "roof", cuboid(v(0.0, -1.0, 5.0), v(4.9995, 1.0, 6.0))),
+        DrawingMesh::new(1, 2, "roof", cuboid(v(5.0005, -1.0, 5.0), v(10.0, 1.0, 6.0))),
+        DrawingMesh::new(1, 3, "bar", cuboid(v(0.0, 0.0, 0.0), v(10.0, 0.1, 1.0))),
+    ];
+    let drawing = draw(&meshes, &options(None).with_plan(7.0));
+    let bar = layer(&drawing, "bar");
+    // Two long sides show through, and the rest of the outline is hidden.
+    let seen: f64 = bar.visible.iter().map(Segment::length).sum();
+    // Within the nanometres of slack that keeps a border from flickering.
+    assert!((seen - 0.002).abs() < 1e-8, "{seen}");
+    let unseen: f64 = bar.hidden.iter().map(Segment::length).sum();
+    assert!((unseen - (20.2 - 0.002)).abs() < 1e-8, "{unseen}");
+}
+
+#[test]
+fn a_sloped_edge_goes_hidden_where_it_passes_under_a_plate() {
+    // A ramp climbing from z = 0 to z = 10 over x = 0..10, under a plate whose top is at z = 5.
+    // Seen from above, both long edges are hidden up to x = 5 and visible after it.
+    let ramp = ifc_geometry::Mesh {
+        positions: vec![v(0.0, 0.0, 0.0), v(10.0, 0.0, 10.0), v(10.0, 1.0, 10.0)],
+        triangles: vec![[0, 1, 2]],
+    };
+    let meshes = vec![
+        DrawingMesh::new(1, 1, "plate", cuboid(v(-1.0, -1.0, 4.9), v(11.0, 2.0, 5.0))),
+        DrawingMesh::new(1, 2, "ramp", ramp),
+    ];
+    let drawing = draw(&meshes, &options(None).with_plan(20.0));
+    let drawn = layer(&drawing, "ramp");
+    let diagonal = 101.0_f64.sqrt();
+    let hidden: f64 = drawn.hidden.iter().map(Segment::length).sum();
+    let visible: f64 = drawn.visible.iter().map(Segment::length).sum();
+    assert!((hidden - (5.0 + diagonal / 2.0)).abs() < 1e-5, "{hidden}");
+    assert!((visible - (5.0 + diagonal / 2.0 + 1.0)).abs() < 1e-5, "{visible}");
+}
+
+#[test]
+fn an_occluder_listed_after_what_it_hides_still_hides() {
+    // The order of the file must not matter: the box comes first here, the slab after it.
+    let mut meshes = slab_over_box();
+    meshes.reverse();
+    let drawing = draw(&meshes, &options(None));
+    let drawn = layer(&drawing, "slab");
+    assert_eq!(drawn.hidden.len(), 4, "{:?}", drawn.hidden);
+    assert!((drawn.hidden.iter().map(Segment::length).sum::<f64>() - 4.0).abs() < 1e-9);
+}
