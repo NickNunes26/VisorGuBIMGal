@@ -21,11 +21,15 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
+          components: clippy
 
       - name: Cargo check
         run: cargo check --workspace
         env:
           RUSTFLAGS: -D warnings
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Cargo test
         run: cargo test --workspace

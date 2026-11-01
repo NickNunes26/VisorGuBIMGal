@@ -429,8 +429,8 @@ pub(crate) fn build(bytes: &[u8]) -> Result<StepIndex<'_>, ParseError> {
             _ => {}
         }
 
-        if word == "FILE_SCHEMA" {
-            if scanner.peek() == Some(b'(') {
+        if word == "FILE_SCHEMA"
+            && scanner.peek() == Some(b'(') {
                 let mut parser = Parser::new(bytes, scanner.pos, bytes.len());
                 match parser.parse_outer_params() {
                     Ok(params) => {
@@ -440,7 +440,6 @@ pub(crate) fn build(bytes: &[u8]) -> Result<StepIndex<'_>, ParseError> {
                     Err(err) => skipped.push(err),
                 }
             }
-        }
 
         match scanner.skip_statement() {
             Ok(()) => {

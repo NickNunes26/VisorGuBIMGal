@@ -543,7 +543,7 @@ pub(crate) fn mesh_surface(surface: &Surface, loops: &[Vec<DVec3>], same_sense: 
     Earcut::new().earcut(points.iter().map(|point| [point.x, point.y]), &hole_starts, &mut indices);
 
     let mut clips = 0;
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let [a, b, c] = [0, 1, 2].map(|corner| points[triangle[corner] as usize]);
         let area = (b - a).perp_dot(c - a);
         if area == 0.0 {

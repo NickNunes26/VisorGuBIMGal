@@ -154,7 +154,7 @@ fn triangulate_rings(rings: &[&[DVec2]]) -> Vec<[u32; 3]> {
     Earcut::new().earcut(points.iter().copied(), &hole_starts, &mut indices);
 
     indices
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|triangle| {
             let (a, b, c) = (triangle[0], triangle[1], triangle[2]);
             let corner = |id: u32| {
@@ -1085,17 +1085,15 @@ impl<'a> ModelEvaluator<'a> {
         };
         let (from, to) = (start.and_then(number), end.and_then(number));
 
-        if from.is_some() || to.is_some() {
-            if let Some((curve, curve_def)) = self.lookup(directrix) {
-                if !by_length(start) && !by_length(end) && (curve_def.is_a("IfcCircle") || curve_def.is_a("IfcEllipse")) {
+        if (from.is_some() || to.is_some())
+            && let Some((curve, curve_def)) = self.lookup(directrix)
+                && !by_length(start) && !by_length(end) && (curve_def.is_a("IfcCircle") || curve_def.is_a("IfcEllipse")) {
                     let (frame, radii) = self.conic(&curve, &curve_def)?;
                     let angle = self.units.plane_angle;
                     let begin = from.unwrap_or(0.0) * angle;
                     let finish = to.map_or(std::f64::consts::TAU, |to| to * angle);
                     return (finish > begin).then(|| on_conic(frame, radii, begin, finish - begin));
                 }
-            }
-        }
 
         let mut path = self.curve_path(directrix, 0)?;
         if from.is_some() || to.is_some() {
@@ -1194,14 +1192,14 @@ impl<'a> ModelEvaluator<'a> {
     fn swept_disk(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
         let directrix = attribute(entity, def, "Directrix").and_then(reference)?;
         let scale = self.units.length;
-        let radius = attribute(entity, def, "Radius").and_then(number)? * scale;
+        let radius = attribute(entity, def, "Radius")
+            .and_then(number)
+            .map(|radius| radius * scale)
+            .filter(|radius| *radius > 0.0)?;
         let inner = attribute(entity, def, "InnerRadius")
             .and_then(number)
             .map(|inner| inner * scale)
             .filter(|inner| *inner > 0.0 && *inner < radius);
-        if !(radius > 0.0) {
-            return None;
-        }
         let mut path = self.curve_path(directrix, 0)?;
         let bound = |name: &str| attribute(entity, def, name).and_then(number);
         let (start, end) = (bound("StartParam"), bound("EndParam"));

@@ -623,12 +623,11 @@ impl<'a> Parser<'a> {
         };
 
         let mut bytes = Vec::with_capacity(data.len() / 2);
-        for pair in data.chunks_exact(2) {
-            if let [high, low] = pair {
-                bytes.push((high << 4) | low);
-            }
+        let (pairs, rest) = data.as_chunks::<2>();
+        for [high, low] in pairs {
+            bytes.push((high << 4) | low);
         }
-        if let Some(high) = data.chunks_exact(2).remainder().first() {
+        if let Some(high) = rest.first() {
             bytes.push(*high);
         }
         Ok(bytes)

@@ -315,7 +315,7 @@ fn attribute_name(lhs: &str) -> String {
 }
 
 /// Sort entities for case-insensitive binary search and validate the graph.
-fn finish_entity_list(entities: &mut Vec<RawEntity>) -> Result<(), String> {
+fn finish_entity_list(entities: &mut [RawEntity]) -> Result<(), String> {
     for entity in entities.iter() {
         for (name, _) in &entity.attributes {
             check_identifier(name)?;
@@ -336,7 +336,7 @@ fn finish_entity_list(entities: &mut Vec<RawEntity>) -> Result<(), String> {
         }
     }
 
-    entities.sort_by(|a, b| a.name.to_ascii_uppercase().cmp(&b.name.to_ascii_uppercase()));
+    entities.sort_by_key(|a| a.name.to_ascii_uppercase());
     for pair in entities.windows(2) {
         if pair[0].name.eq_ignore_ascii_case(&pair[1].name) {
             return Err(format!(
@@ -353,14 +353,13 @@ fn finish_entity_list(entities: &mut Vec<RawEntity>) -> Result<(), String> {
         .collect();
 
     for entity in entities.iter() {
-        if let Some(parent) = &entity.parent {
-            if !index.contains_key(&parent.to_ascii_uppercase()) {
+        if let Some(parent) = &entity.parent
+            && !index.contains_key(&parent.to_ascii_uppercase()) {
                 return Err(format!(
                     "ENTITY {} has unknown supertype {parent}",
                     entity.name
                 ));
             }
-        }
     }
 
     // Detect cycles. A depth that keeps growing past the entity count is a cycle.

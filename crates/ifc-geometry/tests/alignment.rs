@@ -231,7 +231,8 @@ fn gradient_measures_true_distance_along_a_curved_base() {
         #36=IFCCURVESEGMENT(.DISCONTINUOUS.,#32,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(160.),#908);\n\
         #50=IFCGRADIENTCURVE((#36),.F.,#49,$);\n";
     let mesh = wire(curves);
-    close(bounds(&mesh).1.z, 1.5707963, 0.002);
+    // 1% of 100 pi / 2.
+    close(bounds(&mesh).1.z, FRAC_PI_2, 0.002);
 }
 
 #[test]
@@ -569,25 +570,21 @@ fn on_a_small_stack(body: String) -> Vec<Diagnostic> {
 
 #[test]
 fn segment_placed_along_its_own_curve_stops_at_the_depth_limit() {
-    let body = format!(
-        "#60=IFCPOINTBYDISTANCEEXPRESSION(IFCLENGTHMEASURE(1.),$,$,$,#50);\n\
+    let body = "#60=IFCPOINTBYDISTANCEEXPRESSION(IFCLENGTHMEASURE(1.),$,$,$,#50);\n\
          #61=IFCAXIS2PLACEMENTLINEAR(#60,$,$);\n\
          #40=IFCCURVESEGMENT(.DISCONTINUOUS.,#61,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#908);\n\
          #50=IFCCOMPOSITECURVE((#40),.F.);\n\
-         #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n"
-    );
+         #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n".to_string();
     let diagnostics = on_a_small_stack(body);
     assert!(diagnostics.iter().any(|item| item.code == "nesting-too-deep"), "{diagnostics:?}");
 }
 
 #[test]
 fn composite_holding_itself_stops_at_the_depth_limit() {
-    let body = format!(
-        "#40=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#908);\n\
+    let body = "#40=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#908);\n\
          #41=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#50);\n\
          #50=IFCCOMPOSITECURVE((#40,#41),.F.);\n\
-         #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n"
-    );
+         #5=IFCSWEPTDISKSOLID(#50,0.1,$,$,$);\n".to_string();
     let diagnostics = on_a_small_stack(body);
     assert!(diagnostics.iter().any(|item| item.code == "nesting-too-deep"), "{diagnostics:?}");
 }
