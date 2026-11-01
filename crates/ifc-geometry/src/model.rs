@@ -466,23 +466,33 @@ fn swept_sections(profile: &Profile, path: &[DVec3], hints: &[DVec3]) -> Option<
         .collect::<Option<_>>()?;
     let (first, last) = (*runs.first()?, *runs.last()?);
     let mut across = None;
-    let mut sections = Vec::with_capacity(path.len());
+    let mut sections: Vec<Section> = Vec::with_capacity(path.len());
     for (index, at) in path.iter().enumerate() {
         let arriving = if index == 0 { first } else { runs[index - 1] };
         let leaving = runs.get(index).copied().unwrap_or(last);
         let mitre = (arriving + leaving).try_normalize().filter(|plane| plane.dot(arriving) > 0.25);
         let mitre = mitre.unwrap_or(arriving);
-        // A reference along the path gives no direction: keep the last one that did.
         let hint = hints[index];
-        let x = (hint - arriving * hint.dot(arriving)).try_normalize().or(across)?;
-        across = Some(x);
-        let y = arriving.cross(x);
-        let place = |point: &DVec2| {
-            let flat = *at + x * point.x + y * point.y;
-            flat + arriving * (*at - flat).dot(mitre) / arriving.dot(mitre)
+        // Each leg keeps its own frame up to the mitre, or it twists from one to the other.
+        let mut section_along = |run: DVec3| -> Option<Section> {
+            // A reference along the path gives no direction: keep the last one that did.
+            let x = (hint - run * hint.dot(run)).try_normalize().or(across)?;
+            across = Some(x);
+            let y = run.cross(x);
+            let place = |point: &DVec2| {
+                let flat = *at + x * point.x + y * point.y;
+                flat + run * (*at - flat).dot(mitre) / run.dot(mitre)
+            };
+            let rings = std::iter::once(&profile.outer).chain(&profile.holes);
+            Some(rings.map(|ring| ring.iter().map(place).collect()).collect())
         };
-        let rings = std::iter::once(&profile.outer).chain(&profile.holes);
-        sections.push(rings.map(|ring| ring.iter().map(place).collect()).collect());
+        let arrived = section_along(arriving)?;
+        let left = section_along(leaving)?;
+        let apart = arrived.iter().flatten().zip(left.iter().flatten()).any(|(a, b)| a.distance_squared(*b) > 1e-18);
+        sections.push(arrived);
+        if apart {
+            sections.push(left);
+        }
     }
     Some(sections)
 }
