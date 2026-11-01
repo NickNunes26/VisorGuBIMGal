@@ -1,6 +1,7 @@
 //! IFC geometry evaluation: placements, solids, meshes and booleans. Owner: Claude (T-030..T-032).
 
 pub mod csg;
+mod curves;
 pub mod mesh;
 pub mod model;
 mod nurbs;

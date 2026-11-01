@@ -4,6 +4,7 @@
 //! [`Diagnostic`], and the rest of the model carries on.
 
 use crate::csg::{intersect, subtract, subtract_all, union};
+use crate::curves::{self, Heading, Parent, Stationed};
 use crate::mesh::Mesh;
 use crate::nurbs;
 use crate::solids;
@@ -12,6 +13,7 @@ use glam::{DMat4, DVec2, DVec3, DVec4};
 use ifc_schema::units::{ProjectUnits, project_units};
 use ifc_schema::{EntityDef, Schema, SchemaId, schema};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use step_parser::{Entity, StepIndex, Value};
 
 /// Bounds placement chains and nested mapped items, which a hostile file could make cyclic.
@@ -24,6 +26,9 @@ const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 /// Consecutive profile points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
+/// Points one alignment curve may reach: far beyond a real one, and hostile files can ask
+/// for thousands of segments of thousands of points.
+const MAX_CURVE_POINTS: usize = 200_000;
 /// Face surfaces built as an exact B-spline for each face.
 const ANALYTIC_SURFACES: [&str; 5] = [
     "IfcCylindricalSurface",
@@ -62,6 +67,16 @@ pub struct ElementGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsupportedSchema;
 
+/// Where a cross-section stands along a curve.
+struct SectionMark {
+    station: f64,
+    /// To the left, up and along.
+    offsets: DVec3,
+    /// The profile's X and Y axes, relative to the curve: along, left and up.
+    x: DVec3,
+    y: DVec3,
+}
+
 #[derive(Clone)]
 struct Profile {
     outer: Vec<DVec2>,
@@ -73,6 +88,7 @@ pub struct ModelEvaluator<'a> {
     schema: &'static Schema,
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
+    curves: HashMap<u32, Rc<Stationed>>,
     openings: HashMap<u32, Vec<u32>>,
     item_colors: HashMap<u32, u32>,
     diagnostics: Vec<Diagnostic>,
@@ -542,6 +558,7 @@ impl<'a> ModelEvaluator<'a> {
             schema: tables,
             units: project_units(file, tables),
             placements: HashMap::new(),
+            curves: HashMap::new(),
             openings: HashMap::new(),
             item_colors: HashMap::new(),
             diagnostics: Vec::new(),
@@ -828,6 +845,8 @@ impl<'a> ModelEvaluator<'a> {
             self.swept_disk(entity, def)
         } else if def.is_a("IfcFixedReferenceSweptAreaSolid") || def.is_a("IfcSurfaceCurveSweptAreaSolid") {
             self.area_sweep(entity, def)
+        } else if def.is_a("IfcSectionedSolidHorizontal") {
+            self.sectioned_solid(entity, def)
         } else if def.is_a("IfcCsgPrimitive3D") {
             self.primitive(id, entity, def)
         } else if def.is_a("IfcManifoldSolidBrep") {
@@ -1339,7 +1358,8 @@ impl<'a> ModelEvaluator<'a> {
         let Some((entity, def)) = self.lookup(id) else {
             return DMat4::IDENTITY;
         };
-        if !def.is_a("IfcLocalPlacement") {
+        let along_curve = def.is_a("IfcLinearPlacement");
+        if !def.is_a("IfcLocalPlacement") && !along_curve {
             self.warn("unsupported-placement", format!("#{id} {}", def.name()));
             return DMat4::IDENTITY;
         }
@@ -1347,10 +1367,16 @@ impl<'a> ModelEvaluator<'a> {
             Some(parent) => self.placement(parent, depth + 1),
             None => DMat4::IDENTITY,
         };
-        let relative = attribute(&entity, &def, "RelativePlacement")
-            .and_then(reference)
-            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
-        let world = parent * relative;
+        let relative = attribute(&entity, &def, "RelativePlacement").and_then(reference);
+        let relative = if along_curve {
+            relative.and_then(|id| self.linear_matrix(id)).or_else(|| {
+                let fallback = attribute(&entity, &def, "CartesianPosition").and_then(reference);
+                fallback.map(|id| self.placement_matrix(id))
+            })
+        } else {
+            relative.map(|id| self.placement_matrix(id))
+        };
+        let world = parent * relative.unwrap_or(DMat4::IDENTITY);
         self.placements.insert(id, world);
         world
     }
@@ -1369,6 +1395,12 @@ impl<'a> ModelEvaluator<'a> {
             return None;
         }
         let (entity, def) = self.lookup(id)?;
+        if self.is_segmented(&entity, &def) {
+            return self.stationed(id, depth).map(|curve| curve.points.clone());
+        }
+        if def.is_a("IfcOffsetCurve2D") || def.is_a("IfcOffsetCurve3D") || def.is_a("IfcOffsetCurveByDistances") {
+            return self.offset_curve(&entity, &def, depth);
+        }
         if def.is_a("IfcPolyline") {
             list(attribute(&entity, &def, "Points"))
                 .iter()
@@ -1402,6 +1434,277 @@ impl<'a> ModelEvaluator<'a> {
             self.warn("unsupported-curve", format!("#{id} {}", def.name()));
             None
         }
+    }
+
+    /// Whether a curve is made of `IfcCurveSegment`s, as alignment curves are.
+    fn is_segmented(&self, entity: &Entity, def: &EntityDef) -> bool {
+        def.is_a("IfcGradientCurve")
+            || def.is_a("IfcSegmentedReferenceCurve")
+            || (def.is_a("IfcCompositeCurve")
+                && list(attribute(entity, def, "Segments"))
+                    .iter()
+                    .filter_map(reference)
+                    .any(|id| self.lookup(id).is_some_and(|(_, segment)| segment.is_a("IfcCurveSegment"))))
+    }
+
+    /// A curve with the true distance along it, which composites of segments know exactly.
+    fn stationed(&mut self, id: u32, depth: usize) -> Option<Rc<Stationed>> {
+        if let Some(curve) = self.curves.get(&id) {
+            return Some(curve.clone());
+        }
+        self.items_used += 1;
+        if depth >= MAX_DEPTH || self.items_used > MAX_ITEMS_PER_ELEMENT {
+            self.warn("nesting-too-deep", format!("#{id} is nested too deeply"));
+            return None;
+        }
+        let (entity, def) = self.lookup(id)?;
+        let base = attribute(&entity, &def, "BaseCurve").and_then(reference);
+        let curve = if def.is_a("IfcSegmentedReferenceCurve") {
+            self.warn("cant-ignored", format!("#{id} follows its base curve without its cant"));
+            (*self.stationed(base?, depth + 1)?).clone()
+        } else if def.is_a("IfcGradientCurve") {
+            let base = self.stationed(base?, depth + 1)?;
+            let profile = self.curve_segments(&entity, &def)?;
+            let mut profile: Vec<DVec2> = profile.points.iter().map(|point| point.truncate()).collect();
+            base.lifted(&mut profile)
+        } else if self.is_segmented(&entity, &def) {
+            self.curve_segments(&entity, &def)?
+        } else {
+            Stationed::from_path(self.curve_path(id, depth)?)
+        };
+        let curve = Rc::new(curve);
+        self.curves.insert(id, curve.clone());
+        Some(curve)
+    }
+
+    fn curve_segments(&mut self, entity: &Entity, def: &EntityDef) -> Option<Stationed> {
+        let scale = self.units.length;
+        let mut whole = Stationed::default();
+        for id in list(attribute(entity, def, "Segments")).iter().filter_map(reference) {
+            let (segment, segment_def) = self.lookup(id)?;
+            let parent = attribute(&segment, &segment_def, "ParentCurve").and_then(reference)?;
+            let run = if segment_def.is_a("IfcCurveSegment") {
+                let measure = |name: &str| attribute(&segment, &segment_def, name).and_then(number);
+                let (start, length) = (measure("SegmentStart")? * scale, measure("SegmentLength")? * scale);
+                if length == 0.0 {
+                    continue;
+                }
+                let placement = attribute(&segment, &segment_def, "Placement").and_then(reference)?;
+                let placement = self.any_placement(placement)?;
+                let parent = self.parent_curve(parent, length.abs())?;
+                curves::segment(&parent, placement, start, length)?
+            } else {
+                Stationed::from_path(self.curve_path(parent, 1)?)
+            };
+            if whole.points.len() + run.points.len() > MAX_CURVE_POINTS {
+                self.warn("curve-too-long", format!("#{id} goes past {MAX_CURVE_POINTS} points"));
+                return None;
+            }
+            whole.extend(run);
+        }
+        (whole.points.len() >= 2).then_some(whole)
+    }
+
+    /// The curve a segment cuts from. `length` is the length of that segment.
+    fn parent_curve(&mut self, id: u32, length: f64) -> Option<Parent> {
+        let (entity, def) = self.lookup(id)?;
+        let scale = self.units.length;
+        let term = |name: &str| attribute(&entity, &def, name).and_then(number).map(|value| value * scale);
+        let frame = attribute(&entity, &def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let spiral = |heading: Heading| Some(Parent::Spiral { frame, heading });
+
+        if def.is_a("IfcLine") {
+            let origin = attribute(&entity, &def, "Pnt").and_then(reference).and_then(|id| self.point(id))?;
+            let vector = attribute(&entity, &def, "Dir").and_then(reference)?;
+            let (vector, vector_def) = self.lookup(vector)?;
+            let direction = attribute(&vector, &vector_def, "Orientation")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))?
+                .try_normalize()?;
+            Some(Parent::Line { origin, direction })
+        } else if def.is_a("IfcCircle") {
+            let radius = term("Radius").filter(|radius| *radius > 0.0)?;
+            Some(Parent::Circle { frame, radius })
+        } else if def.is_a("IfcClothoid") {
+            spiral(Heading::polynomial(&[None, term("ClothoidConstant")]))
+        } else if def.is_a("IfcSecondOrderPolynomialSpiral") {
+            spiral(Heading::polynomial(&["ConstantTerm", "LinearTerm", "QuadraticTerm"].map(term)))
+        } else if def.is_a("IfcThirdOrderPolynomialSpiral") {
+            spiral(Heading::polynomial(&["ConstantTerm", "LinearTerm", "QuadraticTerm", "CubicTerm"].map(term)))
+        } else if def.is_a("IfcSeventhOrderPolynomialSpiral") {
+            spiral(Heading::polynomial(
+                &[
+                    "ConstantTerm",
+                    "LinearTerm",
+                    "QuadraticTerm",
+                    "CubicTerm",
+                    "QuarticTerm",
+                    "QuinticTerm",
+                    "SexticTerm",
+                    "SepticTerm",
+                ]
+                .map(term),
+            ))
+        } else if def.is_a("IfcCosineSpiral") {
+            let cosine = term("CosineTerm")?;
+            spiral(Heading::Cosine { constant: term("ConstantTerm"), cosine, length })
+        } else if def.is_a("IfcSineSpiral") {
+            let sine = term("SineTerm")?;
+            spiral(Heading::Sine { constant: term("ConstantTerm"), linear: term("LinearTerm"), sine, length })
+        } else if def.is_a("IfcPolynomialCurve") {
+            let coefficients = |name: &str| numbers(attribute(&entity, &def, name));
+            let (x, y, z) = (coefficients("CoefficientsX"), coefficients("CoefficientsY"), coefficients("CoefficientsZ"));
+            Some(Parent::Polynomial { frame, x, y, z, unit: scale })
+        } else {
+            self.warn("unsupported-curve", format!("#{id} {}", def.name()));
+            None
+        }
+    }
+
+    /// A placement of any kind, including one along a curve.
+    fn any_placement(&mut self, id: u32) -> Option<DMat4> {
+        let (_, def) = self.lookup(id)?;
+        if def.is_a("IfcAxis2PlacementLinear") {
+            self.linear_matrix(id)
+        } else {
+            Some(self.placement_matrix(id))
+        }
+    }
+
+    /// An `IfcPointByDistanceExpression`: its curve's id, the distance along, and the offsets
+    /// to the left, up and along.
+    fn distance_along(&self, id: u32) -> Option<(Option<u32>, f64, DVec3)> {
+        let (entity, def) = self.lookup(id)?;
+        let scale = self.units.length;
+        let measure = |name: &str| attribute(&entity, &def, name).and_then(number).unwrap_or(0.0) * scale;
+        let station = attribute(&entity, &def, "DistanceAlong").and_then(number)? * scale;
+        let offsets = DVec3::new(measure("OffsetLateral"), measure("OffsetVertical"), measure("OffsetLongitudinal"));
+        Some((attribute(&entity, &def, "BasisCurve").and_then(reference), station, offsets))
+    }
+
+    /// Where an `IfcAxis2PlacementLinear` lands, its axes taken relative to the curve there.
+    fn linear_matrix(&mut self, id: u32) -> Option<DMat4> {
+        let (entity, def) = self.lookup(id)?;
+        let location = attribute(&entity, &def, "Location").and_then(reference)?;
+        let (basis, station, offsets) = self.distance_along(location)?;
+        let curve = self.stationed(basis?, 0)?;
+        let (point, [along, left, up]) = curve.frame(station)?;
+        let origin = point + left * offsets.x + up * offsets.y + along * offsets.z;
+        let on_curve = DMat4::from_cols(along.extend(0.0), left.extend(0.0), up.extend(0.0), origin.extend(1.0));
+        Some(on_curve * self.placement_matrix(id))
+    }
+
+    fn offset_curve(&mut self, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Vec<DVec3>> {
+        let basis = attribute(entity, def, "BasisCurve").and_then(reference)?;
+        let curve = self.stationed(basis, depth + 1)?;
+        let offsets: Vec<(f64, DVec3)> = list(attribute(entity, def, "OffsetValues"))
+            .iter()
+            .filter_map(reference)
+            .filter_map(|id| self.distance_along(id).map(|(_, station, offsets)| (station, offsets)))
+            .collect();
+        let distance = attribute(entity, def, "Distance").and_then(number).unwrap_or(0.0) * self.units.length;
+        let reference_direction = attribute(entity, def, "RefDirection")
+            .and_then(reference)
+            .and_then(|id| self.direction(id))
+            .and_then(DVec3::try_normalize);
+
+        let mut sorted = offsets;
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let offset_at = |station: f64| {
+            let after = sorted.partition_point(|(at, _)| *at <= station);
+            match (after.checked_sub(1).and_then(|index| sorted.get(index)), sorted.get(after)) {
+                (Some(low), Some(high)) if high.0 > low.0 => {
+                    low.1.lerp(high.1, (station - low.0) / (high.0 - low.0))
+                }
+                (Some(point), _) | (None, Some(point)) => point.1,
+                (None, None) => DVec3::ZERO,
+            }
+        };
+        // Offsets can change between the vertices of the base, so the path bends there too.
+        let (first, last) = (*curve.stations.first()?, *curve.stations.last()?);
+        let marks = sorted.iter().map(|(at, _)| *at).filter(|at| *at > first && *at < last);
+        let mut stations: Vec<f64> = curve.stations.iter().copied().chain(marks).collect();
+        stations.sort_by(f64::total_cmp);
+        stations.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        stations
+            .iter()
+            .map(|station| {
+                let (point, [along, left, up]) = curve.frame(*station)?;
+                Some(if def.is_a("IfcOffsetCurveByDistances") {
+                    let offsets = offset_at(*station);
+                    point + left * offsets.x + up * offsets.y + along * offsets.z
+                } else if def.is_a("IfcOffsetCurve3D") {
+                    point + along.cross(reference_direction?) * distance
+                } else {
+                    point + left * distance
+                })
+            })
+            .collect()
+    }
+
+    /// One cross-section position: the distance along, the offsets, and the profile's axes
+    /// relative to the curve. X defaults to the axis across the curve, to its left.
+    fn section_mark(&mut self, id: u32) -> Option<SectionMark> {
+        let (entity, def) = self.lookup(id)?;
+        let location = attribute(&entity, &def, "Location").and_then(reference)?;
+        let (_, station, offsets) = self.distance_along(location)?;
+        let vector = |name: &str| {
+            attribute(&entity, &def, name)
+                .and_then(reference)
+                .and_then(|id| self.direction(id))
+                .and_then(DVec3::try_normalize)
+        };
+        let y = vector("Axis").unwrap_or(DVec3::Z);
+        let across = y.cross(DVec3::X).try_normalize().unwrap_or(DVec3::Y);
+        let x = vector("RefDirection")
+            .filter(|hint| hint.x.abs() < 0.999)
+            .and_then(|hint| (hint - y * hint.dot(y)).try_normalize())
+            .unwrap_or(across);
+        Some(SectionMark { station, offsets, x, y })
+    }
+
+    fn sectioned_solid(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let ids = |name: &str| -> Vec<u32> { list(attribute(entity, def, name)).iter().filter_map(reference).collect() };
+        let (sections, positions) = (ids("CrossSections"), ids("CrossSectionPositions"));
+        if sections.len() != positions.len() || sections.len() < 2 {
+            self.warn("bad-sections", "cross sections and positions do not pair up".into());
+            return None;
+        }
+        let directrix = attribute(entity, def, "Directrix").and_then(reference)?;
+        let curve = self.stationed(directrix, 0)?;
+        let marks: Vec<SectionMark> = positions.iter().map(|id| self.section_mark(*id)).collect::<Option<_>>()?;
+        let profiles: Vec<Vec<Profile>> = sections.iter().map(|id| self.profiles(*id, 0)).collect::<Option<_>>()?;
+
+        let mut parts = Vec::new();
+        for span in 0..marks.len() - 1 {
+            let (first, second) = (&marks[span], &marks[span + 1]);
+            let pairs = section_pairs(&profiles[span], &profiles[span + 1]).filter(|_| second.station > first.station);
+            let Some(pairs) = pairs else {
+                self.warn("bad-sections", "consecutive sections do not match or do not advance".into());
+                return None;
+            };
+            let inner = curve.stations.iter().copied().filter(|at| *at > first.station && *at < second.station);
+            let stations: Vec<f64> = std::iter::once(first.station).chain(inner).chain([second.station]).collect();
+            for (start, end) in &pairs {
+                let sections: Vec<Section> = stations
+                    .iter()
+                    .map(|station| {
+                        let share = (station - first.station) / (second.station - first.station);
+                        let (point, [along, left, up]) = curve.frame(*station)?;
+                        let world = |local: DVec3| along * local.x + left * local.y + up * local.z;
+                        let offsets = first.offsets.lerp(second.offsets, share);
+                        let origin = point + left * offsets.x + up * offsets.y + along * offsets.z;
+                        let x = world(first.x.lerp(second.x, share)).try_normalize()?;
+                        let y = world(first.y.lerp(second.y, share)).try_normalize()?;
+                        Some(blended(start, end, share, |flat| origin + x * flat.x + y * flat.y))
+                    })
+                    .collect::<Option<_>>()?;
+                parts.push(loft(&sections)?);
+            }
+        }
+        Some(merged(parts.into_iter()))
     }
 
     fn bspline_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {

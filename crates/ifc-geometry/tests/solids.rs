@@ -817,6 +817,11 @@ fn fixtures_that_use_these_solids_now_evaluate() {
             assert!(area(99, &mut evaluator) > 200.529 * 0.995);
             assert!(area(21, &mut evaluator) > 1062.851 * 0.99);
         }
+        if name == "alignment-sweeps" {
+            // Every solid but the alignment, which has an axis and no body.
+            assert_eq!(solids, ids.len() - 1);
+            assert!(codes.is_empty(), "{name}: {codes:?}");
+        }
         if ["bath-csg-solid", "beam-revolved-solid", "boolean-clipping-halfspace", "reinforcing-stirrup", "geographic-referencing", "basin-advanced-brep", "bspline-surface", "bspline-profile-csg"]
             .contains(&name.as_str())
         {
