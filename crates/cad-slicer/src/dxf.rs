@@ -13,11 +13,13 @@ const MAX_VALUE: usize = 255;
 /// Longest R12 layer name.
 const MAX_LAYER: usize = 31;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DxfOptions {
     /// Dashed geometry goes on its own layer.
     pub include_hidden: bool,
     pub include_hatch: bool,
+    /// Written as a 999 comment at the top of the file, sanitised like any group value.
+    pub comment: Option<String>,
 }
 
 impl Default for DxfOptions {
@@ -25,6 +27,7 @@ impl Default for DxfOptions {
         Self {
             include_hidden: true,
             include_hatch: true,
+            comment: None,
         }
     }
 }
@@ -53,6 +56,9 @@ pub fn to_dxf_with(drawing: &Drawing, options: &DxfOptions) -> Vec<u8> {
     }
 
     let mut out = Writer::default();
+    if let Some(comment) = &options.comment {
+        out.text(999, comment);
+    }
     out.header(drawing);
     out.layer_table(&layers);
     out.section("ENTITIES");

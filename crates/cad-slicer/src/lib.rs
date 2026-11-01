@@ -97,6 +97,25 @@ pub struct Drawing {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+impl Drawing {
+    /// The same drawing in other units, for an export in millimetres.
+    pub fn scaled(&self, factor: f64) -> Self {
+        let segments = |list: &[Segment]| -> Vec<Segment> {
+            list.iter().map(|item| Segment::new(item.a * factor, item.b * factor)).collect()
+        };
+        let mut scaled = self.clone();
+        for layer in &mut scaled.layers {
+            for ring in &mut layer.loops {
+                ring.points.iter_mut().for_each(|point| *point *= factor);
+            }
+            layer.visible = segments(&layer.visible);
+            layer.hidden = segments(&layer.hidden);
+            layer.hatch = segments(&layer.hatch);
+        }
+        scaled
+    }
+}
+
 /// Collects one diagnostic per element and code: a mesh with a million bad triangles must not
 /// fill memory with a million identical lines.
 pub(crate) struct Diagnostics {

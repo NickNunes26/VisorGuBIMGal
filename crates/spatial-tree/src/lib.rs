@@ -952,6 +952,34 @@ impl<'a> ModelData<'a> {
         Some(info)
     }
 
+    /// The element's own assignment wins over its type's.
+    fn element_material(&self, id: u32, type_id: Option<u32>) -> Option<MaterialInfo> {
+        match (self.relations.materials.get(&id), type_id) {
+            (Some(material), _) => self.material(*material, true, 0),
+            (None, Some(type_id)) => self
+                .relations
+                .materials
+                .get(&type_id)
+                .and_then(|material| self.material(*material, false, 0)),
+            (None, None) => None,
+        }
+    }
+
+    /// The drawing layer of `docs/05` section 5: the material's name, then its first member's,
+    /// then the IFC class.
+    pub fn layer_name(&self, id: u32, type_name: &str) -> String {
+        let type_id = self.relations.types.get(&id).copied();
+        self.element_material(id, type_id)
+            .and_then(|info| {
+                let first_layer = info.layers.first().and_then(|layer| layer.material.clone());
+                let first_profile = info.profiles.first().and_then(|profile| profile.material.clone());
+                let first_part = info.constituents.first().and_then(|part| part.material.clone());
+                info.name.or(first_layer).or(first_profile).or(first_part)
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| type_name.to_string())
+    }
+
     pub fn element_details(&self, id: u32) -> Option<ElementDetails> {
         let (entity, def) = self.lookup(id)?;
         let attributes = def
@@ -991,15 +1019,7 @@ impl<'a> ModelData<'a> {
             }
         }
 
-        let material = match (self.relations.materials.get(&id), type_id) {
-            (Some(material), _) => self.material(*material, true, 0),
-            (None, Some(type_id)) => self
-                .relations
-                .materials
-                .get(&type_id)
-                .and_then(|material| self.material(*material, false, 0)),
-            (None, None) => None,
-        };
+        let material = self.element_material(id, type_id);
 
         Some(ElementDetails {
             express_id: id,

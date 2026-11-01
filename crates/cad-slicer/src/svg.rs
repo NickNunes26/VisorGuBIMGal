@@ -8,11 +8,23 @@ use crate::text::xml_text;
 use crate::{Drawing, Loop, Segment};
 use glam::DVec2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SvgOptions {
     /// Writes one line of text per layer below the drawing. Off by default: a drawing for a
     /// customer does not carry its layer list.
     pub layer_labels: bool,
+    pub include_hidden: bool,
+    pub include_hatch: bool,
+}
+
+impl Default for SvgOptions {
+    fn default() -> Self {
+        Self {
+            layer_labels: false,
+            include_hidden: true,
+            include_hatch: true,
+        }
+    }
 }
 
 /// Share of the drawing's longest side left blank around it.
@@ -75,7 +87,7 @@ pub fn to_svg_with(drawing: &Drawing, options: &SvgOptions) -> String {
     }
     out.push_str("</g>\n");
 
-    if named.iter().any(|layer| !layer.hidden.is_empty()) {
+    if options.include_hidden && named.iter().any(|layer| !layer.hidden.is_empty()) {
         out.push_str(&format!(
             "<g fill=\"none\" stroke=\"#8a8a8a\" stroke-width=\"{}\" stroke-dasharray=\"{} {}\">\n",
             number(stroke),
@@ -94,7 +106,7 @@ pub fn to_svg_with(drawing: &Drawing, options: &SvgOptions) -> String {
         out.push_str("</g>\n");
     }
 
-    if named.iter().any(|layer| !layer.hatch.is_empty()) {
+    if options.include_hatch && named.iter().any(|layer| !layer.hatch.is_empty()) {
         out.push_str(&format!(
             "<g fill=\"none\" stroke=\"#555555\" stroke-width=\"{}\">\n",
             number(stroke * 0.6)

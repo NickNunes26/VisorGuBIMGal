@@ -103,7 +103,7 @@ fn only_whitelisted_elements_and_attributes_appear() {
 fn a_hostile_layer_name_is_escaped_text_and_nothing_else() {
     let hostile = "Evil <script>alert(\"x\")</script> & 'quoted'";
     let drawing = drawing_with(hostile);
-    let options = SvgOptions { layer_labels: true };
+    let options = SvgOptions { layer_labels: true, ..SvgOptions::default() };
     let svg = to_svg_with(&drawing, &options);
 
     assert!(!svg.contains("<script"), "the name opened an element");
@@ -126,7 +126,7 @@ fn a_hostile_layer_name_is_escaped_text_and_nothing_else() {
 #[test]
 fn control_characters_are_removed() {
     let drawing = drawing_with("Muro\u{0001}\u{0007}Alto");
-    let svg = to_svg_with(&drawing, &SvgOptions { layer_labels: true });
+    let svg = to_svg_with(&drawing, &SvgOptions { layer_labels: true, ..SvgOptions::default() });
     assert!(svg.contains(">MuroAlto<"), "{svg}");
     assert!(!svg.contains('\u{0001}'));
 }

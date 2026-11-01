@@ -144,6 +144,7 @@ fn hidden_lines_go_to_their_own_layer() {
         &DxfOptions {
             include_hidden: false,
             include_hatch: true,
+            ..DxfOptions::default()
         },
     );
     assert!(!String::from_utf8_lossy(&plain).contains("HIDDEN"));
@@ -217,6 +218,7 @@ fn hatch_lines_are_written_as_entities() {
         &DxfOptions {
             include_hidden: true,
             include_hatch: false,
+            ..DxfOptions::default()
         },
     ))
     .iter()

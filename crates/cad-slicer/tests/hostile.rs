@@ -214,7 +214,7 @@ fn a_hostile_layer_name_cannot_break_the_exporters() {
     assert!(dxf.windows(2).any(|window| window == b"\r\n"));
     assert!(dxf.ends_with(b"EOF\r\n"));
 
-    let svg = to_svg_with(&drawing, &SvgOptions { layer_labels: true });
+    let svg = to_svg_with(&drawing, &SvgOptions { layer_labels: true, ..SvgOptions::default() });
     assert!(!svg.contains("<script"));
     assert!(svg.contains("&lt;script&gt;"));
     assert!(svg.contains("&amp;"));

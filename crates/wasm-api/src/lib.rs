@@ -1,10 +1,12 @@
 //! WebAssembly facade of the kernel. Owner: Claude (T-033). Contract: `docs/05_kernel_contract.md`.
 
 pub mod batches;
+pub mod drawing;
 mod encode;
 mod json;
 pub mod loaded;
 
+use drawing::{DrawingRequest, ExportOptions, SheetStore};
 use loaded::{LoadedModel, OpenError};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,6 +129,69 @@ impl Model {
     #[wasm_bindgen(js_name = finishStream)]
     pub fn finish_stream(&mut self) -> String {
         self.inner.finish_stream()
+    }
+
+    /// The numbers of `DrawingRequest::decode`.
+    #[wasm_bindgen(js_name = startDrawing)]
+    pub fn start_drawing(&mut self, request: Vec<f64>) -> Result<(), JsError> {
+        let request = DrawingRequest::decode(&request).ok_or_else(bad_request)?;
+        self.inner.start_drawing(request);
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = nextDrawingChunk)]
+    pub fn next_drawing_chunk(&mut self, max_triangles: u32) -> Option<Vec<u8>> {
+        self.inner.next_drawing_chunk(max_triangles as usize)
+    }
+
+    #[wasm_bindgen(js_name = finishDrawing)]
+    pub fn finish_drawing(&mut self) -> String {
+        self.inner.finish_drawing()
+    }
+}
+
+fn bad_request() -> JsError {
+    JsError::new("internal||malformed drawing request")
+}
+
+/// One drawing, in a Worker of its own. See `docs/05` section 6.
+#[wasm_bindgen]
+pub struct Sheet {
+    inner: SheetStore,
+}
+
+#[wasm_bindgen]
+impl Sheet {
+    #[wasm_bindgen(constructor)]
+    pub fn new(request: Vec<f64>) -> Result<Sheet, JsError> {
+        let request = DrawingRequest::decode(&request).ok_or_else(bad_request)?;
+        Ok(Sheet { inner: SheetStore::new(request) })
+    }
+
+    #[wasm_bindgen(js_name = addChunk)]
+    pub fn add_chunk(&mut self, model_index: u32, chunk: Vec<u8>) {
+        self.inner.add_chunk(model_index, &chunk);
+    }
+
+    #[wasm_bindgen(js_name = dropModel)]
+    pub fn drop_model(&mut self, model_index: u32) {
+        self.inner.drop_model(model_index);
+    }
+
+    pub fn generate(&mut self) -> String {
+        self.inner.generate()
+    }
+
+    /// `None` before `generate`.
+    pub fn export(
+        &self,
+        svg: bool,
+        scale: f64,
+        show_hidden: bool,
+        show_hatching: bool,
+        comment: Option<String>,
+    ) -> Option<Vec<u8>> {
+        self.inner.export(&ExportOptions { svg, scale, show_hidden, show_hatching, comment })
     }
 }
 

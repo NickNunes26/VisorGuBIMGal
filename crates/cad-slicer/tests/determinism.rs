@@ -56,7 +56,7 @@ fn two_runs_give_the_same_dxf_bytes() {
 
 #[test]
 fn two_runs_give_the_same_svg() {
-    let svg = SvgOptions { layer_labels: true };
+    let svg = SvgOptions { layer_labels: true, ..SvgOptions::default() };
     let first = to_svg_with(&draw(&scene(), &options()), &svg);
     let second = to_svg_with(&draw(&scene(), &options()), &svg);
     assert_eq!(first, second);

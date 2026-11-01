@@ -7,12 +7,16 @@ import {
   type ExportedDrawing,
   type GeneratedDrawing,
   type GeometryEvent,
+  type KernelDiagnostic,
   type KernelPort,
   type ModelSummary,
   type ProgressHandler,
   type SpatialTree
 } from '../../domain/kernel/KernelPort';
-import type { StreamStep, WorkerRequest, WorkerResponse } from './protocol';
+import { mapToLatLng } from '../../domain/coordinates/Coordinates';
+import type { CoordinateReference } from '../../domain/models/ModelRecord';
+import { drawingRequest, frameModels } from './drawingRequest';
+import type { SheetDiagnostic, StreamStep, WorkerRequest, WorkerResponse } from './protocol';
 
 interface Pending {
   resolve(value: unknown): void;
@@ -64,9 +68,28 @@ class ModelWorker {
   }
 }
 
-/** Our Rust kernel. Drawings arrive with T-050. */
+/** A verified map conversion is surveyed, while IfcSite is often approximate: docs/05 section 2. */
+function withMapPosition(reference: CoordinateReference): CoordinateReference {
+  const { confidence, crsId, localToMap } = reference;
+  if (confidence !== 'verified' || !crsId || !localToMap) return reference;
+  const latLng = mapToLatLng(crsId, localToMap[12], localToMap[13]);
+  return latLng ? { ...reference, latLng } : reference;
+}
+
+const lostModel = (modelId: ModelId): KernelDiagnostic => ({
+  severity: 'warning',
+  code: 'drawing-model-lost',
+  message: 'El modelo no está disponible y se omite del plano.',
+  modelId
+});
+
+/** Our Rust kernel. Every model and every drawing has its own Worker and WASM instance. */
 export class WasmKernelAdapter implements KernelPort {
   private workers = new Map<ModelId, ModelWorker>();
+  private references = new Map<ModelId, CoordinateReference>();
+  private sheets = new Map<DrawingId, ModelWorker>();
+  private nextDrawing = 0;
+  private drawings: Promise<unknown> = Promise.resolve();
 
   private workerOf(modelId: ModelId): ModelWorker {
     const worker = this.workers.get(modelId);
@@ -86,9 +109,11 @@ export class WasmKernelAdapter implements KernelPort {
     this.workers.set(modelId, worker);
     onProgress?.('Analizando IFC', 0);
     try {
-      const summary = await worker.call<ModelSummary>({ op: 'open', modelId, bytes }, [bytes]);
+      const opened = await worker.call<ModelSummary>({ op: 'open', modelId, bytes }, [bytes]);
+      const coordinateReference = withMapPosition(opened.coordinateReference);
+      this.references.set(modelId, coordinateReference);
       onProgress?.('Analizando IFC', 100);
-      return summary;
+      return { ...opened, coordinateReference };
     } catch (error) {
       await this.closeModel(modelId);
       throw error;
@@ -144,22 +169,124 @@ export class WasmKernelAdapter implements KernelPort {
     }
   }
 
+  /** One at a time: a model holds one drawing state. Failures must not stop the queue. */
   generateDrawing(
-    _modelIds: readonly ModelId[],
-    _options: DrawingOptions,
-    _onProgress?: ProgressHandler
+    modelIds: readonly ModelId[],
+    options: DrawingOptions,
+    onProgress?: ProgressHandler
   ): Promise<GeneratedDrawing> {
-    return Promise.reject(new KernelError('internal', 'Planos pendientes de T-050.'));
+    const run = this.drawings.then(() => this.draw(modelIds, options, onProgress));
+    this.drawings = run.catch(() => undefined);
+    return run;
   }
 
-  exportDrawing(_drawingId: DrawingId, _config: DrawingExportConfig): Promise<ExportedDrawing> {
-    return Promise.reject(new KernelError('drawing-not-found', 'Planos pendientes de T-050.'));
+  /** Pulls a model's chunks into the sheet. A failure on the model's side loses that model only. */
+  private async relay(
+    worker: ModelWorker,
+    sheet: ModelWorker,
+    index: number,
+    request: number[]
+  ): Promise<KernelDiagnostic[] | null> {
+    try {
+      await worker.call({ op: 'draw-start', request });
+    } catch {
+      return null;
+    }
+    for (;;) {
+      let chunk: ArrayBuffer | null;
+      try {
+        chunk = await worker.call<ArrayBuffer | null>({ op: 'draw-next' });
+      } catch {
+        await sheet.call({ op: 'sheet-drop', modelIndex: index });
+        return null;
+      }
+      if (!chunk) break;
+      // Waiting here is the backpressure: nothing piles up in the message queue.
+      await sheet.call({ op: 'sheet-add', modelIndex: index, chunk }, [chunk]);
+    }
+    try {
+      return await worker.call<KernelDiagnostic[]>({ op: 'draw-finish' });
+    } catch {
+      await sheet.call({ op: 'sheet-drop', modelIndex: index });
+      return null;
+    }
   }
 
-  async discardDrawing(_drawingId: DrawingId): Promise<void> {}
+  private async draw(
+    modelIds: readonly ModelId[],
+    options: DrawingOptions,
+    onProgress?: ProgressHandler
+  ): Promise<GeneratedDrawing> {
+    const listed = modelIds.length > 0 ? modelIds : Array.from(this.workers.keys());
+    const models = listed.map((modelId) => ({ modelId, reference: this.references.get(modelId) }));
+    const { included, crsId, diagnostics } = frameModels(options.frame, models);
+
+    const sheet = new ModelWorker();
+    try {
+      await sheet.call({ op: 'sheet-new', request: drawingRequest(options) });
+      const kept = new Map<number, ModelId>();
+      for (const [done, { index, modelId, localToMap }] of included.entries()) {
+        onProgress?.('Cortando modelos', Math.round((done / included.length) * 90));
+        const worker = this.workers.get(modelId);
+        const request = drawingRequest(options, localToMap);
+        const found = worker ? await this.relay(worker, sheet, index, request) : null;
+        if (found) {
+          kept.set(index, modelId);
+          diagnostics.push(...found.map((diagnostic) => ({ ...diagnostic, modelId })));
+        } else {
+          diagnostics.push(lostModel(modelId));
+        }
+      }
+      if (kept.size === 0) {
+        throw new KernelError('model-not-open', 'Ningún modelo disponible para el plano.');
+      }
+
+      onProgress?.('Generando plano', 95);
+      const report = await sheet.call<SheetDiagnostic[]>({ op: 'sheet-generate' });
+      for (const { modelIndex, ...diagnostic } of report) {
+        const modelId = modelIndex === undefined ? undefined : kept.get(modelIndex);
+        diagnostics.push(modelId ? { ...diagnostic, modelId } : diagnostic);
+      }
+      onProgress?.('Generando plano', 100);
+
+      const drawingId = `drawing-${this.nextDrawing++}`;
+      this.sheets.set(drawingId, sheet);
+      return { drawingId, frame: options.frame, crsId, diagnostics };
+    } catch (error) {
+      sheet.terminate();
+      throw error;
+    }
+  }
+
+  async exportDrawing(drawingId: DrawingId, config: DrawingExportConfig): Promise<ExportedDrawing> {
+    const sheet = this.sheets.get(drawingId);
+    if (!sheet) throw new KernelError('drawing-not-found', 'El plano ya no existe.');
+    const svg = config.format === 'svg';
+    const bytes = await sheet.call<Uint8Array>({
+      op: 'sheet-export',
+      svg,
+      scale: config.units === 'mm' ? 1000 : 1,
+      showHidden: config.showHiddenLines,
+      showHatching: config.showHatching,
+      comment: config.crsComment
+    });
+    return svg
+      ? {
+          content: new TextDecoder().decode(bytes),
+          mimeType: 'image/svg+xml',
+          filename: `${config.fileName}.svg`
+        }
+      : { content: bytes, mimeType: 'application/dxf', filename: `${config.fileName}.dxf` };
+  }
+
+  async discardDrawing(drawingId: DrawingId): Promise<void> {
+    this.sheets.get(drawingId)?.terminate();
+    this.sheets.delete(drawingId);
+  }
 
   async closeModel(modelId: ModelId): Promise<void> {
     this.workers.get(modelId)?.terminate();
     this.workers.delete(modelId);
+    this.references.delete(modelId);
   }
 }

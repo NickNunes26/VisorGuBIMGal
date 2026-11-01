@@ -1,6 +1,6 @@
 //! JSON shapes of `src/domain/kernel/KernelPort.ts` and `src/domain/models/ModelRecord.ts`.
 
-use crate::json::{Object, ToJson};
+use crate::json::{Object, ToJson, to_json};
 use ifc_geometry::Diagnostic as GeometryDiagnostic;
 use spatial_tree::{
     AttributeValue, CoordinateReference, Diagnostic, ElementDetails, MaterialConstituent,
@@ -9,7 +9,7 @@ use spatial_tree::{
 };
 
 /// Notes that change nothing the user sees. Everything else is worth a warning.
-fn severity(code: &str) -> &'static str {
+pub(crate) fn severity(code: &str) -> &'static str {
     match code {
         "map-scale-default" => "info",
         _ => "warning",
@@ -344,6 +344,10 @@ impl ToJson for Bounds {
             .field("max", &Point(self.1))
             .end();
     }
+}
+
+pub fn diagnostics_json(diagnostics: &[&GeometryDiagnostic]) -> String {
+    to_json(diagnostics)
 }
 
 /// The closing event of a geometry stream, without its `type`.

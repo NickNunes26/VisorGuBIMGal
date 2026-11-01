@@ -1,7 +1,8 @@
 //! An open model: its bytes, its index, and everything that borrows them.
 
 use crate::batches::{Batch, GeometryStream};
-use crate::encode::complete_json;
+use crate::drawing::{DrawingRequest, DrawingStream};
+use crate::encode::{complete_json, diagnostics_json};
 use crate::json::to_json;
 use ifc_geometry::ModelEvaluator;
 use spatial_tree::ModelData;
@@ -60,6 +61,7 @@ struct ActiveStream {
 
 pub struct LoadedModel {
     stream: Option<ActiveStream>,
+    drawing: Option<DrawingStream>,
     data: ModelData<'static>,
     file: &'static StepIndex<'static>,
     _allocation: Allocation,
@@ -72,7 +74,7 @@ impl LoadedModel {
             let identifiers = file.schema_identifiers().iter().map(ToString::to_string).collect();
             return Err(OpenError::UnsupportedSchema(identifiers));
         };
-        Ok(Self { stream: None, data, file, _allocation: allocation })
+        Ok(Self { stream: None, drawing: None, data, file, _allocation: allocation })
     }
 
     pub fn summary_json(&self) -> String {
@@ -106,6 +108,27 @@ impl LoadedModel {
 
     pub fn total_elements(&self) -> usize {
         self.stream.as_ref().map_or(0, |active| active.stream.total())
+    }
+
+    /// Its own evaluator, so a drawing can interleave with a geometry stream.
+    pub fn start_drawing(&mut self, request: DrawingRequest) {
+        self.drawing = ModelEvaluator::new(self.file)
+            .ok()
+            .map(|evaluator| DrawingStream::new(evaluator, request));
+    }
+
+    pub fn next_drawing_chunk(&mut self, max_triangles: usize) -> Option<Vec<u8>> {
+        self.drawing.as_mut()?.next_chunk(&self.data, max_triangles)
+    }
+
+    /// Ends the drawing, frees its caches, and returns its diagnostics as JSON.
+    pub fn finish_drawing(&mut self) -> String {
+        let drawing = self.drawing.take();
+        let diagnostics: Vec<_> = drawing
+            .iter()
+            .flat_map(|drawing| drawing.evaluator().diagnostics())
+            .collect();
+        diagnostics_json(&diagnostics)
     }
 
     /// Ends the stream, frees its caches, and returns the closing event.
