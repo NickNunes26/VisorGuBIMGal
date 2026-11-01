@@ -2272,6 +2272,7 @@ impl<'a> ModelEvaluator<'a> {
                 }
             }
         }
+        builder.mesh.orient_shell();
         (!builder.mesh.is_empty()).then_some(builder.mesh)
     }
 

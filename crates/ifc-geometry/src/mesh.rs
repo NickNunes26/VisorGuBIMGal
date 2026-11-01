@@ -100,4 +100,97 @@ impl Mesh {
         }
         balance.values().map(|count| count.unsigned_abs() as usize).sum()
     }
+
+    /// Makes a shell agree with itself: faces across a shared edge wind the same way, a closed
+    /// part winds outward, and an open part keeps the way most of its area faces. Real files
+    /// write faces of one shell in both directions. An edge of three or more faces joins nothing.
+    pub fn orient_shell(&mut self) {
+        let mut edges: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        for (index, [a, b, c]) in self.triangles.iter().enumerate() {
+            for (from, to) in [(*a, *b), (*b, *c), (*c, *a)] {
+                edges.entry((from.min(to), from.max(to))).or_default().push(index as u32);
+            }
+        }
+        let mut flip = vec![false; self.triangles.len()];
+        let mut seen = vec![false; self.triangles.len()];
+        for start in 0..self.triangles.len() {
+            if seen[start] {
+                continue;
+            }
+            seen[start] = true;
+            let mut part = vec![start];
+            let mut closed = true;
+            // Grows while it is walked: an explicit list, because recursion would grow with the
+            // file and the WASM stack is 1 MB.
+            let mut next = 0;
+            while next < part.len() {
+                let current = part[next];
+                next += 1;
+                let [a, b, c] = self.triangles[current];
+                for (from, to) in [(a, b), (b, c), (c, a)] {
+                    let users = &edges[&(from.min(to), from.max(to))];
+                    let [one, two] = users.as_slice() else {
+                        closed = false;
+                        continue;
+                    };
+                    let other = if *one as usize == current { *two } else { *one } as usize;
+                    if seen[other] {
+                        continue;
+                    }
+                    seen[other] = true;
+                    // Neighbours that agree run along their shared edge in opposite directions.
+                    let same_way = self.runs(other, from, to);
+                    flip[other] = same_way != flip[current];
+                    part.push(other);
+                }
+            }
+            self.settle(&part, closed, &mut flip);
+        }
+        for (triangle, flip) in self.triangles.iter_mut().zip(flip) {
+            if flip {
+                triangle.swap(1, 2);
+            }
+        }
+    }
+
+    /// Whether a triangle runs along `from` to `to`, rather than the other way.
+    fn runs(&self, triangle: usize, from: u32, to: u32) -> bool {
+        let [a, b, c] = self.triangles[triangle];
+        [(a, b), (b, c), (c, a)].contains(&(from, to))
+    }
+
+    /// Chooses the direction of one connected part, whose flips so far agree with its first.
+    fn settle(&self, part: &[usize], closed: bool, flip: &mut [bool]) {
+        let corners = |index: usize| {
+            let [a, b, c] = self.triangles[index].map(|id| self.positions[id as usize]);
+            if flip[index] { [a, c, b] } else { [a, b, c] }
+        };
+        let turn = if closed {
+            let pivot = corners(part[0])[0];
+            let six_volume: f64 = part
+                .iter()
+                .map(|index| {
+                    let [a, b, c] = corners(*index);
+                    (a - pivot).dot((b - pivot).cross(c - pivot))
+                })
+                .sum();
+            six_volume < 0.0
+        } else {
+            let area = |turned: bool| -> f64 {
+                part.iter()
+                    .filter(|index| flip[**index] == turned)
+                    .map(|index| {
+                        let [a, b, c] = corners(*index);
+                        (b - a).cross(c - a).length()
+                    })
+                    .sum()
+            };
+            area(true) > area(false)
+        };
+        if turn {
+            for index in part {
+                flip[*index] = !flip[*index];
+            }
+        }
+    }
 }

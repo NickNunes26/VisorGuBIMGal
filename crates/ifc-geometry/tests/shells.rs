@@ -1,0 +1,173 @@
+//! Shells whose faces disagree about which way is out, as real exporters write them.
+
+use glam::DVec3;
+use ifc_geometry::{Mesh, ModelEvaluator};
+use step_parser::index;
+
+const CORNERS: &str = "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+    #2=IFCWALL('w',$,$,$,$,$,#3,$);\n\
+    #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+    #4=IFCSHAPEREPRESENTATION($,'Body','SurfaceModel',(#5));\n\
+    #10=IFCCARTESIANPOINT((0.,0.,0.));\n\
+    #11=IFCCARTESIANPOINT((1.,0.,0.));\n\
+    #12=IFCCARTESIANPOINT((1.,2.,0.));\n\
+    #13=IFCCARTESIANPOINT((0.,2.,0.));\n\
+    #14=IFCCARTESIANPOINT((0.,0.,3.));\n\
+    #15=IFCCARTESIANPOINT((1.,0.,3.));\n\
+    #16=IFCCARTESIANPOINT((1.,2.,3.));\n\
+    #17=IFCCARTESIANPOINT((0.,2.,3.));\n";
+
+/// A 1 by 2 by 3 box of six faces. `top` is the top face's loop, outward when `#14,#15,#16,#17`.
+fn faces(top: &str) -> String {
+    let loops = [
+        "#10,#13,#12,#11".to_string(),
+        top.to_string(),
+        "#10,#11,#15,#14".to_string(),
+        "#11,#12,#16,#15".to_string(),
+        "#12,#13,#17,#16".to_string(),
+        "#13,#10,#14,#17".to_string(),
+    ];
+    let mut text = String::new();
+    for (index, points) in loops.iter().enumerate() {
+        let at = 20 + index * 3;
+        text += &format!(
+            "#{at}=IFCPOLYLOOP(({points}));\n#{}=IFCFACEOUTERBOUND(#{at},.T.);\n#{}=IFCFACE((#{}));\n",
+            at + 1,
+            at + 2,
+            at + 1
+        );
+    }
+    text + "#40=IFCCONNECTEDFACESET((#22,#25,#28,#31,#34,#37));\n"
+}
+
+fn evaluate(body: &str) -> Mesh {
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC2X3'));ENDSEC;DATA;\n{CORNERS}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let element = evaluator.evaluate(2).expect("the element evaluates");
+    element.meshes.into_iter().next().expect("a mesh").mesh
+}
+
+fn close(actual: f64, expected: f64) {
+    assert!((actual - expected).abs() <= 1e-9, "{actual} against {expected}");
+}
+
+#[test]
+fn a_surface_model_with_one_face_written_backwards_closes_outward() {
+    let body = faces("#17,#16,#15,#14") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let mesh = evaluate(&body);
+    close(mesh.volume(), 6.0);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn a_shell_written_inside_out_turns_outward() {
+    let body = "#41=IFCCLOSEDSHELL((#22,#25,#28,#31,#34,#37));\n#5=IFCFACETEDBREP(#41);\n";
+    // Every face reversed, by the flag on each bound.
+    let inverted = faces("#14,#15,#16,#17").replace(",.T.)", ",.F.)");
+    close(evaluate(&(inverted + body)).volume(), 6.0);
+}
+
+#[test]
+fn a_shell_written_correctly_keeps_its_triangles() {
+    let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let mesh = evaluate(&body);
+    let mut repaired = mesh.clone();
+    repaired.orient_shell();
+    assert_eq!(repaired, mesh);
+    close(mesh.volume(), 6.0);
+}
+
+fn flipped(mut mesh: Mesh, triangles: &[usize]) -> Mesh {
+    for index in triangles {
+        mesh.triangles[*index].swap(1, 2);
+    }
+    mesh
+}
+
+fn unit_box() -> Mesh {
+    Mesh::cuboid(DVec3::ZERO, DVec3::splat(1.0))
+}
+
+#[test]
+fn every_way_of_flipping_one_face_of_a_box_is_repaired() {
+    for face in 0..6 {
+        let mut mesh = flipped(unit_box(), &[face * 2, face * 2 + 1]);
+        assert_ne!(mesh.open_edges(), 0);
+        mesh.orient_shell();
+        assert_eq!(mesh.open_edges(), 0, "face {face}");
+        close(mesh.volume(), 1.0);
+    }
+}
+
+#[test]
+fn separate_solids_in_one_mesh_are_each_turned_outward() {
+    let far = Mesh::cuboid(DVec3::splat(5.0), DVec3::splat(7.0));
+    let mut mesh = unit_box();
+    let first = mesh.positions.len() as u32;
+    mesh.positions.extend(far.positions);
+    // The second box inside out, so the two would cancel in a sum over the whole mesh.
+    mesh.triangles.extend(far.triangles.iter().map(|[a, b, c]| [a + first, c + first, b + first]));
+    mesh.orient_shell();
+    close(mesh.volume(), 1.0 + 8.0);
+}
+
+#[test]
+fn an_open_surface_keeps_the_way_most_of_it_faces() {
+    // A box with no top: 10 triangles, one flipped. There is no inside, so the rest decide.
+    let mut open = unit_box();
+    open.triangles.drain(2..4);
+    let wanted = open.clone();
+    let mut mesh = flipped(open, &[3]);
+    mesh.orient_shell();
+    assert_eq!(mesh, wanted);
+}
+
+#[test]
+fn an_open_surface_facing_inward_is_left_that_way() {
+    // Volume means nothing without a closed boundary, so it must not turn this round.
+    let mut open = unit_box();
+    open.triangles.drain(2..4);
+    open.triangles.iter_mut().for_each(|triangle| triangle.swap(1, 2));
+    let wanted = open.clone();
+    open.orient_shell();
+    assert_eq!(open, wanted);
+}
+
+#[test]
+fn an_edge_of_three_faces_does_not_panic_or_lose_triangles() {
+    let mut mesh = Mesh {
+        positions: vec![
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::NEG_Y,
+            DVec3::Z,
+        ],
+        triangles: vec![[0, 1, 2], [0, 1, 3], [0, 1, 4]],
+    };
+    mesh.orient_shell();
+    assert_eq!(mesh.triangles.len(), 3);
+}
+
+#[test]
+fn a_large_shell_is_walked_without_recursion() {
+    // A strip of a million triangles, every other one flipped: a recursive walk would overflow
+    // the 1 MB stack of a WASM build.
+    let count = 500_000u32;
+    let mut mesh = Mesh::default();
+    for column in 0..=count {
+        mesh.positions.push(DVec3::new(f64::from(column), 0.0, 0.0));
+        mesh.positions.push(DVec3::new(f64::from(column), 1.0, 0.0));
+    }
+    for column in 0..count {
+        let (a, b, c, d) = (column * 2, column * 2 + 2, column * 2 + 3, column * 2 + 1);
+        mesh.triangles.push([a, b, c]);
+        mesh.triangles.push(if column % 2 == 0 { [a, c, d] } else { [a, d, c] });
+    }
+    mesh.orient_shell();
+    let up = mesh.triangle_corners().filter(|[a, b, c]| (b - a).cross(c - a).z > 0.0).count();
+    assert_eq!(up, mesh.triangles.len());
+}
