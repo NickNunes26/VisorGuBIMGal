@@ -6,6 +6,8 @@ use glam::{DMat4, DVec2, DVec3};
 use std::f64::consts::{PI, TAU};
 
 const MAX_SEGMENT_POINTS: usize = 4096;
+/// How far a chord of an alignment curve may stray from it, in metres.
+const CHORD_TOLERANCE: f64 = 0.02;
 /// Polynomial segments have no turn to measure before sampling them.
 const POLYNOMIAL_STEPS: usize = 32;
 /// Simpson intervals from a spiral's origin to the start of a segment.
@@ -122,15 +124,23 @@ impl Parent {
         }
     }
 
+    /// Enough steps for the angle turned, and for chords to stay close to wide curves, where
+    /// a count per turn alone would leave chords tens of metres long.
     fn steps(&self, start: f64, length: f64) -> usize {
         let per_turn = CIRCLE_SEGMENTS as f64 / TAU;
+        let steps_for = |turn: f64, curvature: f64| {
+            let chords = length.abs() * (curvature / (8.0 * CHORD_TOLERANCE)).sqrt();
+            (turn * per_turn).max(chords)
+        };
         let steps = match self {
             Self::Line { .. } => 1.0,
-            Self::Circle { radius, .. } => (length / radius).abs() * per_turn,
+            Self::Circle { radius, .. } => steps_for((length / radius).abs(), 1.0 / radius),
             Self::Polynomial { .. } => POLYNOMIAL_STEPS as f64,
             Self::Spiral { heading, .. } => {
                 let angle = |sample: usize| heading.at(start + length * sample as f64 / TURN_SAMPLES as f64);
-                (1..=TURN_SAMPLES).map(|i| (angle(i) - angle(i - 1)).abs()).sum::<f64>() * per_turn
+                let turns = (1..=TURN_SAMPLES).map(|i| (angle(i) - angle(i - 1)).abs());
+                let (total, sharpest) = turns.fold((0.0, 0.0_f64), |(total, sharpest), turn| (total + turn, sharpest.max(turn)));
+                steps_for(total, sharpest * TURN_SAMPLES as f64 / length.abs())
             }
         };
         (steps.ceil() as usize).clamp(1, MAX_SEGMENT_POINTS)

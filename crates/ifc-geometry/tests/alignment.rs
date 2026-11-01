@@ -372,12 +372,45 @@ fn sectioned_solid_takes_its_profile_x_to_the_left_of_the_curve() {
 fn sectioned_solid_follows_a_curved_directrix() {
     let mesh = evaluate(&sectioned(LINE_AND_ARC, &[(100.0, 2.0, 1.0), (100.0 + 50.0 * PI, 2.0, 1.0)]));
     assert_eq!(mesh.open_edges(), 0);
-    // A quarter ring of eight facets: 2 R sin(d) for each, a little under Pappus's 314.16.
-    close(mesh.volume(), 8.0 * 2.0 * 100.0 * (PI / 16.0).sin(), 0.25);
+    // Pappus on a quarter circle of radius 100.
+    close(mesh.volume(), 2.0 * 50.0 * PI, 0.1);
     // At the end of the arc the curve runs up +Y, so its left is -X.
     let (_, max) = bounds(&mesh);
     close(max.x, 201.0, 0.1);
     close(max.y, 100.0, 0.2);
+}
+
+#[test]
+fn road_curves_stay_within_a_chord_tolerance_however_wide_they_are() {
+    // At a fixed count per turn, chords on this radius would miss the curve by 2.4 m.
+    let radius = 500.0;
+    let quarter = FRAC_PI_2 * radius;
+    let curves = format!(
+        "#20=IFCCARTESIANPOINT((0.,{radius:?}));\n#21=IFCAXIS2PLACEMENT2D(#20,$);\n\
+         #24=IFCCIRCLE(#21,{radius:?});\n\
+         #48=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE({quarter:?}),#24);\n\
+         #50=IFCCOMPOSITECURVE((#48),.F.);\n"
+    );
+    let mesh = evaluate(&sectioned(&curves, &[(0.0, 2.0, 1.0), (quarter, 2.0, 1.0)]));
+    close(mesh.volume(), 2.0 * quarter, 0.2);
+    // Stand something between samples: it has to be on the true circle.
+    for at in [7.0, 111.0, 333.0, 700.0] {
+        let placed = linear_placement(&curves, at, 0.0, 0.0, 0.0);
+        let from_centre = placed.positions[0].truncate().distance(DVec2::new(0.0, radius));
+        close(from_centre, radius, 0.03);
+    }
+}
+
+#[test]
+fn spirals_stay_within_the_chord_tolerance_where_they_curve_most() {
+    let length = 400.0;
+    let curves = single_segment("#30=IFCCLOTHOID(#905,300.);\n", 0.0, length);
+    let heading = |s: f64| s * s / (2.0 * 300.0 * 300.0);
+    assert_ends_at(&wire(&curves), integrated(heading, 0.0, length));
+    let at = 390.0;
+    let placed = linear_placement(&curves, at, 0.0, 0.0, 0.0);
+    let expected = integrated(heading, 0.0, at);
+    close(placed.positions[0].truncate().distance(expected), 0.0, 0.03);
 }
 
 #[test]

@@ -86,6 +86,19 @@ fn mitred_bend_keeps_the_volume_of_a_centred_profile() {
 }
 
 #[test]
+fn legs_that_climb_keep_their_own_frame_up_to_the_mitre() {
+    // The reference is upright, so the frame tilts where the path starts to climb.
+    let body = "#6=IFCCARTESIANPOINT((10.,8.,3.));\n#7=IFCPOLYLINE((#900,#907,#6));\n\
+        #5=IFCFIXEDREFERENCESWEPTAREASOLID(#906,#903,#7,$,$,#901);\n";
+    let mesh = evaluate(body);
+    assert_eq!(mesh.open_edges(), 0);
+    // Each leg is a prism cut through its axis, so it keeps the volume of its length. A leg
+    // that twists from one frame into the other does not.
+    let climbing = (64.0_f64 + 9.0).sqrt();
+    close(mesh.volume(), 2.0 * (10.0 + climbing), 1e-6);
+}
+
+#[test]
 fn sweep_follows_an_arc() {
     let body = "#6=IFCCIRCLE(#905,10.);\n\
         #7=IFCTRIMMEDCURVE(#6,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE(1.570796326794897)),.T.,.PARAMETER.);\n\
