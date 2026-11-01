@@ -1,7 +1,7 @@
 //! Independent review of T-050: exact answers worked out by hand, on cases the slicer's own
 //! tests leave out.
 
-use cad_slicer::{Axis, Cut, DrawingMesh, DrawingOptions, Look, Segment, draw, to_dxf};
+use cad_slicer::{Axis, Cut, DrawingMesh, DrawingOptions, Look, Segment, draw, to_dxf, to_svg};
 use glam::DVec3;
 use ifc_geometry::Mesh;
 use std::f64::consts::FRAC_PI_6;
@@ -104,6 +104,29 @@ fn solids_touching_inside_one_mesh_keep_all_their_material() {
     let area: f64 = drawing.layers.iter().flat_map(|layer| &layer.loops).map(|ring| ring.area()).sum();
     close(area, 2.0, 1e-9);
     assert!(drawing.layers.iter().flat_map(|layer| &layer.loops).all(|ring| ring.closed));
+    // The joint between them bounds nothing, so a single outline goes round both.
+    assert_eq!(drawing.layers.iter().flat_map(|layer| &layer.loops).count(), 1);
+}
+
+#[test]
+fn an_svg_plan_keeps_north_at_the_top() {
+    // SVG counts Y downwards, so what lies further north must get the smaller y.
+    let south = DrawingMesh::new(0, 1, "A", Mesh::cuboid(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)));
+    let north_part = Mesh::cuboid(DVec3::new(0.0, 9.0, 0.0), DVec3::new(1.0, 10.0, 1.0));
+    let north = DrawingMesh::new(0, 2, "B", north_part);
+    let svg = to_svg(&draw(&[south, north], &DrawingOptions::cut_only(Cut::Plan { z: 0.5 })));
+    // Layers are written in name order, so the first path is the southern box.
+    let heights = |path: &str| -> Vec<f64> {
+        let numbers: Vec<f64> = path.split(' ').filter_map(|word| word.parse().ok()).collect();
+        numbers.iter().skip(1).step_by(2).copied().collect()
+    };
+    let mut paths = svg.split(" d=\"").skip(1).map(|part| part.split('"').next().unwrap_or(""));
+    let (first, second) = (heights(paths.next().unwrap()), heights(paths.next().unwrap()));
+    let (lowest_of_first, highest_of_second) = (
+        first.iter().copied().fold(f64::INFINITY, f64::min),
+        second.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    assert!(lowest_of_first > highest_of_second, "{first:?} against {second:?}");
 }
 
 #[test]
