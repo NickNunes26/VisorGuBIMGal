@@ -6,11 +6,13 @@
 
 mod cut;
 mod geom;
+mod project;
 
 pub use cut::{Axis, Cut, Frame, Look};
 pub use geom::{Loop, Segment};
 
 use ifc_geometry::Mesh;
+use glam::DVec2;
 
 /// Something skipped or degraded on one element of one model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +109,38 @@ impl Diagnostics {
     }
 }
 
+/// Records what the projection had to skip.
+fn note_projection(
+    diagnostics: &mut Diagnostics,
+    item: &DrawingMesh,
+    report: &project::ProjectReport,
+) {
+    if report.non_finite > 0 {
+        diagnostics.add(
+            item.model_id,
+            item.element_id,
+            "non-finite-coordinate",
+            "the projection skipped triangles with a coordinate that is not finite".into(),
+        );
+    }
+    if report.too_large {
+        diagnostics.add(
+            item.model_id,
+            item.element_id,
+            "projection-skipped",
+            "the element has too many triangles and is not projected".into(),
+        );
+    }
+    if report.truncated {
+        diagnostics.add(
+            item.model_id,
+            item.element_id,
+            "projection-truncated",
+            "the projection reached its work limit and stopped".into(),
+        );
+    }
+}
+
 pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
     let mut diagnostics = Diagnostics::new();
     let Some(frame) = Frame::of(options.cut) else {
@@ -128,6 +162,31 @@ pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
 
     // Sorted by name through a tree, so the sheet never depends on hash order.
     let mut layers: std::collections::BTreeMap<String, Layer> = std::collections::BTreeMap::new();
+
+    let mut grid = options.include_projection.then(|| {
+        let mut low = DVec2::splat(f64::MAX);
+        let mut high = DVec2::splat(f64::MIN);
+        for item in meshes {
+            for point in &item.mesh.positions {
+                if !point.is_finite() {
+                    continue;
+                }
+                let flat = frame.project(*point);
+                low = low.min(flat);
+                high = high.max(flat);
+            }
+        }
+        let span = if low.x <= high.x { (high - low).max_element() } else { 0.0 };
+        project::Occluders::new(span)
+    });
+    if let Some(grid) = grid.as_mut() {
+        for item in meshes {
+            let report = project::add_occluders(&item.mesh, &frame, depth, grid);
+            note_projection(&mut diagnostics, item, &report);
+        }
+    }
+    let mut budget = project::Budget::new();
+
     for item in meshes {
         let layer = layers
             .entry(item.layer.clone())
@@ -162,6 +221,25 @@ pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
             );
         }
         layer.loops.extend(loops);
+
+        if let Some(grid) = grid.as_mut() {
+            let report = project::project_mesh(
+                &item.mesh,
+                &frame,
+                depth,
+                grid,
+                &mut budget,
+                &mut layer.visible,
+                &mut layer.hidden,
+            );
+            note_projection(&mut diagnostics, item, &report);
+        }
+    }
+
+    if options.include_projection {
+        for layer in layers.values_mut() {
+            project::merge_lines(&mut layer.visible, &mut layer.hidden);
+        }
     }
 
     // A layer nothing reached is still a layer: the caller asked for it.
