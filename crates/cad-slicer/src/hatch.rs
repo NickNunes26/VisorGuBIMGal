@@ -179,7 +179,7 @@ pub(crate) fn hatch_loops(
             }
         }
         cuts.sort_by(f64::total_cmp);
-        for pair in cuts.chunks_exact(2) {
+        for pair in cuts.as_chunks::<2>().0 {
             if pair[1] - pair[0] <= 1e-9 {
                 continue;
             }

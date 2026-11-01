@@ -54,7 +54,8 @@ pub(crate) fn dxf_bytes(raw: &str, limit: usize) -> Vec<u8> {
     out
 }
 
-/// XML text: the five escapes, and no character that XML 1.0 forbids.
+/// XML text: the five escapes, no control character other than tab, line feed and carriage
+/// return, and nothing XML 1.0 forbids. A control from a file name must not reach the panel.
 pub(crate) fn xml_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for character in raw.chars() {
@@ -65,7 +66,7 @@ pub(crate) fn xml_text(raw: &str) -> String {
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
             '\u{0009}' | '\u{000A}' | '\u{000D}' => out.push(character),
-            c if (c as u32) < 0x20 => {}
+            c if c.is_control() => {}
             c if (c as u32) >= 0xD800 && (c as u32) <= 0xDFFF => {}
             c if (c as u32) == 0xFFFE || (c as u32) == 0xFFFF => {}
             c => out.push(c),
@@ -103,5 +104,7 @@ mod tests {
         assert_eq!(xml_text("<script>\"&'"), "&lt;script&gt;&quot;&amp;&apos;");
         assert_eq!(xml_text("a\u{0001}b"), "ab");
         assert_eq!(xml_text("line\nbreak"), "line\nbreak");
+        // DEL and the C1 controls are valid XML but not text a drawing should carry.
+        assert_eq!(xml_text("a\u{007F}b\u{0085}c"), "abc");
     }
 }

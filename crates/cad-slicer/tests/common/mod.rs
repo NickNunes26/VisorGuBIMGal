@@ -73,12 +73,11 @@ pub fn pyramid(base: f64, height: f64) -> Mesh {
 }
 
 pub fn layer<'a>(drawing: &'a Drawing, name: &str) -> &'a Layer {
-    let found = drawing
+    drawing
         .layers
         .iter()
         .find(|layer| layer.name == name)
-        .unwrap_or_else(|| panic!("no layer {name}"));
-    found
+        .unwrap_or_else(|| panic!("no layer {name}"))
 }
 
 /// Area of a loop, positive when counter-clockwise.

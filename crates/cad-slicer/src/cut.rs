@@ -200,18 +200,29 @@ pub(crate) fn cut_mesh(mesh: &Mesh, frame: &Frame, out: &mut Vec<Loop>) -> CutRe
         edges.push((from, to));
     }
 
-    report.open_loops = chain(&index, &edges, out);
+    let chain_report = chain(&index, &edges, out);
+    report.open_loops = chain_report.open;
+    report.truncated |= chain_report.capped;
     report
 }
 
+/// What the chaining pass found.
+struct ChainReport {
+    /// Chains that stopped without closing on a mesh that should have been watertight.
+    open: usize,
+    /// A loop hit the point limit, so the rest of its edges were left for another chain.
+    capped: bool,
+}
+
 /// Follows the directed edges into loops and returns how many chains stayed open.
-fn chain(index: &NodeIndex, edges: &[(u32, u32)], out: &mut Vec<Loop>) -> usize {
+fn chain(index: &NodeIndex, edges: &[(u32, u32)], out: &mut Vec<Loop>) -> ChainReport {
     let mut outgoing: Vec<Vec<u32>> = vec![Vec::new(); index.len()];
     for (id, (from, _)) in edges.iter().enumerate() {
         outgoing[*from as usize].push(id as u32);
     }
     let mut used = vec![false; edges.len()];
     let mut open = 0;
+    let mut capped = false;
 
     for start in 0..edges.len() {
         if used[start] {
@@ -245,7 +256,12 @@ fn chain(index: &NodeIndex, edges: &[(u32, u32)], out: &mut Vec<Loop>) -> usize 
             points.pop();
         }
         if !closed {
-            open += 1;
+            // A ring longer than the cap is not an open mesh; the pass simply stopped.
+            if points.len() >= MAX_LOOP_POINTS {
+                capped = true;
+            } else {
+                open += 1;
+            }
         }
         let shape = Loop {
             points,
@@ -254,8 +270,13 @@ fn chain(index: &NodeIndex, edges: &[(u32, u32)], out: &mut Vec<Loop>) -> usize 
         if !shape.is_empty() {
             out.push(shape);
         }
+        // Past the cap there is no useful remainder: stop instead of reporting the fragments
+        // as open loops.
+        if capped {
+            break;
+        }
     }
-    open
+    ChainReport { open, capped }
 }
 
 /// The straightest unused edge leaving a node, then the lowest number. Fixed rules keep the

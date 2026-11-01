@@ -23,7 +23,9 @@ fn groups(bytes: &[u8]) -> Vec<(i16, String)> {
     // The final CRLF leaves an empty tail.
     assert_eq!(lines.len() % 2, 1, "an odd number of lines");
     lines[..lines.len() - 1]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let code: i16 = std::str::from_utf8(pair[0])
                 .expect("group codes are ASCII")
@@ -159,7 +161,7 @@ fn a_layer_name_outside_cp1252_never_becomes_utf8() {
         .find(|(code, value)| *code == 2 && value.starts_with("Muro"))
         .map(|(_, value)| value.clone())
         .expect("the layer is in the table");
-    assert!(name.chars().all(|character| character.is_ascii()));
+    assert!(name.is_ascii());
     assert!(name.chars().all(|character| {
         character.is_ascii_alphanumeric() || matches!(character, '$' | '_' | '-' | '.')
     }));
