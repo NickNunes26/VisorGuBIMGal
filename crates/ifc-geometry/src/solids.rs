@@ -324,8 +324,8 @@ pub(crate) fn rounded(corners: &[Corner]) -> Vec<DVec2> {
         DVec2::new(x, y)
     };
     let mut ring = Vec::with_capacity(count);
-    for index in 0..count {
-        let (at, radius) = (point(index), corners[index].2);
+    for (index, (_, _, radius)) in corners.iter().enumerate() {
+        let (at, radius) = (point(index), *radius);
         let (before, after) = (point(index + count - 1), point(index + 1));
         let (to_before, to_after) = (before - at, after - at);
         let (Some(u), Some(v)) = (to_before.try_normalize(), to_after.try_normalize()) else {

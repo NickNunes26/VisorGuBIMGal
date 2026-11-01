@@ -40,14 +40,13 @@ fn check(batch: &Batch) {
     assert_eq!(batch.mesh_table.len() % RECORD_WORDS, 0);
     assert!(batch.positions.iter().all(|value| value.is_finite()));
 
-    for normal in batch.normals.chunks_exact(3) {
+    for normal in batch.normals.as_chunks::<3>().0 {
         let length = normal.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!((length - 1.0).abs() < 1e-3, "{normal:?}");
     }
     let vertex_total = (batch.positions.len() / 3) as u32;
-    for record in batch.mesh_table.chunks_exact(RECORD_WORDS) {
-        let [express_id, first_vertex, vertex_count, first_index, index_count, _, flags] =
-            record.try_into().unwrap();
+    for record in batch.mesh_table.as_chunks::<RECORD_WORDS>().0 {
+        let [express_id, first_vertex, vertex_count, first_index, index_count, _, flags] = *record;
         assert_ne!(express_id, 0);
         assert!(first_vertex + vertex_count <= vertex_total);
         assert!((first_index + index_count) as usize <= batch.indices.len());
@@ -96,12 +95,11 @@ fn batch_size_does_not_change_what_is_drawn() {
                 let at = index as usize * 3;
                 std::array::from_fn(|axis| batch.positions[at + axis] as f64 + batch.origin[axis])
             };
-            for record in batch.mesh_table.chunks_exact(RECORD_WORDS) {
+            for record in batch.mesh_table.as_chunks::<RECORD_WORDS>().0 {
                 let entry = elements.entry(record[0]).or_default();
                 let first = record[3] as usize;
-                for triangle in batch.indices[first..first + record[4] as usize].chunks_exact(3) {
-                    let ([ax, ay, az], [bx, by, bz], [cx, cy, cz]) =
-                        (corner(triangle[0]), corner(triangle[1]), corner(triangle[2]));
+                for [a, b, c] in batch.indices[first..first + record[4] as usize].as_chunks::<3>().0 {
+                    let ([ax, ay, az], [bx, by, bz], [cx, cy, cz]) = (corner(*a), corner(*b), corner(*c));
                     entry.0 += 1;
                     entry.1 += (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz)
                         + az * (bx * cy - by * cx))

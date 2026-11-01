@@ -127,7 +127,7 @@ fn mirrored_and_scaled_transforms_keep_solids_outward_facing() {
 #[test]
 fn corrupted_files_never_panic() {
     let original = sample("SimpleWall.ifc");
-    let replacements = [b'9', b'0', b'#', b'$', b'(', b')', b',', b'.', b'E', b'\''];
+    let replacements = *b"90#$(),.E'";
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut evaluated = 0usize;
     for round in 0..3000 {
