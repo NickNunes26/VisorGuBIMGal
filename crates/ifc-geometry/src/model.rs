@@ -1379,7 +1379,7 @@ impl<'a> ModelEvaluator<'a> {
         };
         let relative = attribute(&entity, &def, "RelativePlacement").and_then(reference);
         let relative = if along_curve {
-            relative.and_then(|id| self.linear_matrix(id)).or_else(|| {
+            relative.and_then(|id| self.linear_matrix(id, depth + 1)).or_else(|| {
                 let fallback = attribute(&entity, &def, "CartesianPosition").and_then(reference);
                 fallback.map(|id| self.placement_matrix(id))
             })
@@ -1474,11 +1474,11 @@ impl<'a> ModelEvaluator<'a> {
             (*self.stationed(base?, depth + 1)?).clone()
         } else if def.is_a("IfcGradientCurve") {
             let base = self.stationed(base?, depth + 1)?;
-            let profile = self.curve_segments(&entity, &def)?;
+            let profile = self.curve_segments(&entity, &def, depth)?;
             let mut profile: Vec<DVec2> = profile.points.iter().map(|point| point.truncate()).collect();
             base.lifted(&mut profile)
         } else if self.is_segmented(&entity, &def) {
-            self.curve_segments(&entity, &def)?
+            self.curve_segments(&entity, &def, depth)?
         } else {
             Stationed::from_path(self.curve_path(id, depth)?)
         };
@@ -1487,7 +1487,7 @@ impl<'a> ModelEvaluator<'a> {
         Some(curve)
     }
 
-    fn curve_segments(&mut self, entity: &Entity, def: &EntityDef) -> Option<Stationed> {
+    fn curve_segments(&mut self, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Stationed> {
         let scale = self.units.length;
         let mut whole = Stationed::default();
         for id in list(attribute(entity, def, "Segments")).iter().filter_map(reference) {
@@ -1500,11 +1500,11 @@ impl<'a> ModelEvaluator<'a> {
                     continue;
                 }
                 let placement = attribute(&segment, &segment_def, "Placement").and_then(reference)?;
-                let placement = self.any_placement(placement)?;
+                let placement = self.any_placement(placement, depth + 1)?;
                 let parent = self.parent_curve(parent, length.abs())?;
                 curves::segment(&parent, placement, start, length)?
             } else {
-                Stationed::from_path(self.curve_path(parent, 1)?)
+                Stationed::from_path(self.curve_path(parent, depth + 1)?)
             };
             if whole.points.len() + run.points.len() > MAX_CURVE_POINTS {
                 self.warn("curve-too-long", format!("#{id} goes past {MAX_CURVE_POINTS} points"));
@@ -1574,10 +1574,10 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     /// A placement of any kind, including one along a curve.
-    fn any_placement(&mut self, id: u32) -> Option<DMat4> {
+    fn any_placement(&mut self, id: u32, depth: usize) -> Option<DMat4> {
         let (_, def) = self.lookup(id)?;
         if def.is_a("IfcAxis2PlacementLinear") {
-            self.linear_matrix(id)
+            self.linear_matrix(id, depth)
         } else {
             Some(self.placement_matrix(id))
         }
@@ -1595,11 +1595,12 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     /// Where an `IfcAxis2PlacementLinear` lands, its axes taken relative to the curve there.
-    fn linear_matrix(&mut self, id: u32) -> Option<DMat4> {
+    fn linear_matrix(&mut self, id: u32, depth: usize) -> Option<DMat4> {
         let (entity, def) = self.lookup(id)?;
         let location = attribute(&entity, &def, "Location").and_then(reference)?;
         let (basis, station, offsets) = self.distance_along(location)?;
-        let curve = self.stationed(basis?, 0)?;
+        // A segment can be placed along the curve it belongs to, so depth carries through.
+        let curve = self.stationed(basis?, depth + 1)?;
         let (point, [along, left, up]) = curve.frame(station)?;
         let origin = point + left * offsets.x + up * offsets.y + along * offsets.z;
         let on_curve = DMat4::from_cols(along.extend(0.0), left.extend(0.0), up.extend(0.0), origin.extend(1.0));
