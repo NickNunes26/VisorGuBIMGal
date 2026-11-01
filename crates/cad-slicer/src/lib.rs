@@ -5,11 +5,14 @@
 //! [`Diagnostic`] and the rest of the drawing carries on.
 
 mod cut;
+mod dxf;
 mod geom;
 mod hatch;
 mod project;
+mod text;
 
 pub use cut::{Axis, Cut, Frame, Look};
+pub use dxf::{DxfOptions, to_dxf, to_dxf_with};
 pub use geom::{Loop, Segment};
 pub use hatch::HatchStyle;
 
