@@ -24,6 +24,14 @@ const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 /// Consecutive profile points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
+/// Face surfaces built as an exact B-spline for each face.
+const ANALYTIC_SURFACES: [&str; 5] = [
+    "IfcCylindricalSurface",
+    "IfcSphericalSurface",
+    "IfcToroidalSurface",
+    "IfcSurfaceOfRevolution",
+    "IfcSurfaceOfLinearExtrusion",
+];
 /// Steps along a ruled wall that twists, where two triangles would not follow it.
 const RULED_STEPS: usize = 8;
 
@@ -1368,6 +1376,103 @@ impl<'a> ModelEvaluator<'a> {
         (path.len() >= 3).then_some(path)
     }
 
+    /// The profile curve of a swept surface, in the XY plane.
+    fn swept_curve(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let profile = attribute(entity, def, "SweptCurve").and_then(reference)?;
+        let (profile, profile_def) = self.lookup(profile)?;
+        let curve = attribute(&profile, &profile_def, "Curve")
+            .or_else(|| attribute(&profile, &profile_def, "OuterCurve"))
+            .and_then(reference)?;
+        self.curve_path(curve, 0)
+    }
+
+    /// An analytic surface as an exact B-spline, built for one face: it covers the angles the
+    /// face's loops reach, so its seam stays out of the face, and the extent they reach on
+    /// directions the surface leaves unbounded.
+    fn analytic_surface(
+        &mut self,
+        entity: &Entity,
+        def: &EntityDef,
+        loops: &[Vec<DVec3>],
+    ) -> Option<nurbs::Surface> {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let scale = self.units.length;
+        let size = |name: &str| attribute(entity, def, name).and_then(number).map(|size| size * scale);
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let around_z = |points: &[DVec3]| {
+            nurbs::covered_arc(points.iter().filter(|point| point.truncate().length() > 1e-9).map(|point| point.y.atan2(point.x)))
+        };
+        let localized = |frame: DMat4| -> Vec<DVec3> {
+            let inverse = frame.inverse();
+            loops.iter().flatten().map(|point| inverse.transform_point3(*point)).collect()
+        };
+        let spread = |values: &[f64]| {
+            values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+                (low.min(*value), high.max(*value))
+            })
+        };
+
+        if def.is_a("IfcCylindricalSurface") {
+            let radius = size("Radius").filter(|radius| *radius > 0.0)?;
+            let local = localized(position);
+            let heights: Vec<f64> = local.iter().map(|point| point.z).collect();
+            let (low, high) = spread(&heights);
+            let edge = nurbs::Curve::polyline(vec![DVec3::new(radius, 0.0, low), DVec3::new(radius, 0.0, high)])?;
+            let (start, sweep) = around_z(&local);
+            Some(nurbs::Surface::revolved(&edge, start, sweep).transformed(position))
+        } else if def.is_a("IfcSphericalSurface") {
+            let radius = size("Radius").filter(|radius| *radius > 0.0)?;
+            let meridian = nurbs::Curve::arc_in_xz(0.0, radius, -FRAC_PI_2, PI);
+            let (start, sweep) = around_z(&localized(position));
+            Some(nurbs::Surface::revolved(&meridian, start, sweep).transformed(position))
+        } else if def.is_a("IfcToroidalSurface") {
+            let major = size("MajorRadius").filter(|radius| *radius > 0.0)?;
+            let minor = size("MinorRadius").filter(|radius| *radius > 0.0)?;
+            let local = localized(position);
+            let tube = |point: &DVec3| point.z.atan2(point.truncate().length() - major);
+            let (tube_start, tube_sweep) = nurbs::covered_arc(local.iter().map(tube));
+            let section = nurbs::Curve::arc_in_xz(major, minor, tube_start, tube_sweep);
+            let (start, sweep) = around_z(&local);
+            Some(nurbs::Surface::revolved(&section, start, sweep).transformed(position))
+        } else if def.is_a("IfcSurfaceOfRevolution") {
+            let curve = self.swept_curve(entity, def)?;
+            let axis = attribute(entity, def, "AxisPosition").and_then(reference)?;
+            let (axis, axis_def) = self.lookup(axis)?;
+            let origin = attribute(&axis, &axis_def, "Location")
+                .and_then(reference)
+                .and_then(|id| self.point(id))?;
+            let z = attribute(&axis, &axis_def, "Axis")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))
+                .unwrap_or(DVec3::Z)
+                .try_normalize()?;
+            let (x, y) = solids::perpendiculars(z);
+            let axis_frame = DMat4::from_cols(x.extend(0.0), y.extend(0.0), z.extend(0.0), origin.extend(1.0));
+            let frame = position * axis_frame;
+            let to_axis = axis_frame.inverse();
+            let curve = curve.iter().map(|point| to_axis.transform_point3(*point)).collect();
+            let (start, sweep) = around_z(&localized(frame));
+            let revolved = nurbs::Surface::revolved(&nurbs::Curve::polyline(curve)?, start, sweep);
+            Some(revolved.transformed(frame))
+        } else {
+            let direction = attribute(entity, def, "ExtrudedDirection")
+                .and_then(reference)
+                .and_then(|id| self.direction(id))?
+                .try_normalize()?;
+            let depth = size("Depth")?;
+            let curve = nurbs::Curve::polyline(self.swept_curve(entity, def)?)?;
+            // The profile lies in the XY plane, so height tells how far along a point has gone.
+            let climb = direction.z;
+            let travel = |point: &DVec3| if climb.abs() > 1e-9 { point.z / climb } else { point.dot(direction) };
+            let reached: Vec<f64> = localized(position).iter().map(travel).collect();
+            let (low, high) = spread(&reached);
+            let (low, high) = (low.min(0.0), high.max(depth));
+            Some(nurbs::Surface::extruded(&curve, direction * low, direction * high).transformed(position))
+        }
+    }
+
     /// A face on a curved surface, meshed in that surface's parameter space.
     fn curved_face(
         &mut self,
@@ -1376,7 +1481,7 @@ impl<'a> ModelEvaluator<'a> {
         same_sense: bool,
         builder: &mut FaceBuilder,
     ) {
-        let Some(mesh) = nurbs::mesh_surface(surface, loops) else {
+        let Some(mesh) = nurbs::mesh_surface(surface, loops, same_sense) else {
             self.warn("bad-trim", "face boundary does not lie on its surface".into());
             return;
         };
@@ -1761,11 +1866,18 @@ impl<'a> ModelEvaluator<'a> {
             .and_then(reference)
             .and_then(|id| self.lookup(id));
         if let Some((surface, surface_def)) = &surface {
-            if surface_def.is_a("IfcBSplineSurfaceWithKnots") {
-                if let Some(surface) = self.bspline_surface(surface, surface_def) {
-                    let mut loops = vec![outer];
-                    loops.append(&mut holes);
-                    self.curved_face(&surface, &loops, same_sense, builder);
+            let spline = surface_def.is_a("IfcBSplineSurfaceWithKnots");
+            let analytic = ANALYTIC_SURFACES.iter().any(|name| surface_def.is_a(name));
+            if spline || analytic {
+                let mut loops = vec![outer.clone()];
+                loops.extend(holes.iter().cloned());
+                let curved = if spline {
+                    self.bspline_surface(surface, surface_def)
+                } else {
+                    self.analytic_surface(surface, surface_def, &loops)
+                };
+                if let Some(curved) = curved {
+                    self.curved_face(&curved, &loops, same_sense, builder);
                     return;
                 }
                 self.warn("bad-surface", format!("#{id} has an unusable surface"));
