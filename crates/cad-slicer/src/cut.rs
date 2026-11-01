@@ -13,7 +13,7 @@
 use crate::geom::{Loop, NodeIndex, SEGMENT_EPSILON};
 use glam::{DVec2, DVec3};
 use ifc_geometry::Mesh;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Segments one element may contribute. Beyond this the cut is truncated and reported.
 pub(crate) const MAX_CUT_SEGMENTS: usize = 200_000;
@@ -127,7 +127,6 @@ pub(crate) fn cut_mesh(mesh: &Mesh, frame: &Frame, out: &mut Vec<Loop>) -> CutRe
     let mut report = CutReport::default();
     let mut index = NodeIndex::new();
     let mut edges: Vec<(u32, u32)> = Vec::new();
-    let mut seen: BTreeSet<(u32, u32)> = BTreeSet::new();
 
     for [a, b, c] in mesh.triangle_corners() {
         if !(a.is_finite() && b.is_finite() && c.is_finite()) {
@@ -193,17 +192,48 @@ pub(crate) fn cut_mesh(mesh: &Mesh, frame: &Frame, out: &mut Vec<Loop>) -> CutRe
         if from == to {
             continue;
         }
-        // An edge shared by two triangles is one boundary, not two.
-        if !seen.insert((from.min(to), from.max(to))) {
-            continue;
-        }
         edges.push((from, to));
     }
 
+    let edges = merge_edges(&edges);
     let chain_report = chain(&index, &edges, out);
     report.open_loops = chain_report.open;
     report.truncated |= chain_report.capped;
     report
+}
+
+/// Pairs the directed edges that join the same two nodes.
+///
+/// Two solids touching inside one mesh both cut their shared face, each with the material on
+/// its own side, so the two edges run in opposite directions and bound nothing between them:
+/// the pair cancels and the joint outline closes. Only an edge repeated in the same direction
+/// is the same boundary drawn twice, and one copy survives. The walk keeps the input order so
+/// the result does not depend on any hashing.
+fn merge_edges(edges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    // Which directions each unordered node pair was seen in.
+    let mut directions: BTreeMap<(u32, u32), [bool; 2]> = BTreeMap::new();
+    for (from, to) in edges {
+        let forward = (*from < *to) as usize;
+        directions
+            .entry((*from.min(to), *from.max(to)))
+            .or_default()[forward] = true;
+    }
+    // Which directions have already given their one surviving edge.
+    let mut emitted: BTreeSet<(u32, u32, bool)> = BTreeSet::new();
+    let mut kept = Vec::with_capacity(edges.len());
+    for (from, to) in edges {
+        let pair = (*from.min(to), *from.max(to));
+        let forward = *from < *to;
+        if directions[&pair][1 - (forward as usize)] {
+            continue;
+        }
+        // A repeat in the same direction is the same boundary: keep its first copy.
+        if !emitted.insert((pair.0, pair.1, forward)) {
+            continue;
+        }
+        kept.push((*from, *to));
+    }
+    kept
 }
 
 /// What the chaining pass found.
