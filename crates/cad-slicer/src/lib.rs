@@ -9,12 +9,14 @@ mod dxf;
 mod geom;
 mod hatch;
 mod project;
+mod svg;
 mod text;
 
 pub use cut::{Axis, Cut, Frame, Look};
 pub use dxf::{DxfOptions, to_dxf, to_dxf_with};
 pub use geom::{Loop, Segment};
 pub use hatch::HatchStyle;
+pub use svg::{SvgOptions, to_svg, to_svg_with};
 
 use ifc_geometry::Mesh;
 use glam::DVec2;

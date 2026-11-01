@@ -57,44 +57,6 @@ impl Segment {
     }
 }
 
-/// Whether a point lies on a segment, within `epsilon`.
-pub(crate) fn on_segment(a: DVec2, b: DVec2, point: DVec2, epsilon: f64) -> bool {
-    let run = b - a;
-    let length = run.length();
-    if length <= epsilon {
-        return a.distance(point) <= epsilon;
-    }
-    let across = run.perp_dot(point - a) / length;
-    if across.abs() > epsilon {
-        return false;
-    }
-    let along = run.dot(point - a) / length;
-    along >= -epsilon && along <= length + epsilon
-}
-
-/// Even-odd containment. A point on the boundary counts as inside, so touching loops
-/// never leave a hatch line dangling.
-pub(crate) fn contains(ring: &[DVec2], point: DVec2) -> bool {
-    let count = ring.len();
-    if count < 3 {
-        return false;
-    }
-    let mut inside = false;
-    for i in 0..count {
-        let (a, b) = (ring[i], ring[(i + 1) % count]);
-        if on_segment(a, b, point, POINT_EPSILON) {
-            return true;
-        }
-        if (a.y > point.y) != (b.y > point.y) {
-            let across = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if across > point.x {
-                inside = !inside;
-            }
-        }
-    }
-    inside
-}
-
 /// Welds endpoints that rounding placed a hair apart. Cells are walked in a fixed order so
 /// the same input always gives the same node numbers.
 pub(crate) struct NodeIndex {
