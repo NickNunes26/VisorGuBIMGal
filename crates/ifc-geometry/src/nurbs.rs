@@ -304,6 +304,25 @@ impl Surface {
         Some(best.0)
     }
 
+    /// The unit normal, along U cross V, at the surface point nearest each of `points`.
+    pub fn normals_at(&self, points: &[DVec3]) -> Option<Vec<DVec3>> {
+        let seeds = self.seed_grid();
+        let (u_start, u_end) = self.u_domain();
+        let (v_start, v_end) = self.v_domain();
+        let (du, dv) = ((u_end - u_start) * 1e-5, (v_end - v_start) * 1e-5);
+        let mut previous = None;
+        points
+            .iter()
+            .map(|point| {
+                let uv = self.invert(*point, &seeds, previous)?;
+                previous = Some(uv);
+                let along_u = self.at(uv.x + du, uv.y)? - self.at(uv.x - du, uv.y)?;
+                let along_v = self.at(uv.x, uv.y + dv)? - self.at(uv.x, uv.y - dv)?;
+                along_u.cross(along_v).try_normalize()
+            })
+            .collect()
+    }
+
     /// Whether the two ends of a parameter direction are the same place.
     fn closes(&self, along_u: bool) -> bool {
         let (u_start, u_end) = self.u_domain();

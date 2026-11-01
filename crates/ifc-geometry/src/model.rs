@@ -441,6 +441,55 @@ fn flat_walls(a: &Profile, b: &Profile, offset: DVec3) -> bool {
     })
 }
 
+/// The sections of a profile along `path`. Its X axis takes the direction of `hints`, one
+/// for each point, across the path. Joints are mitred at half the angle of the turn.
+fn swept_sections(profile: &Profile, path: &[DVec3], hints: &[DVec3]) -> Option<Vec<Section>> {
+    let runs: Vec<DVec3> = path
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).try_normalize())
+        .collect::<Option<_>>()?;
+    let (first, last) = (*runs.first()?, *runs.last()?);
+    let mut across = None;
+    let mut sections = Vec::with_capacity(path.len());
+    for (index, at) in path.iter().enumerate() {
+        let arriving = if index == 0 { first } else { runs[index - 1] };
+        let leaving = runs.get(index).copied().unwrap_or(last);
+        let mitre = (arriving + leaving).try_normalize().filter(|plane| plane.dot(arriving) > 0.25);
+        let mitre = mitre.unwrap_or(arriving);
+        // A reference along the path gives no direction: keep the last one that did.
+        let hint = hints[index];
+        let x = (hint - arriving * hint.dot(arriving)).try_normalize().or(across)?;
+        across = Some(x);
+        let y = arriving.cross(x);
+        let place = |point: &DVec2| {
+            let flat = *at + x * point.x + y * point.y;
+            flat + arriving * (*at - flat).dot(mitre) / arriving.dot(mitre)
+        };
+        let rings = std::iter::once(&profile.outer).chain(&profile.holes);
+        sections.push(rings.map(|ring| ring.iter().map(place).collect()).collect());
+    }
+    Some(sections)
+}
+
+/// The run of a polyline between two distances along it.
+fn path_between_lengths(path: &[DVec3], start: f64, end: f64) -> Vec<DVec3> {
+    let mut run = Vec::new();
+    let mut walked = 0.0;
+    for pair in path.windows(2) {
+        let length = pair[0].distance(pair[1]);
+        let reach = walked + length;
+        let at = |distance: f64| pair[0].lerp(pair[1], ((distance - walked) / length).clamp(0.0, 1.0));
+        if reach > start && walked < end {
+            if run.is_empty() {
+                run.push(at(start));
+            }
+            run.push(at(end));
+        }
+        walked = reach;
+    }
+    run
+}
+
 /// The run of a polyline between two parameters, which count its segments from zero.
 fn polyline_between(path: &[DVec3], start: f64, end: f64) -> Vec<DVec3> {
     let at = |t: f64| {
@@ -777,6 +826,8 @@ impl<'a> ModelEvaluator<'a> {
             self.revolved(entity, def)
         } else if def.is_a("IfcSweptDiskSolid") {
             self.swept_disk(entity, def)
+        } else if def.is_a("IfcFixedReferenceSweptAreaSolid") || def.is_a("IfcSurfaceCurveSweptAreaSolid") {
+            self.area_sweep(entity, def)
         } else if def.is_a("IfcCsgPrimitive3D") {
             self.primitive(id, entity, def)
         } else if def.is_a("IfcManifoldSolidBrep") {
@@ -990,6 +1041,94 @@ impl<'a> ModelEvaluator<'a> {
                     })
                 })
                 .collect();
+            parts.push(loft(&sections)?);
+        }
+        Some(transformed(merged(parts.into_iter()), position))
+    }
+
+    /// The part of a directrix that a sweep's `StartParam` and `EndParam` select.
+    fn directrix_path(&mut self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
+        let directrix = attribute(entity, def, "Directrix").and_then(reference)?;
+        let start = attribute(entity, def, "StartParam");
+        let end = attribute(entity, def, "EndParam");
+        let by_length = |value: Option<&Value>| {
+            matches!(value, Some(Value::Typed { name, .. }) if name.contains("LENGTHMEASURE"))
+        };
+        let (from, to) = (start.and_then(number), end.and_then(number));
+
+        if from.is_some() || to.is_some() {
+            if let Some((curve, curve_def)) = self.lookup(directrix) {
+                if !by_length(start) && !by_length(end) && (curve_def.is_a("IfcCircle") || curve_def.is_a("IfcEllipse")) {
+                    let (frame, radii) = self.conic(&curve, &curve_def)?;
+                    let angle = self.units.plane_angle;
+                    let begin = from.unwrap_or(0.0) * angle;
+                    let finish = to.map_or(std::f64::consts::TAU, |to| to * angle);
+                    return (finish > begin).then(|| on_conic(frame, radii, begin, finish - begin));
+                }
+            }
+        }
+
+        let mut path = self.curve_path(directrix, 0)?;
+        if from.is_some() || to.is_some() {
+            let last = path.len().saturating_sub(1) as f64;
+            if by_length(start) || by_length(end) {
+                let scale = self.units.length;
+                let begin = from.unwrap_or(0.0) * scale;
+                let finish = to.map_or(f64::INFINITY, |to| to * scale);
+                path = path_between_lengths(&path, begin, finish);
+            } else if self.is_polyline(directrix) {
+                let (begin, finish) = (from.unwrap_or(0.0).clamp(0.0, last), to.unwrap_or(last).clamp(0.0, last));
+                if finish > begin {
+                    path = polyline_between(&path, begin, finish);
+                }
+            } else {
+                self.warn("sweep-trim-ignored", "swept along the whole directrix".into());
+            }
+        }
+        path.dedup_by(|a, b| a.distance_squared(*b) <= POINT_TOLERANCE * POINT_TOLERANCE);
+        (path.len() >= 2).then_some(path)
+    }
+
+    /// The direction of the profile's X axis at each point of a sweep's path.
+    fn sweep_hints(&mut self, entity: &Entity, def: &EntityDef, path: &[DVec3]) -> Option<Vec<DVec3>> {
+        if let Some(fixed) = attribute(entity, def, "FixedReference").and_then(reference) {
+            return Some(vec![self.direction(fixed)?; path.len()]);
+        }
+        let surface = attribute(entity, def, "ReferenceSurface").and_then(reference)?;
+        let (surface, surface_def) = self.lookup(surface)?;
+        if surface_def.is_a("IfcPlane") {
+            let frame = attribute(&surface, &surface_def, "Position")
+                .and_then(reference)
+                .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+            return Some(vec![frame.z_axis.truncate(); path.len()]);
+        }
+        let loops = [path.to_vec()];
+        let curved = if surface_def.is_a("IfcBSplineSurfaceWithKnots") {
+            self.bspline_surface(&surface, &surface_def)
+        } else if ANALYTIC_SURFACES.iter().any(|name| surface_def.is_a(name)) {
+            self.analytic_surface(&surface, &surface_def, &loops)
+        } else {
+            self.warn("unsupported-surface", surface_def.name().to_string());
+            return None;
+        };
+        let normals = curved.and_then(|curved| curved.normals_at(path));
+        if normals.is_none() {
+            self.warn("bad-surface", "reference surface gives no normal along the directrix".into());
+        }
+        normals
+    }
+
+    fn area_sweep(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
+        let profile = attribute(entity, def, "SweptArea").and_then(reference)?;
+        let profiles = self.profiles(profile, 0)?;
+        let position = attribute(entity, def, "Position")
+            .and_then(reference)
+            .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
+        let path = self.directrix_path(entity, def)?;
+        let hints = self.sweep_hints(entity, def, &path)?;
+        let mut parts = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            let sections = swept_sections(&wound(profile), &path, &hints)?;
             parts.push(loft(&sections)?);
         }
         Some(transformed(merged(parts.into_iter()), position))
@@ -1419,6 +1558,8 @@ impl<'a> ModelEvaluator<'a> {
             let local = localized(position);
             let heights: Vec<f64> = local.iter().map(|point| point.z).collect();
             let (low, high) = spread(&heights);
+            // A curve at one height still needs a surface with some height, to have a normal.
+            let (low, high) = if high - low < 1e-6 { (low - 1.0, high + 1.0) } else { (low, high) };
             let edge = nurbs::Curve::polyline(vec![DVec3::new(radius, 0.0, low), DVec3::new(radius, 0.0, high)])?;
             let (start, sweep) = around_z(&local);
             Some(nurbs::Surface::revolved(&edge, start, sweep).transformed(position))
