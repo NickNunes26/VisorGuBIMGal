@@ -27,8 +27,13 @@ impl Loop {
         if count < 3 {
             return 0.0;
         }
+        // Measured from the first point: at UTM coordinates the absolute products reach 1e13
+        // and their rounding error swamps a small area, while the differences stay small.
+        let origin = self.points[0];
         (0..count)
-            .map(|i| self.points[i].perp_dot(self.points[(i + 1) % count]))
+            .map(|i| {
+                (self.points[i] - origin).perp_dot(self.points[(i + 1) % count] - origin)
+            })
             .sum::<f64>()
             / 2.0
     }
