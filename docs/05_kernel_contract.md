@@ -88,7 +88,7 @@ H = b·(λ·z + OrthogonalHeight)
 - `IfcMapConversionScaled` sigue el orden `R·F·S`: los factores multiplican los ejes sin rotar (`λ·FactorX·x`, `λ·FactorY·y`, `λ·FactorZ·z`). Cualquier otro `IfcCoordinateOperation` emite un diagnóstico; nunca se usa la identidad en silencio.
 - Prueba numérica de referencia en `crates/spatial-tree/tests/model_data.rs`. Fuente: `buildingSMART/IFC4.x-development`, `IfcMapConversion.md`, `IfcMapConversionScaled.md` e `IfcProjectedCRS.md`.
 - `trueNorth` es informativo: nunca entra en `localToMap` ni se suma a él. IFC lo define así cuando hay conversión, y en caso de conflicto prevalece `IfcMapConversion`. Sin conversión no hay `localToMap`, y `trueNorth` tampoco crea uno. Es el ángulo en grados, antihorario, desde +Y del proyecto hasta `IfcGeometricRepresentationContext.TrueNorth`, y queda indefinido si el archivo no lo declara.
-- `latLng` son grados decimales desde `IfcSite.RefLatitude/RefLongitude`, o derivados de un CRS conocido. El kernel no supone Galicia ni UTM 29N.
+- `latLng` son grados decimales. Si `confidence` es `'verified'` y `proj4` conoce el CRS, el adaptador los deriva en `openModel` de `localToMap` aplicado al origen del modelo, porque `IfcSite` suele ser aproximado. Si no, salen de `IfcSite.RefLatitude/RefLongitude`. El kernel no incluye proyecciones geodésicas ni supone Galicia o UTM 29N: entrega `localToMap` y el CRS.
 - `crsId` es un resultado de búsqueda, no un atributo IFC. `confidence: 'verified'` exige coincidencia exacta del CRS.
 
 ---
@@ -204,11 +204,12 @@ Se conserva lo que queda detrás del plano, en el sentido de la mirada.
 
 ### Planos de varios modelos
 
-- **Lista de modelos:** vacía significa todos los abiertos, en orden de apertura. Su orden numera los modelos dentro del plano.
+- **Lista de modelos:** vacía significa todos los abiertos, en orden de apertura. Su orden numera los modelos dentro del plano, y esa posición no cambia aunque otro modelo de la lista se omita.
+- **Concurrencia:** el adaptador atiende `generateDrawing` de una en una, en orden de llegada. Una llamada espera a que termine la anterior.
 - **Ocultación cruzada:** las líneas ocultas se calculan entre todos los modelos del plano. Un elemento de un modelo oculta a los de otro, como en la realidad.
 - **Exclusiones:** `IfcSpace` no entra en los planos, porque sus lazos taparían cada estancia con una trama. La visibilidad por elemento de la vista 3D no se aplica.
-- **Determinismo:** los mismos modelos, en el mismo orden y con las mismas opciones dan bytes idénticos en DXF y SVG (TC-005), sea cual sea el orden de llegada de los datos y aunque cambie `ModelId`, que es aleatorio. El kernel ordena los elementos por `(posición en la lista, expressId)` antes de cortar.
-- **Fallos:** un modelo que no está abierto, que se cierra durante la generación o cuyo Worker falla se omite con `drawing-model-lost`. Si no queda ninguno, `generateDrawing` rechaza con `model-not-open`.
+- **Determinismo:** los mismos modelos, en el mismo orden y con las mismas opciones dan bytes idénticos en DXF y SVG (TC-005), sea cual sea el orden de llegada de los datos y aunque cambie `ModelId`, que es aleatorio. El kernel ordena las mallas por `(posición en la lista, expressId, parte)` antes de cortar, donde `parte` es el orden de la malla dentro de su elemento. Esa clave es única, así que los límites de trabajo también cortan siempre en el mismo sitio.
+- **Fallos:** un modelo que no está abierto, que se cierra durante la generación o cuyo Worker falla se omite entero con `drawing-model-lost`: lo que ya hubiera enviado se descarta, para no dibujar medio modelo. Si no queda ninguno, `generateDrawing` rechaza con `model-not-open`. Si falla el Worker de plano, rechaza con `out-of-memory` o `internal`, y los modelos no se ven afectados.
 - **Límites:** los límites de trabajo de `cad-slicer` son por plano, no por modelo. Al alcanzarlos, el plano se entrega incompleto con un diagnóstico.
 
 ### Seguridad del SVG
@@ -271,6 +272,7 @@ impl Sheet {
     #[wasm_bindgen(constructor)]
     pub fn new(options_json: &str) -> Result<Sheet, JsError>;
     pub fn add_chunk(&mut self, model_index: u32, chunk: Vec<u8>);
+    pub fn drop_model(&mut self, model_index: u32);
     pub fn generate(&mut self) -> String;
     pub fn export(&self, config_json: &str) -> Result<Vec<u8>, JsError>;
 }
@@ -298,14 +300,15 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 
 1. El adaptador resuelve la lista de modelos y el CRS común (sección 5), y crea el Worker de plano con `Sheet::new`.
 2. Cada Worker de modelo evalúa sus elementos uno a uno y los pasa a coordenadas del marco en `f64`, aplicando su `localToMap` si el marco es `map`.
-3. `next_drawing_chunk` entrega trozos binarios con `expressId`, capa, trama, posiciones `f64` y triángulos. Descarta antes los elementos cuya caja queda entera delante del plano o más allá de `depth`, y sin proyección también los que no tocan el plano. Un elemento fuera de esa zona no se ve ni oculta nada.
-4. El hilo principal transfiere cada trozo a `Sheet::add_chunk` sin leerlo ni guardarlo. `finish_drawing` devuelve los diagnósticos del modelo.
-5. `Sheet::generate` ordena las mallas por `(model_index, expressId)`, llama una vez a `cad_slicer::draw` con todas, libera las mallas y devuelve los diagnósticos.
-6. `exportDrawing` llama a `Sheet::export`, que serializa en Rust. Nada de geometría se procesa en el hilo principal.
+3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, trama, posiciones `f64` y triángulos. Descarta antes los elementos cuya caja, calculada en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también los que no tocan el plano. Un elemento fuera de esa zona no se ve ni oculta nada.
+4. El hilo principal transfiere cada trozo a `Sheet::add_chunk` sin leerlo ni guardarlo, y **solo pide el siguiente cuando `add_chunk` ha terminado**. Así los trozos nunca se acumulan en la cola de mensajes, y los de un modelo llegan en orden. `finish_drawing` devuelve los diagnósticos del modelo.
+5. Si un modelo se pierde a medias, el adaptador llama a `Sheet::drop_model` antes de seguir.
+6. `Sheet::generate` ordena las mallas por `(model_index, expressId, parte)`, llama una vez a `cad_slicer::draw` con todas, libera las mallas y devuelve los diagnósticos, cuyo `model_index` el adaptador traduce a `ModelId`.
+7. `exportDrawing` llama a `Sheet::export`, que serializa en Rust. El adaptador decodifica el SVG de UTF-8 a texto y deja el DXF en bytes. Nada de geometría se procesa en el hilo principal.
 
 `start_drawing` usa su propio evaluador, y el Worker atiende de uno en uno, así que un plano puede intercalarse con un flujo de geometría del mismo modelo. Los trozos son formato interno entre dos Workers de la misma versión, pero `add_chunk` los valida igual y nunca entra en pánico.
 
-**Por qué una pasada conjunta y no un dibujo por modelo que luego se funde:** un dibujo por modelo deja sólidas las líneas que otro modelo oculta, y corregirlo exigiría un segundo protocolo de oclusores. Además, retener todas las mallas en el Worker de un modelo fija ese máximo de memoria hasta cerrarlo, mientras que el Worker de plano se destruye. El coste es un solo hilo para el corte y un pico de memoria con la suma de los modelos, que T-061 mide.
+**Por qué una pasada conjunta y no un dibujo por modelo que luego se funde:** un dibujo por modelo deja sólidas las líneas que otro modelo oculta, y corregirlo exigiría un segundo protocolo de oclusores. Además, retener todas las mallas en el Worker de un modelo fija ese máximo de memoria hasta cerrarlo, mientras que el Worker de plano se destruye. El coste es un solo hilo para el corte, dos copias transitorias de cada triángulo al cruzar, y un pico de memoria con la suma de los modelos, que sigue en esa instancia hasta `discardDrawing` y que T-061 mide. Un plano demasiado grande rechaza con `out-of-memory` sin afectar a los modelos.
 
 ---
 
@@ -328,10 +331,7 @@ El código aún no cumple esta revisión en los puntos siguientes. Se cierran co
 | Contrato | Código actual |
 |---|---|
 | Flujo de planos, `Sheet`, `start_drawing` | No existe. `WasmKernelAdapter` rechaza los planos y `HybridKernelAdapter` usa IFClite |
-| `map-scale-default`, `map-scale-from-units` | `spatial-tree` emite un único `map-scale-assumed`, siempre `info` |
-| `map-rotation-invalid`, `map-conversion-invalid` | `spatial-tree` usa `θ = 0` en silencio y acepta factores no positivos |
-| `trueNorth` | El kernel no lo rellena |
-| Anexo A: claves `fábric`, `formig`, `aceiro`, `madeir`, `vidro`, `illament` | No están en `hatch.rs` |
+| `latLng` desde un CRS verificado | El adaptador del kernel solo entrega el de `IfcSite` |
 | `units`, `crsComment`, `showHiddenLines` y `showHatching` en SVG | `cad-slicer` exporta siempre en metros, sin comentario de CRS, y el SVG no puede omitir capas |
 | `includeHiddenLines` | `cad-slicer` siempre calcula las ocultas: el cableado debe descartarlas |
 
@@ -339,7 +339,7 @@ El código aún no cumple esta revisión en los puntos siguientes. Se cierran co
 
 ## Anexo A. Regla de tramas
 
-Se aplica a los elementos sin `IfcFillAreaStyleHatching`, de modo que otra implementación produzca la misma hoja.
+Se aplica a los elementos sin `IfcFillAreaStyleHatching`, de modo que otra implementación produzca la misma hoja. También se aplica si esa trama no tiene un ángulo finito y una separación positiva, con el diagnóstico `bad-hatch-style`.
 
 1. El nombre de la capa se pasa a minúsculas y se busca cada clave de la tabla, en orden. Gana la primera.
 2. Sin coincidencia, se elige un patrón de reserva por FNV-1a de 64 bits de los bytes UTF-8 del nombre en minúsculas, módulo 4.
