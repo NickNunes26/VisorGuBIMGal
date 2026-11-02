@@ -82,6 +82,21 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 | D4 | Reintentar un modelo cuyo Worker cayó. La caída ya queda aislada en su modelo; falta el botón | `kernel.worker.ts:38-49`, `WasmKernelAdapter.ts:47` | S | G | Corregido: el informe lo daba por ausente |
 | D5 | Matriz de navegadores: Firefox ya, Safari cuando haya equipo | Solo Chrome probado | S | C | Sí |
 
+## E. Aplicación de escritorio
+
+Último bloque: se empieza cuando todo lo anterior esté hecho. Un solo código y dos compilaciones: la web sigue publicándose desde `main` y la de escritorio se construye desde el mismo commit.
+
+| ID | Mejora | Evidencia en el código | Tam. | Origen | Comprobado |
+|---|---|---|---|---|---|
+| E1 | Aplicación de escritorio con Tauri (MIT/Apache) para Windows: abrir un `.ifc` con doble clic, una sola instancia que recibe los archivos siguientes. Usa WebView2 (Chromium), así que WebGPU funciona; donde no lo haya, cae a WebGL2 | Ninguna | M | C | Diseño |
+| E2 | Puerto de archivos: abrir desde una ruta y guardar con el diálogo nativo, con versión navegador y versión escritorio elegidas en `composition.ts`, sin ramas `if (escritorio)` repartidas por el código | Descarga por enlace en `SectionDxfPanel.tsx:23` | S | C | Sí |
+| E3 | Compilación de escritorio: `base` propia, porque `vite.config.ts:5` apunta a la ruta de Pages | `vite.config.ts:5` | S | C | Sí |
+| E4 | Archivos grandes por el protocolo de archivos locales de Tauri, no por su canal de mensajes. Probar primero con el modelo público de 184 MB | Ninguna | S | C | Riesgo principal del puerto |
+| E5 | Sin conexión: estado claro en el panel GIS (mosaicos de OpenStreetMap e IGN, `LeafletService.ts:27,33`) y ocultar o incluir la descarga de muestras (`App.tsx:136`) | `LeafletService.ts:27,33`, `App.tsx:136` | S | C | Sí |
+| E6 | Publicación: una etiqueta de versión hace que CI construya el instalador y lo suba a GitHub Releases; el actualizador de Tauri lo ofrece al abrir la aplicación. La firma de código (certificado de pago) la decide el propietario del proyecto | Ninguna | M | C | Diseño |
+| E7 | macOS y Linux, cuando haya equipos donde compilar y probar | Ninguna | M | C | Diseño |
+| E8 | Opcional y más adelante: kernel nativo en vez de WASM, sin el límite de 4 GB por modelo y con carga en varios hilos. Necesita un camino nuevo para la geometría hasta el renderizador; semanas de trabajo | Ninguna | L | C | Diseño |
+
 ## Orden propuesto
 
 1. **Fluidez primero, medida:** A1, A2, A3, después A5 y A4. Objetivo: bloqueos por debajo de 200 ms.
@@ -90,5 +105,6 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 4. **Escala:** A6, A7, A8, A9, A10.
 5. **Trabajo en equipo:** C9, C10, C12, C13.
 6. **Resto,** según lo que pidan los usuarios.
+7. **Aplicación de escritorio:** E1 a E6, después E7. E8 solo si la velocidad con modelos grandes pasa a ser la queja principal.
 
 D1 y D2 conviene tenerlos antes de la fase 4, para que cada optimización tenga su medición en CI.
