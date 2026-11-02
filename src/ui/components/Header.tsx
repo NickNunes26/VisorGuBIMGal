@@ -1,4 +1,5 @@
 import React, { useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Upload,
   Layers,
@@ -168,7 +169,7 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       {/* Acerca de modal panel */}
-      {showAbout && (
+      {showAbout && createPortal(
         <div
           role="dialog"
           aria-modal="true"
@@ -257,7 +258,8 @@ export const Header: React.FC<HeaderProps> = ({
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </header>
   );
