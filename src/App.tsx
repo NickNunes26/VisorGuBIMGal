@@ -33,11 +33,8 @@ export default function App() {
 
   // Subscribe to renderer backend changes
   useEffect(() => {
-    if ('onBackendChange' in renderer && typeof (renderer as any).onBackendChange === 'function') {
-      return (renderer as any).onBackendChange((backend: 'webgpu' | 'webgl2' | null) => {
-        setActiveBackend(backend);
-      });
-    }
+    const stop = renderer.onBackendChange(setActiveBackend);
+    return () => void stop();
   }, []);
 
   // Tab state

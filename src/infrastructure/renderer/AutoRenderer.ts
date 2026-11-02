@@ -46,6 +46,19 @@ export class AutoRenderer implements RendererPort {
     this.activeRenderer?.setHandlers(handlers);
   }
 
+  private async startWebGl2(canvas: HTMLCanvasElement): Promise<WebGl2Renderer | null> {
+    const renderer = new WebGl2Renderer();
+    renderer.setHandlers(this.handlers);
+    try {
+      await renderer.initialize(canvas);
+      return renderer;
+    } catch (err) {
+      console.warn('Fallo al inicializar WebGL2:', err);
+      renderer.destroy();
+      return null;
+    }
+  }
+
   async initialize(canvas: HTMLCanvasElement): Promise<void> {
     this.destroy();
 
@@ -75,33 +88,30 @@ export class AutoRenderer implements RendererPort {
       } catch (gpuErr) {
         console.warn('Fallo al inicializar WebGPU, alternando a WebGL2:', gpuErr);
         gpuRenderer.destroy();
-
-        if (targetCanvas.parentElement) {
-          const replacement = document.createElement('canvas');
-          replacement.className = targetCanvas.className;
-          replacement.tabIndex = targetCanvas.tabIndex;
-          replacement.style.cssText = targetCanvas.style.cssText;
-          if (targetCanvas.id) replacement.id = targetCanvas.id;
-          targetCanvas.parentElement.replaceChild(replacement, targetCanvas);
-          targetCanvas = replacement;
-        }
       }
     }
 
     if (!chosenRenderer) {
-      const gl2Renderer = new WebGl2Renderer();
-      gl2Renderer.setHandlers(this.handlers);
-      try {
-        await gl2Renderer.initialize(targetCanvas);
-        chosenRenderer = gl2Renderer;
-        chosenBackend = 'webgl2';
-      } catch (gl2Err) {
-        gl2Renderer.destroy();
+      chosenRenderer = await this.startWebGl2(targetCanvas);
+      // WebGPU may have taken the canvas before failing, and a canvas keeps its first context.
+      // Only then is it replaced: React still holds the original, so this is the last resort.
+      if (!chosenRenderer && canTryWebGpu && targetCanvas.parentElement) {
+        const replacement = document.createElement('canvas');
+        replacement.className = targetCanvas.className;
+        replacement.tabIndex = targetCanvas.tabIndex;
+        replacement.style.cssText = targetCanvas.style.cssText;
+        if (targetCanvas.id) replacement.id = targetCanvas.id;
+        targetCanvas.parentElement.replaceChild(replacement, targetCanvas);
+        targetCanvas = replacement;
+        chosenRenderer = await this.startWebGl2(targetCanvas);
+      }
+      if (!chosenRenderer) {
         this.notifyBackendChange(null);
         throw new Error(
           'Ni WebGPU ni WebGL2 están disponibles en este navegador o equipo. Por favor, utiliza un navegador compatible (Chrome o Edge) con aceleración gráfica habilitada.'
         );
       }
+      chosenBackend = 'webgl2';
     }
 
     this.activeRenderer = chosenRenderer;
