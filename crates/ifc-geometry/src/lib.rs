@@ -2,6 +2,7 @@
 
 pub mod csg;
 mod curves;
+pub mod hash;
 pub mod mesh;
 pub mod model;
 mod nurbs;

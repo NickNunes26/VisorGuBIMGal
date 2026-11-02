@@ -1,6 +1,7 @@
 //! Shells whose faces disagree about which way is out, as real exporters write them.
 
 use glam::DVec3;
+use ifc_geometry::hash::set_secret;
 use ifc_geometry::{Mesh, ModelEvaluator};
 use step_parser::index;
 
@@ -434,4 +435,16 @@ fn a_clean_shell_reports_nothing() {
     let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
     let (_, codes) = diagnostics_of(&body);
     assert!(codes.is_empty(), "{codes:?}");
+}
+
+#[test]
+fn the_hash_secret_does_not_change_a_shell() {
+    // Points shared by faces and a face with a hole fill the builder's maps.
+    let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let holed = holed_face("IFCFACE((#24,#21))", ".T.", false);
+    let expected = (evaluate(&body), evaluate(&holed));
+    for secret in [[1, 2, 3, 4], [u64::MAX; 4], [0x9e37_79b9_7f4a_7c15, 7, 0, 1 << 63]] {
+        set_secret(secret);
+        assert_eq!((evaluate(&body), evaluate(&holed)), expected);
+    }
 }

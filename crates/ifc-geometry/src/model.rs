@@ -5,6 +5,7 @@
 
 use crate::csg::{intersect, subtract, subtract_all, union};
 use crate::curves::{self, Heading, Parent, Stationed};
+use crate::hash::KeyedMap;
 use crate::mesh::Mesh;
 use crate::nurbs;
 use crate::solids;
@@ -579,10 +580,10 @@ fn transformed(mesh: Mesh, transform: DMat4) -> Mesh {
 
 /// Whether the mesh, once coincident vertices are merged, encloses a volume.
 fn is_closed(mesh: &Mesh) -> bool {
-    let mut ids: HashMap<[u64; 3], u32> = HashMap::new();
+    let mut ids: KeyedMap<(u64, u64, u64), u32> = KeyedMap::default();
     let mut remap = Vec::with_capacity(mesh.positions.len());
     for position in &mesh.positions {
-        let key = [position.x.to_bits(), position.y.to_bits(), position.z.to_bits()];
+        let key = (position.x.to_bits(), position.y.to_bits(), position.z.to_bits());
         let next = ids.len() as u32;
         remap.push(*ids.entry(key).or_insert(next));
     }
@@ -2595,9 +2596,9 @@ fn resolve_index(value: f64, lookup: &[u32], count: usize) -> Option<u32> {
 #[derive(Default)]
 struct FaceBuilder {
     mesh: Mesh,
-    ids: HashMap<[u64; 3], u32>,
+    ids: KeyedMap<(u64, u64, u64), u32>,
     /// Faces share their corners, so each is decoded from the file once per shell.
-    points: HashMap<u32, DVec3>,
+    points: KeyedMap<u32, DVec3>,
 }
 
 impl FaceBuilder {
@@ -2611,7 +2612,7 @@ impl FaceBuilder {
     }
 
     fn vertex(&mut self, position: DVec3) -> u32 {
-        let key = [position.x.to_bits(), position.y.to_bits(), position.z.to_bits()];
+        let key = (position.x.to_bits(), position.y.to_bits(), position.z.to_bits());
         *self.ids.entry(key).or_insert_with(|| {
             self.mesh.positions.push(position);
             (self.mesh.positions.len() - 1) as u32

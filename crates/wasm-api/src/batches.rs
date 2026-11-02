@@ -1,8 +1,8 @@
 //! Turns evaluated elements into wire-format geometry batches. See `docs/05` section 3.
 
 use glam::{DVec3, Vec3};
+use ifc_geometry::hash::KeyedMap;
 use ifc_geometry::{Diagnostic, ElementGeometry, ModelEvaluator};
-use std::collections::HashMap;
 
 /// Furthest a vertex may lie from its batch origin, in metres. Mirrors `MAX_BATCH_RADIUS`.
 pub const MAX_BATCH_RADIUS: f64 = 4096.0;
@@ -121,7 +121,8 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
         };
         // A mesh normally uses each of its positions at least once, so reserving that many
         // saves the map from growing step by step.
-        let mut shared: HashMap<(u32, [i16; 3]), u32> = HashMap::with_capacity(mesh.positions.len());
+        let mut shared: KeyedMap<(u32, u64), u32> =
+            KeyedMap::with_capacity_and_hasher(mesh.positions.len(), Default::default());
         for triangle in &mesh.triangles {
             let corners = triangle.map(|id| mesh.positions[id as usize]);
             let Some(normal) = usable_normal(corners) else {
@@ -129,9 +130,11 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
                 continue;
             };
             let facing = (normal * 32767.0).round().as_i16vec3().to_array();
+            // One word instead of three to hash.
+            let packed = facing.iter().fold(0, |packed, part| packed << 16 | u64::from(*part as u16));
             for (id, corner) in triangle.iter().zip(corners) {
                 let next = part.positions.len() as u32;
-                let index = *shared.entry((*id, facing)).or_insert(next);
+                let index = *shared.entry((*id, packed)).or_insert(next);
                 if index == next {
                     part.positions.push(corner);
                     part.normals.push(normal);

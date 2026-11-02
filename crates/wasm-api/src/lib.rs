@@ -65,6 +65,29 @@ pub fn allocation_failed() -> bool {
     ALLOCATION_FAILED.load(Ordering::Relaxed)
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = crypto, js_name = getRandomValues, catch)]
+    fn get_random_values(bytes: &mut [u8]) -> Result<(), JsValue>;
+}
+
+/// Gives the geometry's hash maps a fresh secret from the host's random source, so a file cannot
+/// be written to make their keys collide. Without one they keep the secret they had.
+fn renew_hash_secret() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut bytes = [0u8; 32];
+        if get_random_values(&mut bytes).is_ok() {
+            let mut words = [0u64; 4];
+            for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+                *word = u64::from_le_bytes(*chunk);
+            }
+            ifc_geometry::hash::set_secret(words);
+        }
+    }
+}
+
 /// Encoded as `code|offset|message`, which the Worker turns into a `KernelError`.
 fn open_error(error: OpenError) -> JsError {
     match error {
@@ -85,6 +108,7 @@ pub struct Model {
 impl Model {
     #[wasm_bindgen(constructor)]
     pub fn open(bytes: Vec<u8>) -> Result<Model, JsError> {
+        renew_hash_secret();
         LoadedModel::open(bytes).map(|inner| Model { inner }).map_err(open_error)
     }
 

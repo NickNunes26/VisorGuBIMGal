@@ -167,6 +167,41 @@ fn far_apart_elements_get_separate_batches_near_real_coordinates() {
 }
 
 #[test]
+fn a_box_shares_corners_within_a_side_and_splits_them_between_sides() {
+    let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
+        #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+        #2=IFCWALL('w',$,$,$,$,$,#10,$);\n\
+        #10=IFCPRODUCTDEFINITIONSHAPE($,$,(#11));\n\
+        #11=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#12));\n\
+        #12=IFCEXTRUDEDAREASOLID(#13,#15,#16,3.);\n\
+        #13=IFCRECTANGLEPROFILEDEF(.AREA.,$,#14,4.,0.2);\n\
+        #14=IFCAXIS2PLACEMENT2D(#17,$);\n\
+        #15=IFCAXIS2PLACEMENT3D(#17,$,$);\n\
+        #16=IFCDIRECTION((0.,0.,1.));\n\
+        #17=IFCCARTESIANPOINT((0.,0.,0.));\n\
+        ENDSEC;END-ISO-10303-21;";
+    let mut model = LoadedModel::open(text.as_bytes().to_vec()).unwrap();
+    let batches = stream(&mut model, usize::MAX);
+    batches.iter().for_each(check);
+    let batch = &batches[0];
+    // Eight corners, each on three sides, and two triangles per side.
+    assert_eq!((batch.positions.len() / 3, batch.indices.len() / 3), (24, 12));
+    let vector = |values: &[f32], index: u32| -> [f32; 3] {
+        std::array::from_fn(|axis| values[index as usize * 3 + axis])
+    };
+    for triangle in batch.indices.as_chunks::<3>().0 {
+        let [a, b, c] = triangle.map(|index| vector(&batch.positions, index));
+        let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+        let cross = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        for index in triangle {
+            let normal = vector(&batch.normals, *index);
+            let along: f32 = normal.iter().zip(cross).map(|(n, c)| n * c).sum();
+            let length = cross.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!((along - length).abs() < 1e-4 * length, "{normal:?} against {cross:?}");
+        }
+    }
+}
+#[test]
 fn a_huge_element_is_flagged_instead_of_losing_precision_silently() {
     let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
         #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
