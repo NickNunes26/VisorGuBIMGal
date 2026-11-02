@@ -92,9 +92,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Check banned @ifc-lite occurrences
+      - name: Check banned IFClite occurrences
         run: |
-          count=$( (grep -rnF "@ifc-lite" package.json package-lock.json src/ --exclude-dir=ifclite 2>/dev/null || true) | wc -l )
-          echo "::warning::Found $count occurrences of @ifc-lite outside src/infrastructure/ifclite/"
-          # Line to change at T-051 so it fails if occurrences exist: test "$count" -eq 0
-          exit 0
+          count=$( (grep -rniE "ifc-lite|ifclite" src index.html vite.config.ts package.json package-lock.json 2>/dev/null || true) | wc -l )
+          if [ "$count" -ne 0 ]; then
+            echo "Found $count banned IFClite occurrences:"
+            grep -rniE "ifc-lite|ifclite" src index.html vite.config.ts package.json package-lock.json
+            exit 1
+          fi
+          test "$count" -eq 0
