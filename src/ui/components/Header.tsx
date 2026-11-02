@@ -22,6 +22,7 @@ interface HeaderProps {
   isGisExpanded: boolean;
   onToggleGis: () => void;
   isWorking: boolean;
+  activeBackend?: 'webgpu' | 'webgl2' | null;
   isWebGpuAvailable?: boolean;
 }
 
@@ -33,12 +34,17 @@ export const Header: React.FC<HeaderProps> = ({
   isGisExpanded,
   onToggleGis,
   isWorking,
+  activeBackend,
   isWebGpuAvailable
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [showAbout, setShowAbout] = useState(false);
-  const isWebGpu =
-    isWebGpuAvailable ?? (typeof navigator !== 'undefined' && 'gpu' in navigator);
+  const backend =
+    activeBackend !== undefined
+      ? activeBackend
+      : (isWebGpuAvailable ?? (typeof navigator !== 'undefined' && 'gpu' in navigator))
+      ? 'webgpu'
+      : null;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -60,12 +66,22 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       <div className="header-actions">
-        {/* WebGPU Status Indicator */}
+        {/* WebGPU / WebGL2 Status Indicator */}
         <span
-          className={`status-badge ${isWebGpu ? 'ready' : 'error'}`}
-          title={isWebGpu ? 'WebGPU disponible y activo' : 'WebGPU no disponible en este navegador'}
+          className={`status-badge ${backend ? 'ready' : 'error'}`}
+          title={
+            backend === 'webgpu'
+              ? 'WebGPU disponible y activo'
+              : backend === 'webgl2'
+              ? 'WebGL2 disponible y activo'
+              : 'Aceleración gráfica 3D no disponible en este navegador'
+          }
         >
-          {isWebGpu ? '● WebGPU Activo' : '● Sin WebGPU'}
+          {backend === 'webgpu'
+            ? '● WebGPU Activo'
+            : backend === 'webgl2'
+            ? '● WebGL2 Activo'
+            : '● Sin aceleración 3D'}
         </span>
 
         {/* View presets */}

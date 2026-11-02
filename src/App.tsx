@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { Header } from './ui/components/Header';
 import { ModelsPanel } from './ui/components/ModelsPanel';
 import { SpatialTreePanel } from './ui/components/SpatialTreePanel';
@@ -28,7 +28,17 @@ export default function App() {
   const [selectedElement, setSelectedElement] = useState<SelectedElementDetails | null>(null);
   const [statusText, setStatusText] = useState<string>('Listo. Abre un archivo IFC para comenzar.');
   const [isWorking, setIsWorking] = useState<boolean>(false);
-  const [rendererError, setRendererError] = useState<string | null>(null);
+  const [, setRendererError] = useState<string | null>(null);
+  const [activeBackend, setActiveBackend] = useState<'webgpu' | 'webgl2' | null>(null);
+
+  // Subscribe to renderer backend changes
+  useEffect(() => {
+    if ('onBackendChange' in renderer && typeof (renderer as any).onBackendChange === 'function') {
+      return (renderer as any).onBackendChange((backend: 'webgpu' | 'webgl2' | null) => {
+        setActiveBackend(backend);
+      });
+    }
+  }, []);
 
   // Tab state
   const [leftTab, setLeftTab] = useState<'models' | 'tree'>('models');
@@ -53,7 +63,7 @@ export default function App() {
         opened = true;
 
         // 2. Stream geometry from kernel to renderer
-        setStatusText('Procesando geometría 3D en WebGPU...');
+        setStatusText(`Procesando geometría 3D (${activeBackend === 'webgl2' ? 'WebGL2' : 'WebGPU'})...`);
         renderer.addModel(modelId);
 
         let meshCount = 0;
@@ -117,7 +127,7 @@ export default function App() {
         setIsWorking(false);
       }
     },
-    []
+    [activeBackend]
   );
 
   // Sample model loader
@@ -208,9 +218,6 @@ export default function App() {
     }
   }, []);
 
-  const isWebGpuAvailable =
-    !rendererError && typeof navigator !== 'undefined' && 'gpu' in navigator;
-
   return (
     <div className="app-container">
       <Header
@@ -221,7 +228,8 @@ export default function App() {
         isGisExpanded={isGisExpanded}
         onToggleGis={() => setIsGisExpanded((prev) => !prev)}
         isWorking={isWorking}
-        isWebGpuAvailable={isWebGpuAvailable}
+        activeBackend={activeBackend}
+        isWebGpuAvailable={activeBackend === 'webgpu'}
       />
 
       <div className="workspace">
