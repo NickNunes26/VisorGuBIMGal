@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Upload,
   Layers,
@@ -6,9 +6,12 @@ import {
   Box,
   Eye,
   RefreshCw,
-  Compass
+  Compass,
+  Info,
+  X
 } from 'lucide-react';
 import type { ViewPreset } from '../../domain/kernel/RendererPort';
+import noticeText from '../../../NOTICE.md?raw';
 
 interface HeaderProps {
   onOpenFile: (file: File) => void;
@@ -32,6 +35,7 @@ export const Header: React.FC<HeaderProps> = ({
   isWebGpuAvailable
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [showAbout, setShowAbout] = useState(false);
   const isWebGpu =
     isWebGpuAvailable ?? (typeof navigator !== 'undefined' && 'gpu' in navigator);
 
@@ -51,8 +55,6 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
         <div>
           <span className="brand-title">VisorGuBIMGal</span>
-          <span style={{ margin: '0 8px', color: '#475569' }}>|</span>
-          <span className="brand-badge">IFClite + GIS</span>
         </div>
       </div>
 
@@ -153,7 +155,110 @@ export const Header: React.FC<HeaderProps> = ({
           <MapPin size={15} />
           <span>GIS 2D</span>
         </button>
+
+        {/* Acerca de Button */}
+        <button
+          className="btn btn-secondary"
+          onClick={() => setShowAbout(true)}
+          title="Acerca de VisorGuBIMGal (avisos y licencias)"
+        >
+          <Info size={15} />
+          <span>Acerca de</span>
+        </button>
       </div>
+
+      {/* Acerca de modal panel */}
+      {showAbout && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.7)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9999,
+            padding: '20px'
+          }}
+          onClick={() => setShowAbout(false)}
+        >
+          <div
+            style={{
+              backgroundColor: '#0f172a',
+              border: '1px solid #334155',
+              borderRadius: '8px',
+              maxWidth: '680px',
+              width: '100%',
+              maxHeight: '80vh',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
+              overflow: 'hidden'
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '12px 16px',
+                borderBottom: '1px solid #1e293b',
+                backgroundColor: '#1e293b'
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600, fontSize: '14px', color: '#f8fafc' }}>
+                <Info size={16} color="#38bdf8" />
+                <span>Acerca de VisorGuBIMGal</span>
+              </div>
+              <button
+                className="btn btn-ghost btn-icon"
+                onClick={() => setShowAbout(false)}
+                title="Cerrar"
+                style={{ padding: '4px' }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div
+              style={{
+                padding: '16px',
+                overflowY: 'auto',
+                fontSize: '12px',
+                lineHeight: 1.6,
+                color: '#cbd5e1'
+              }}
+            >
+              <pre
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  margin: 0
+                }}
+              >
+                {noticeText}
+              </pre>
+            </div>
+            <div
+              style={{
+                padding: '10px 16px',
+                borderTop: '1px solid #1e293b',
+                display: 'flex',
+                justifyContent: 'flex-end',
+                backgroundColor: '#0f172a'
+              }}
+            >
+              <button className="btn btn-secondary" onClick={() => setShowAbout(false)}>
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </header>
   );
 };
