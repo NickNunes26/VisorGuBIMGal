@@ -187,28 +187,26 @@ impl<'a> Parser<'a> {
         self.expect(b'=')?;
         self.skip_ws_comments()?;
         if self.peek() == Some(b'(') {
-            let parts = self.parse_complex_parts()?;
+            let mut parts = self.parse_complex_parts()?.into_iter();
             self.skip_ws_comments()?;
             self.expect(b';')?;
             let (type_name, params) = parts
-                .first()
-                .cloned()
+                .next()
                 .ok_or_else(|| self.error(ErrorKind::MalformedEntity))?;
             Ok(Entity {
                 type_name,
                 params,
-                parts,
+                other_parts: parts.collect(),
             })
         } else {
             let type_name = self.parse_ident()?;
             let params = self.parse_outer_params()?;
             self.skip_ws_comments()?;
             self.expect(b';')?;
-            let parts = vec![(type_name.clone(), params.clone())];
             Ok(Entity {
                 type_name,
                 params,
-                parts,
+                other_parts: Vec::new(),
             })
         }
     }

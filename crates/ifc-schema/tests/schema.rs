@@ -32,14 +32,14 @@ fn every_entity_in_every_file_matches_its_schema() {
         let tables = schema(id);
         for express_id in file.ids() {
             let entity = file.decode(express_id).unwrap();
-            for (type_name, params) in &entity.parts {
+            for (type_name, params) in entity.parts() {
                 let Some(def) = tables.entity(type_name) else {
                     problems.push(format!("{}: unknown {type_name}", path.display()));
                     continue;
                 };
                 checked += 1;
                 let attributes = def.attributes();
-                if entity.parts.len() == 1 && attributes.len() != params.len() {
+                if entity.other_parts.is_empty() && attributes.len() != params.len() {
                     problems.push(format!(
                         "{}: #{express_id} {type_name} has {} parameters, schema says {}",
                         path.display(),

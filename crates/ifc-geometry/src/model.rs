@@ -91,6 +91,8 @@ struct Profile {
 pub struct ModelEvaluator<'a> {
     file: &'a StepIndex<'a>,
     schema: &'static Schema,
+    /// Schema definition of each type in `file.type_names()`, by position.
+    defs: Vec<Option<EntityDef>>,
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
     curves: HashMap<u32, Rc<Stationed>>,
@@ -573,6 +575,7 @@ impl<'a> ModelEvaluator<'a> {
         let mut evaluator = Self {
             file,
             schema: tables,
+            defs: file.type_names().map(|name| tables.entity(name)).collect(),
             units: project_units(file, tables),
             placements: HashMap::new(),
             curves: HashMap::new(),
@@ -609,8 +612,9 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     fn lookup(&self, id: u32) -> Option<(Entity, EntityDef)> {
-        let entity = self.file.decode(id).ok()?;
-        let def = self.schema.entity(&entity.type_name)?;
+        let found = self.file.get(id)?;
+        let def = (*self.defs.get(found.type_index as usize)?)?;
+        let entity = self.file.decode_ref(found).ok()?;
         Some((entity, def))
     }
 

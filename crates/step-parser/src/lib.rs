@@ -51,11 +51,21 @@ pub struct Entity {
     ///
     /// For a complex instance these are the parameters of the first partial.
     pub params: Vec<Value>,
-    /// Every partial of a complex instance, in file order.
-    ///
-    /// Ordinary entities have exactly one element, matching [`Self::type_name`]
-    /// and [`Self::params`].
-    pub parts: Vec<(String, Vec<Value>)>,
+    /// The partials of a complex instance after the first, in file order.
+    /// Empty for an ordinary entity.
+    pub other_parts: Vec<(String, Vec<Value>)>,
+}
+
+impl Entity {
+    /// Every partial in file order: the first is [`Self::type_name`] with
+    /// [`Self::params`], so an ordinary entity yields exactly that one.
+    pub fn parts(&self) -> impl Iterator<Item = (&str, &[Value])> + '_ {
+        std::iter::once((self.type_name.as_str(), self.params.as_slice())).chain(
+            self.other_parts
+                .iter()
+                .map(|(name, params)| (name.as_str(), params.as_slice())),
+        )
+    }
 }
 
 /// The reason a [`ParseError`] was produced.
@@ -151,6 +161,9 @@ pub struct EntityRef<'a> {
     pub id: u32,
     /// Upper-cased entity type name.
     pub type_name: &'a str,
+    /// Position of [`Self::type_name`] in [`StepIndex::type_names`], so callers can
+    /// resolve each type once per file instead of once per entity.
+    pub type_index: u32,
     /// First byte of the record (`#`).
     pub start: usize,
     /// One past the final byte of the record (after `;`).
@@ -172,6 +185,39 @@ struct Entry {
     end: usize,
 }
 
+/// Entry position by `expressId`. Exporters number entities densely, so most files
+/// get a plain table indexed by id; scattered ids keep the hash map.
+#[derive(Debug)]
+enum IdTable {
+    Dense(Vec<u32>),
+    Sparse(HashMap<u32, u32>),
+}
+
+const NO_ENTRY: u32 = u32::MAX;
+
+impl IdTable {
+    fn new(by_id: HashMap<u32, u32>) -> Self {
+        let limit = by_id.len().saturating_mul(2).saturating_add(1024);
+        match by_id.keys().max() {
+            Some(&max) if (max as usize) < limit => {
+                let mut table = vec![NO_ENTRY; max as usize + 1];
+                for (id, entry) in by_id {
+                    table[id as usize] = entry;
+                }
+                Self::Dense(table)
+            }
+            _ => Self::Sparse(by_id),
+        }
+    }
+
+    fn get(&self, id: u32) -> Option<u32> {
+        match self {
+            Self::Dense(table) => table.get(id as usize).copied().filter(|&at| at != NO_ENTRY),
+            Self::Sparse(map) => map.get(&id).copied(),
+        }
+    }
+}
+
 /// A lazily-decoded index over an ISO 10303-21 file.
 ///
 /// Building the index stores only identifiers, byte ranges and one interned type
@@ -181,7 +227,7 @@ pub struct StepIndex<'a> {
     bytes: &'a [u8],
     schemas: Vec<String>,
     entries: Vec<Entry>,
-    by_id: HashMap<u32, u32>,
+    by_id: IdTable,
     types: Vec<String>,
     type_lookup: HashMap<String, u32>,
     by_type: HashMap<u32, Vec<u32>>,
@@ -218,12 +264,13 @@ impl<'a> StepIndex<'a> {
 
     /// Look up one entity by `expressId`.
     pub fn get(&self, id: u32) -> Option<EntityRef<'_>> {
-        let entry_idx = *self.by_id.get(&id)?;
+        let entry_idx = self.by_id.get(id)?;
         let entry = self.entries.get(entry_idx as usize)?;
         let type_name = self.types.get(entry.type_idx as usize)?;
         Some(EntityRef {
             id: entry.id,
             type_name: type_name.as_str(),
+            type_index: entry.type_idx,
             start: entry.start,
             end: entry.end,
         })
@@ -278,6 +325,7 @@ impl<'a> StepIndex<'a> {
         Some(EntityRef {
             id: entry.id,
             type_name: type_name.as_str(),
+            type_index: entry.type_idx,
             start: entry.start,
             end: entry.end,
         })

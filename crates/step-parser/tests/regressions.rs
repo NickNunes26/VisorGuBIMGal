@@ -168,10 +168,10 @@ fn complex_entity_instances_index_and_decode() {
     assert_eq!(complex.type_name, "IFCA");
     assert_eq!(complex.params, [Value::Integer(1)]);
     assert_eq!(
-        complex.parts,
+        complex.parts().collect::<Vec<_>>(),
         [
-            ("IFCA".to_owned(), vec![Value::Integer(1)]),
-            ("IFCB".to_owned(), vec![Value::Integer(2)]),
+            ("IFCA", &[Value::Integer(1)][..]),
+            ("IFCB", &[Value::Integer(2)][..]),
         ]
     );
 
@@ -179,8 +179,8 @@ fn complex_entity_instances_index_and_decode() {
     assert_eq!(ordinary.type_name, "IFCX");
     assert_eq!(ordinary.params, [Value::Integer(3)]);
     assert_eq!(
-        ordinary.parts,
-        [("IFCX".to_owned(), vec![Value::Integer(3)])]
+        ordinary.parts().collect::<Vec<_>>(),
+        [("IFCX", &[Value::Integer(3)][..])]
     );
 }
 
@@ -225,4 +225,31 @@ fn non_finite_reals_are_invalid_numbers() {
     // A finite real near the top of the range still decodes.
     let index = index(b"DATA;\n#1=IFCA(1.0E308);\nENDSEC;").unwrap();
     assert!(matches!(index.decode(1).unwrap().params[0], Value::Real(_)));
+}
+
+#[test]
+fn lookup_by_id_works_for_dense_sparse_and_missing_ids() {
+    // Dense: ids close together, with a gap.
+    let dense = complete("#1=IFCA(1);\n#2=IFCB(2);\n#4=IFCC(4);");
+    let dense = index(&dense).unwrap();
+    assert_eq!(dense.get(1).unwrap().type_name, "IFCA");
+    assert_eq!(dense.get(4).unwrap().type_name, "IFCC");
+    assert!(dense.get(3).is_none());
+    assert!(dense.get(0).is_none());
+    assert!(dense.get(5).is_none());
+    assert!(dense.get(u32::MAX).is_none());
+
+    // Sparse: an id far beyond the entity count must not need a table that large.
+    let sparse = complete("#7=IFCA(1);\n#4294967295=IFCB(2);\n#4000000000=IFCC(3);");
+    let sparse = index(&sparse).unwrap();
+    assert_eq!(sparse.get(7).unwrap().type_name, "IFCA");
+    assert_eq!(sparse.get(u32::MAX).unwrap().type_name, "IFCB");
+    assert_eq!(sparse.decode(4_000_000_000).unwrap().params, [Value::Integer(3)]);
+    assert!(sparse.get(8).is_none());
+    assert!(sparse.get(4_000_000_001).is_none());
+
+    // A duplicate keeps the first record in both layouts.
+    let duplicate = complete("#1=IFCA(1);\n#1=IFCB(2);");
+    let duplicate = index(&duplicate).unwrap();
+    assert_eq!(duplicate.get(1).unwrap().type_name, "IFCA");
 }

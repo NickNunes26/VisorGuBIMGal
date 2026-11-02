@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::parser::Parser;
-use crate::{Entry, ErrorKind, ParseError, StepIndex, Value};
+use crate::{Entry, ErrorKind, IdTable, ParseError, StepIndex, Value};
 
 struct Scanner<'a> {
     bytes: &'a [u8],
@@ -466,7 +466,7 @@ pub(crate) fn build(bytes: &[u8]) -> Result<StepIndex<'_>, ParseError> {
         bytes,
         schemas,
         entries,
-        by_id,
+        by_id: IdTable::new(by_id),
         types,
         type_lookup,
         by_type,
