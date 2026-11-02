@@ -24,6 +24,8 @@ const MAX_ITEMS_PER_ELEMENT: usize = 100_000;
 /// Booleans one element may evaluate. Each costs far more than a plain item.
 const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
+/// Triangles kept for repeated instances, so a model of unique shapes cannot fill memory twice.
+const MAX_INSTANCE_TRIANGLES: usize = 1_000_000;
 /// Consecutive curve points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
 /// The same for the rings of a profile. Exporters round the ends of arcs and lines apart by
@@ -92,6 +94,8 @@ pub struct ModelEvaluator<'a> {
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
     curves: HashMap<u32, Rc<Stationed>>,
+    instances: HashMap<u32, Mesh>,
+    instance_triangles: usize,
     openings: HashMap<u32, Vec<u32>>,
     item_colors: HashMap<u32, u32>,
     diagnostics: Vec<Diagnostic>,
@@ -572,6 +576,8 @@ impl<'a> ModelEvaluator<'a> {
             units: project_units(file, tables),
             placements: HashMap::new(),
             curves: HashMap::new(),
+            instances: HashMap::new(),
+            instance_triangles: 0,
             openings: HashMap::new(),
             item_colors: HashMap::new(),
             diagnostics: Vec::new(),
@@ -814,7 +820,7 @@ impl<'a> ModelEvaluator<'a> {
             self.mapped_item(&entity, &def, transform, color, depth, out);
             return;
         }
-        let local = self.solid(id, &entity, &def, depth);
+        let local = self.instance_of(id, &entity, &def, depth);
 
         if let Some(mesh) = local {
             out.push(ElementMesh {
@@ -822,6 +828,25 @@ impl<'a> ModelEvaluator<'a> {
                 rgba: color,
             });
         }
+    }
+
+    /// `solid`, remembered for items under a mapped representation, which models repeat by the
+    /// thousand. An item that raised a diagnostic is not kept, so each element reports it.
+    fn instance_of(&mut self, id: u32, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Mesh> {
+        if depth == 0 {
+            return self.solid(id, entity, def, depth);
+        }
+        if let Some(mesh) = self.instances.get(&id) {
+            return Some(mesh.clone());
+        }
+        let reported = self.diagnostics.len();
+        let mesh = self.solid(id, entity, def, depth)?;
+        let kept = self.instance_triangles + mesh.triangles.len();
+        if self.diagnostics.len() == reported && kept <= MAX_INSTANCE_TRIANGLES {
+            self.instance_triangles = kept;
+            self.instances.insert(id, mesh.clone());
+        }
+        Some(mesh)
     }
 
     /// Exporters may style a boolean result or only the solid it started from.
@@ -2332,7 +2357,7 @@ impl<'a> ModelEvaluator<'a> {
                     list(attribute(&poly, &poly_def, "Polygon"))
                         .iter()
                         .filter_map(reference)
-                        .filter_map(|point| self.point(point))
+                        .filter_map(|point| builder.point(point, |id| self.point(id)))
                         .collect::<Vec<_>>(),
                 )
             } else if poly_def.is_a("IfcEdgeLoop") {
@@ -2440,7 +2465,7 @@ impl<'a> ModelEvaluator<'a> {
                 positions: positions.clone(),
                 triangles: Vec::new(),
             },
-            ids: HashMap::new(),
+            ..FaceBuilder::default()
         };
         for face in list(attribute(entity, def, "Faces")).iter().filter_map(reference) {
             let Some((face, face_def)) = self.lookup(face) else { continue };
@@ -2487,9 +2512,20 @@ fn resolve_index(value: f64, lookup: &[u32], count: usize) -> Option<u32> {
 struct FaceBuilder {
     mesh: Mesh,
     ids: HashMap<[u64; 3], u32>,
+    /// Faces share their corners, so each is decoded from the file once per shell.
+    points: HashMap<u32, DVec3>,
 }
 
 impl FaceBuilder {
+    fn point(&mut self, id: u32, decode: impl FnOnce(u32) -> Option<DVec3>) -> Option<DVec3> {
+        if let Some(point) = self.points.get(&id) {
+            return Some(*point);
+        }
+        let point = decode(id)?;
+        self.points.insert(id, point);
+        Some(point)
+    }
+
     fn vertex(&mut self, position: DVec3) -> u32 {
         let key = [position.x.to_bits(), position.y.to_bits(), position.z.to_bits()];
         *self.ids.entry(key).or_insert_with(|| {
@@ -2503,6 +2539,13 @@ impl FaceBuilder {
             return;
         }
         let corner = |id: u32| self.mesh.positions[id as usize];
+        // Most faces of a faceted solid are triangles, which need no triangulating.
+        if let ([a, b, c], []) = (outer, holes) {
+            if (corner(*b) - corner(*a)).cross(corner(*c) - corner(*a)) != DVec3::ZERO {
+                self.mesh.triangles.push([*a, *b, *c]);
+            }
+            return;
+        }
         // Newell's method, which tolerates collinear and slightly non-planar corners.
         let normal = outer.iter().enumerate().fold(DVec3::ZERO, |sum, (i, id)| {
             sum + corner(*id).cross(corner(outer[(i + 1) % outer.len()]))

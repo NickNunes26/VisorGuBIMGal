@@ -197,3 +197,77 @@ fn a_polygonal_set_written_inward_turns_outward() {
     body += "#5=IFCPOLYGONALFACESET(#20,.T.,(#30,#31,#32,#33,#34,#35),$);\n";
     close(evaluate_in("IFC4", &body).volume(), 8.0);
 }
+
+/// Two walls using one mapped box, the second moved 10 m along X.
+const MAPPED: &str = "#2=IFCWALL('w',$,$,$,$,$,#3,$);\n\
+    #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+    #4=IFCSHAPEREPRESENTATION($,'Body','MappedRepresentation',(#50));\n\
+    #6=IFCWALL('x',$,$,$,$,$,#7,$);\n\
+    #7=IFCPRODUCTDEFINITIONSHAPE($,$,(#8));\n\
+    #8=IFCSHAPEREPRESENTATION($,'Body','MappedRepresentation',(#51));\n\
+    #50=IFCMAPPEDITEM(#52,#53);\n\
+    #51=IFCMAPPEDITEM(#52,#54);\n\
+    #52=IFCREPRESENTATIONMAP(#55,#56);\n\
+    #53=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#57,$,$);\n\
+    #54=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#58,$,$);\n\
+    #55=IFCAXIS2PLACEMENT3D(#57,$,$);\n\
+    #56=IFCSHAPEREPRESENTATION($,'Body','Brep',(#5));\n\
+    #57=IFCCARTESIANPOINT((0.,0.,0.));\n\
+    #58=IFCCARTESIANPOINT((10.,0.,0.));\n";
+
+fn mapped_file(item: &str) -> String {
+    format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC2X3'));ENDSEC;DATA;\n#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+         {}{MAPPED}{item}ENDSEC;END-ISO-10303-21;",
+        CORNERS.split_once("#10=").map(|(_, rest)| format!("#10={rest}")).unwrap()
+    )
+}
+
+#[test]
+fn each_instance_of_a_mapped_item_keeps_its_own_place() {
+    let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let text = mapped_file(&body);
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    for (id, x) in [(2, 0.0), (6, 10.0), (2, 0.0)] {
+        let element = evaluator.evaluate(id).expect("the element evaluates");
+        let mesh = &element.meshes[0].mesh;
+        close(mesh.volume(), 6.0);
+        let least = mesh.positions.iter().fold(f64::INFINITY, |least, point| least.min(point.x));
+        close(least, x);
+    }
+    assert!(evaluator.diagnostics().is_empty());
+}
+
+#[test]
+fn a_problem_in_a_mapped_item_is_reported_for_each_element_using_it() {
+    // A face bounded by a loop the kernel cannot use is skipped, with a warning.
+    let body = faces("#14,#15,#16,#17").replace("#20=IFCPOLYLOOP((#10,#13,#12,#11));", "#20=IFCVERTEXLOOP(#61);\n#61=IFCVERTEXPOINT(#10);")
+        + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    assert!(body.contains("IFCVERTEXLOOP"), "{body}");
+    let text = mapped_file(&body);
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    evaluator.evaluate(2).expect("the first element evaluates");
+    let first = evaluator.diagnostics().len();
+    assert!(first > 0, "the item should warn");
+    evaluator.evaluate(6).expect("the second element evaluates");
+    assert!(evaluator.diagnostics().len() > first, "{:?}", evaluator.diagnostics());
+}
+
+#[test]
+fn triangular_faces_are_kept_and_zero_area_ones_are_dropped() {
+    // A tetrahedron of four faces, plus one face with all three corners on a line.
+    let body = "#20=IFCPOLYLOOP((#10,#12,#11));#21=IFCFACEOUTERBOUND(#20,.T.);#22=IFCFACE((#21));\n\
+        #23=IFCPOLYLOOP((#10,#11,#14));#24=IFCFACEOUTERBOUND(#23,.T.);#25=IFCFACE((#24));\n\
+        #26=IFCPOLYLOOP((#11,#12,#14));#27=IFCFACEOUTERBOUND(#26,.T.);#28=IFCFACE((#27));\n\
+        #29=IFCPOLYLOOP((#12,#10,#14));#30=IFCFACEOUTERBOUND(#29,.T.);#31=IFCFACE((#30));\n\
+        #32=IFCPOLYLOOP((#10,#14,#60));#33=IFCFACEOUTERBOUND(#32,.T.);#34=IFCFACE((#33));\n\
+        #60=IFCCARTESIANPOINT((0.,0.,6.));\n\
+        #40=IFCCONNECTEDFACESET((#22,#25,#28,#31,#34));\n\
+        #5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let mesh = evaluate(body);
+    assert_eq!(mesh.triangles.len(), 4);
+    // Base 1 by 2 over 2, height 3, over 3.
+    close(mesh.volume(), 1.0 * 2.0 / 2.0 * 3.0 / 3.0);
+}
