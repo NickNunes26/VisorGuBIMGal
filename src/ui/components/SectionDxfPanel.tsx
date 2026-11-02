@@ -30,6 +30,14 @@ function downloadExportedDrawing(res: ExportedDrawing): void {
   URL.revokeObjectURL(url);
 }
 
+/** Diagnostics that mean a whole model is not in the drawing. */
+const OMITS_MODEL = new Set([
+  'drawing-model-lost',
+  'map-frame-no-georeference',
+  'map-frame-crs-mismatch',
+  'bad-drawing-chunk'
+]);
+
 /** A drawing that lost lines must not read as a success. */
 function drawingStatus(diagnostics: readonly KernelDiagnostic[]): string {
   const warnings = diagnostics.filter((item) => item.severity !== 'info');
@@ -158,11 +166,11 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
         void kernel.discardDrawing(currentDrawing.drawingId);
       }
 
-      // A model lost on the way is not in this drawing, so closing it must not clear the drawing.
-      const lost = generated.diagnostics
-        .filter((item) => item.code === 'drawing-model-lost')
+      // A model left out is not in this drawing, so closing it must not clear the drawing.
+      const omitted = generated.diagnostics
+        .filter((item) => OMITS_MODEL.has(item.code))
         .map((item) => item.modelId);
-      const drawnIds = modelIds.filter((id) => !lost.includes(id));
+      const drawnIds = modelIds.filter((id) => !omitted.includes(id));
       const firstModel = models.find((m) => m.id === drawnIds[0]);
       setDrawingFirstModelFileName(firstModel ? firstModel.fileName : null);
       setDrawingModelIds(drawnIds);

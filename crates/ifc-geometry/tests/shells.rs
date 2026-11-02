@@ -271,3 +271,71 @@ fn triangular_faces_are_kept_and_zero_area_ones_are_dropped() {
     // Base 1 by 2 over 2, height 3, over 3.
     close(mesh.volume(), 1.0 * 2.0 / 2.0 * 3.0 / 3.0);
 }
+
+
+#[test]
+fn a_set_with_no_shared_indices_still_closes_outward() {
+    // A 2 m cube as 36 corners, one per triangle corner, every triangle wound inward: nothing
+    // shares an index, so adjacency has to come from where the corners are.
+    let cube = Mesh::cuboid(DVec3::ZERO, DVec3::splat(2.0));
+    let mut mesh = Mesh::default();
+    for [a, b, c] in cube.triangle_corners() {
+        let first = mesh.positions.len() as u32;
+        mesh.positions.extend([a, c, b]);
+        mesh.triangles.push([first, first + 1, first + 2]);
+    }
+    close(mesh.volume(), -8.0);
+    mesh.orient_shell();
+    close(mesh.volume(), 8.0);
+}
+
+#[test]
+fn a_corner_at_negative_zero_is_the_same_corner() {
+    // Rounding gives -0.0 as easily as 0.0, and their bits differ. Half the triangles use one.
+    let cube = Mesh::cuboid(DVec3::ZERO, DVec3::splat(2.0));
+    let mut mesh = Mesh::default();
+    for (index, [a, b, c]) in cube.triangle_corners().enumerate() {
+        let zero = |point: DVec3| {
+            let axis = |value: f64| if value == 0.0 && index % 2 == 1 { -0.0 } else { value };
+            DVec3::new(axis(point.x), axis(point.y), axis(point.z))
+        };
+        let first = mesh.positions.len() as u32;
+        mesh.positions.extend([zero(a), zero(c), zero(b)]);
+        mesh.triangles.push([first, first + 1, first + 2]);
+    }
+    mesh.orient_shell();
+    close(mesh.volume(), 8.0);
+}
+
+fn diagnostics_of(body: &str) -> (Mesh, Vec<String>) {
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC2X3'));ENDSEC;DATA;\n{CORNERS}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let element = evaluator.evaluate(2).expect("the element evaluates");
+    let mesh = element.meshes.into_iter().next().map(|item| item.mesh).unwrap_or_default();
+    (mesh, evaluator.diagnostics().iter().map(|item| item.code.to_string()).collect())
+}
+
+#[test]
+fn a_corner_that_cannot_be_read_is_reported() {
+    // #99 does not exist: the quad would quietly become a triangle.
+    let body = faces("#14,#15,#16,#99") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let (_, codes) = diagnostics_of(&body);
+    assert!(codes.iter().any(|code| code == "bad-face"), "{codes:?}");
+}
+
+#[test]
+fn a_face_left_with_too_few_corners_is_reported() {
+    let body = faces("#14,#15") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let (_, codes) = diagnostics_of(&body);
+    assert!(codes.iter().any(|code| code == "bad-face"), "{codes:?}");
+}
+
+#[test]
+fn a_clean_shell_reports_nothing() {
+    let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let (_, codes) = diagnostics_of(&body);
+    assert!(codes.is_empty(), "{codes:?}");
+}

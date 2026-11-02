@@ -39,6 +39,14 @@ function sameCrs(a: CoordinateReference, b: CoordinateReference): boolean {
   return a.crsName !== undefined && a.crsName === b.crsName;
 }
 
+/** Whether open models exist and the frame took none of them: closed ones do not count. */
+export function frameExcludesAll(
+  models: ReadonlyArray<{ open: boolean }>,
+  included: FramedModels['included']
+): boolean {
+  return models.some(({ open }) => open) && !included.some(({ index }) => models[index].open);
+}
+
 /** Applies the frame rules of `docs/05` section 5 to a list of models. */
 export function frameModels(
   frame: DrawingOptions['frame'],

@@ -1,7 +1,11 @@
 // Checks the pure part of the drawing path, with no browser or kernel.
 // usage: node --experimental-strip-types scripts/check-drawing-request.mjs
 import assert from 'node:assert/strict';
-import { drawingRequest, frameModels } from '../src/infrastructure/kernel/drawingRequest.ts';
+import {
+  drawingRequest,
+  frameExcludesAll,
+  frameModels
+} from '../src/infrastructure/kernel/drawingRequest.ts';
 
 const plan = (depth) => ({
   cut: { kind: 'plan', elevation: 1.2, depth },
@@ -37,5 +41,18 @@ const mixed = frameModels(map, [
 ]);
 assert.deepEqual(mixed.included.map(({ index, modelId }) => [index, modelId]), [[1, 'b']]);
 assert.equal(mixed.crsId, 'EPSG:25829');
+
+// One open model the frame excludes, one closed model: the open one decides the error.
+const both = [
+  { modelId: 'a', open: true },
+  { modelId: 'b', open: false }
+];
+assert.equal(frameExcludesAll(both, frameModels(map, both).included), true);
+assert.equal(frameExcludesAll([{ modelId: 'b', open: false }], [{ index: 0, modelId: 'b' }]), false);
+const fine = [
+  { modelId: 'a', open: true, reference },
+  { modelId: 'b', open: false }
+];
+assert.equal(frameExcludesAll(fine, frameModels(map, fine).included), false);
 
 console.log('drawing requests pass');

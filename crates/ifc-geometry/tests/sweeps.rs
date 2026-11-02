@@ -326,3 +326,21 @@ fn ends_that_miss_an_arc_by_a_hair_still_close_the_wall() {
     let exact = turn * (outer * outer - inner * inner) / 2.0 * 6.75;
     close(mesh.volume(), exact, exact * 1e-3);
 }
+
+#[test]
+fn a_hole_too_small_to_keep_is_reported_not_quietly_filled() {
+    // Three points within 10 microns of each other merge into one, and the hole is gone.
+    let (mesh, diagnostics) = evaluated(
+        "IFC4",
+        "#5=IFCEXTRUDEDAREASOLID(#20,#903,#901,1.);\n\
+         #20=IFCARBITRARYPROFILEDEFWITHVOIDS(.AREA.,$,#21,(#22));\n\
+         #21=IFCPOLYLINE((#30,#31,#32,#33,#30));\n\
+         #22=IFCPOLYLINE((#34,#35,#36,#34));\n\
+         #30=IFCCARTESIANPOINT((0.,0.));\n#31=IFCCARTESIANPOINT((10.,0.));\n\
+         #32=IFCCARTESIANPOINT((10.,10.));\n#33=IFCCARTESIANPOINT((0.,10.));\n\
+         #34=IFCCARTESIANPOINT((1.,1.));\n#35=IFCCARTESIANPOINT((1.000005,1.));\n\
+         #36=IFCCARTESIANPOINT((1.,1.000005));\n",
+    );
+    close(mesh.volume(), 100.0, 1e-6);
+    assert!(diagnostics.iter().any(|item| item.code == "bad-profile-hole"), "{diagnostics:?}");
+}

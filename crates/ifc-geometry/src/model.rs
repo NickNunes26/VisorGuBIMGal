@@ -1023,9 +1023,10 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     /// The schema says an enclosure only helps searching and leaves the result alone, but Revit
-    /// writes it as the cut itself: a box centred on the plane, one wall thick. The element's own
-    /// `Volume` confirms that, and the half space alone removes most of the wall. Any other box
-    /// follows the schema.
+    /// writes it as the cut itself: a box centred on the plane in X and Y, starting at the plane,
+    /// one wall thick. In the Revit files tried, the `Volume` each element declares matches that
+    /// reading, and the whole half space removes most of the wall. This goes by the shape of the
+    /// box alone and reads no quantity. Any other box follows the schema.
     fn enclosed_notch(&mut self, entity: &Entity, def: &EntityDef, frame: DMat4, into: DVec3) -> Option<Mesh> {
         if !def.is_a("IfcBoxedHalfSpace") {
             return None;
@@ -2174,11 +2175,15 @@ impl<'a> ModelEvaluator<'a> {
         };
 
         let outer = clean_ring(outer);
+        let given = holes.len();
         let holes: Vec<Vec<DVec2>> = holes
             .into_iter()
             .map(clean_ring)
             .filter(|hole| hole.len() >= 3)
             .collect();
+        if holes.len() != given {
+            self.warn("bad-profile-hole", format!("#{id} has a hole too small to keep"));
+        }
         (outer.len() >= 3).then_some(Profile { outer, holes })
     }
 
@@ -2353,13 +2358,16 @@ impl<'a> ModelEvaluator<'a> {
                 continue;
             };
             let ring = if poly_def.is_a("IfcPolyLoop") {
-                Some(
-                    list(attribute(&poly, &poly_def, "Polygon"))
-                        .iter()
-                        .filter_map(reference)
-                        .filter_map(|point| builder.point(point, |id| self.point(id)))
-                        .collect::<Vec<_>>(),
-                )
+                let corners = list(attribute(&poly, &poly_def, "Polygon"));
+                let points: Vec<DVec3> = corners
+                    .iter()
+                    .filter_map(reference)
+                    .filter_map(|point| builder.point(point, |id| self.point(id)))
+                    .collect();
+                if points.len() != corners.len() {
+                    self.warn("bad-face", format!("#{id} has a corner that cannot be read"));
+                }
+                Some(points)
             } else if poly_def.is_a("IfcEdgeLoop") {
                 self.edge_loop(&poly, &poly_def)
             } else {
@@ -2380,6 +2388,10 @@ impl<'a> ModelEvaluator<'a> {
             outer = Some(holes.remove(0));
         }
         let Some(outer) = outer else { return };
+        if outer.len() < 3 {
+            self.warn("bad-face", format!("#{id} has fewer than three corners"));
+            return;
+        }
 
         let same_sense = flag(attribute(&entity, &def, "SameSense")).unwrap_or(true);
         let surface = attribute(&entity, &def, "FaceSurface")

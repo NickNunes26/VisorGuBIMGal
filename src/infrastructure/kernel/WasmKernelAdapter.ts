@@ -15,7 +15,7 @@ import {
 } from '../../domain/kernel/KernelPort';
 import { mapToLatLng } from '../../domain/coordinates/Coordinates';
 import type { CoordinateReference } from '../../domain/models/ModelRecord';
-import { drawingRequest, frameModels } from './drawingRequest';
+import { drawingRequest, frameExcludesAll, frameModels } from './drawingRequest';
 import type { SheetDiagnostic, StreamStep, WorkerRequest, WorkerResponse } from './protocol';
 
 interface Pending {
@@ -230,7 +230,7 @@ export class WasmKernelAdapter implements KernelPort {
       reference: this.references.get(modelId)
     }));
     const { included, crsId, diagnostics } = frameModels(options.frame, models);
-    if (included.length === 0 && models.some(({ open }) => open)) {
+    if (frameExcludesAll(models, included)) {
       const reason = diagnostics[0]?.message ?? 'Ningún modelo encaja en el marco del plano.';
       throw new KernelError('drawing-frame-empty', reason);
     }

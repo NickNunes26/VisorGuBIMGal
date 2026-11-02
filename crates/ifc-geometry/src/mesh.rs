@@ -104,10 +104,24 @@ impl Mesh {
     /// Makes a shell agree with itself: faces across a shared edge wind the same way, a closed
     /// part winds outward, and an open part keeps the way most of its area faces. Real files
     /// write faces of one shell in both directions. An edge of three or more faces joins nothing.
+    /// Corners at one position count as one, because a face set need not share its indices.
     pub fn orient_shell(&mut self) {
+        let mut ids: HashMap<[u64; 3], u32> = HashMap::new();
+        let welded: Vec<u32> = self
+            .positions
+            .iter()
+            .map(|point| {
+                // Adding zero turns -0.0 into 0.0, which has other bits.
+                let key = (*point + DVec3::ZERO).to_array().map(f64::to_bits);
+                let next = ids.len() as u32;
+                *ids.entry(key).or_insert(next)
+            })
+            .collect();
+        let corners = |triangle: [u32; 3]| triangle.map(|id| welded[id as usize]);
         let mut edges: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-        for (index, [a, b, c]) in self.triangles.iter().enumerate() {
-            for (from, to) in [(*a, *b), (*b, *c), (*c, *a)] {
+        for (index, triangle) in self.triangles.iter().enumerate() {
+            let [a, b, c] = corners(*triangle);
+            for (from, to) in [(a, b), (b, c), (c, a)] {
                 edges.entry((from.min(to), from.max(to))).or_default().push(index as u32);
             }
         }
@@ -126,7 +140,7 @@ impl Mesh {
             while next < part.len() {
                 let current = part[next];
                 next += 1;
-                let [a, b, c] = self.triangles[current];
+                let [a, b, c] = corners(self.triangles[current]);
                 for (from, to) in [(a, b), (b, c), (c, a)] {
                     let users = &edges[&(from.min(to), from.max(to))];
                     let [one, two] = users.as_slice() else {
@@ -139,7 +153,8 @@ impl Mesh {
                     }
                     seen[other] = true;
                     // Neighbours that agree run along their shared edge in opposite directions.
-                    let same_way = self.runs(other, from, to);
+                    let [d, e, f] = corners(self.triangles[other]);
+                    let same_way = [(d, e), (e, f), (f, d)].contains(&(from, to));
                     flip[other] = same_way != flip[current];
                     part.push(other);
                 }
@@ -151,12 +166,6 @@ impl Mesh {
                 triangle.swap(1, 2);
             }
         }
-    }
-
-    /// Whether a triangle runs along `from` to `to`, rather than the other way.
-    fn runs(&self, triangle: usize, from: u32, to: u32) -> bool {
-        let [a, b, c] = self.triangles[triangle];
-        [(a, b), (b, c), (c, a)].contains(&(from, to))
     }
 
     /// Chooses the direction of one connected part, whose flips so far agree with its first.
