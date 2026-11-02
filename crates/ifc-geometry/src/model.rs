@@ -955,6 +955,9 @@ impl<'a> ModelEvaluator<'a> {
         // AgreementFlag is true when the normal points away from the material.
         let agrees = matches!(attribute(entity, def, "AgreementFlag"), Some(Value::Enum(flag)) if flag == "T");
         let into = if agrees { -normal } else { normal };
+        if let Some(notch) = self.enclosed_notch(entity, def, frame, into) {
+            return Some(notch);
+        }
 
         let reach = |from: DVec3| {
             let furthest = target.positions.iter().fold(0.0_f64, |most, point| most.max(point.distance(from)));
@@ -989,6 +992,37 @@ impl<'a> ModelEvaluator<'a> {
                 None
             }
         }
+    }
+
+    /// The schema says an enclosure only helps searching and leaves the result alone, but Revit
+    /// writes it as the cut itself: a box centred on the plane, one wall thick. The element's own
+    /// `Volume` confirms that, and the half space alone removes most of the wall. Any other box
+    /// follows the schema.
+    fn enclosed_notch(&mut self, entity: &Entity, def: &EntityDef, frame: DMat4, into: DVec3) -> Option<Mesh> {
+        if !def.is_a("IfcBoxedHalfSpace") {
+            return None;
+        }
+        let enclosure = attribute(entity, def, "Enclosure").and_then(reference)?;
+        let (enclosure, enclosure_def) = self.lookup(enclosure)?;
+        let corner = attribute(&enclosure, &enclosure_def, "Corner")
+            .and_then(reference)
+            .and_then(|id| self.point(id))?;
+        let scale = self.units.length;
+        let size = |name: &str| attribute(&enclosure, &enclosure_def, name).and_then(number).map(|value| value * scale);
+        let size = DVec3::new(size("XDim")?, size("YDim")?, size("ZDim")?);
+        let centred = |offset: f64, side: f64| (offset.abs() * 2.0 - side).abs() <= 1e-6;
+        let shaped = size.min_element() > 0.0
+            && centred(corner.x, size.x)
+            && centred(corner.y, size.y)
+            && corner.z.abs() <= 1e-6;
+        if !shaped {
+            return None;
+        }
+        let x = frame.x_axis.truncate().try_normalize()?;
+        let y = into.cross(x);
+        let placement = DMat4::from_cols(x.extend(0.0), y.extend(0.0), into.extend(0.0), frame.w_axis);
+        let half = (size / 2.0).truncate();
+        Some(transformed(Mesh::cuboid(-half.extend(0.0), half.extend(size.z)), placement))
     }
 
     /// The placement of a revolution, a point on its axis, the axis, and how far it turns.

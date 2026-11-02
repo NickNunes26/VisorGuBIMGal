@@ -10,6 +10,8 @@ pub(crate) const CIRCLE_SEGMENTS: usize = 32;
 const PIPE_SEGMENTS: usize = 12;
 /// Latitude bands of a sphere.
 const SPHERE_BANDS: usize = 16;
+/// How far a chord of a circular arc may stray from it, in metres.
+const ARC_TOLERANCE: f64 = 0.005;
 
 /// A mesh built inside out is mirrored, not wrong: flip it so its volume is positive.
 pub(crate) fn outward(mut mesh: Mesh) -> Mesh {
@@ -23,9 +25,16 @@ pub(crate) fn outward(mut mesh: Mesh) -> Mesh {
 
 /// Evenly spaced points of a circular arc in the XY plane, both ends included.
 pub(crate) fn arc(center: DVec2, radius: DVec2, start: f64, sweep: f64) -> Vec<DVec2> {
+    arc_of(center, radius, start, sweep, radius.abs().max_element())
+}
+
+/// `arc` for a curve that is `size` metres across once it is placed. A count per turn alone
+/// would let the chords of a wide curve leave it: on a 43 m wall, by more than the wall is thick.
+fn arc_of(center: DVec2, radius: DVec2, start: f64, sweep: f64, size: f64) -> Vec<DVec2> {
     // The small margin stops rounding error adding a facet to an exact fraction of a turn.
     let turns = sweep.abs() / (TAU / CIRCLE_SEGMENTS as f64);
-    let steps = ((turns - 1e-9).ceil() as usize).clamp(1, 4096);
+    let chords = sweep.abs() * (size / (8.0 * ARC_TOLERANCE)).sqrt();
+    let steps = ((turns.max(chords) - 1e-9).ceil() as usize).clamp(1, 4096);
     (0..=steps)
         .map(|step| {
             let angle = start + sweep * step as f64 / steps as f64;
@@ -53,7 +62,7 @@ pub(crate) fn arc_through(a: DVec3, b: DVec3, c: DVec3) -> Vec<DVec3> {
         to.dot(y).atan2(to.dot(x)).rem_euclid(TAU)
     };
     let sweep = angle(c);
-    arc(DVec2::ZERO, DVec2::ONE, 0.0, sweep)
+    arc_of(DVec2::ZERO, DVec2::ONE, 0.0, sweep, radius)
         .into_iter()
         .map(|point| center + (x * point.x + y * point.y) * radius)
         .collect()
@@ -70,7 +79,7 @@ fn lathe(outline: &[DVec2]) -> Mesh {
             rings.push(vec![start; CIRCLE_SEGMENTS]);
             continue;
         }
-        let circle = arc(DVec2::ZERO, DVec2::splat(point.x), 0.0, TAU);
+        let circle = arc_of(DVec2::ZERO, DVec2::splat(point.x), 0.0, TAU, 0.0);
         positions.extend(circle[..CIRCLE_SEGMENTS].iter().map(|ring| ring.extend(point.y)));
         rings.push((start..start + CIRCLE_SEGMENTS as u32).collect());
     }

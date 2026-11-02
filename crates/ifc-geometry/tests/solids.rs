@@ -512,8 +512,9 @@ fn hollow_and_elliptical_profiles() {
         faceted_circle_area(1.0) - faceted_circle_area(0.75),
         1e-9,
     );
-    // An ellipse is a circle stretched, and its facets stretch with it.
-    close(profile_area("#50=IFCELLIPSEPROFILEDEF(.AREA.,$,#905,2.,1.);"), faceted_circle_area(1.0) * 2.0, 1e-9);
+    // Against the true area: 2 m across is wide enough for the chord tolerance to decide, and
+    // 32 stretched facets miss this by 0.04.
+    close(profile_area("#50=IFCELLIPSEPROFILEDEF(.AREA.,$,#905,2.,1.);"), PI * 2.0, 0.025);
 }
 
 #[test]

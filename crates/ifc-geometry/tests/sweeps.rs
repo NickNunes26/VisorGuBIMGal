@@ -198,3 +198,115 @@ fn surface_curve_sweep_off_its_surface_says_so() {
     let (_, diagnostics) = evaluated("IFC4", body);
     assert!(diagnostics.iter().any(|item| item.code == "bad-surface"), "{diagnostics:?}");
 }
+
+
+/// A wall along an arc: the two faces, in one composite curve, and the two ends.
+fn curved_wall(outer: f64, inner: f64, turn: f64) -> String {
+    let point = |id: u32, radius: f64, angle: f64| {
+        format!("#{id}=IFCCARTESIANPOINT(({},{}));\n", radius * angle.cos(), radius * angle.sin())
+    };
+    format!(
+        "#5=IFCEXTRUDEDAREASOLID(#20,#903,#901,6.75);\n\
+         #20=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#21);\n\
+         #21=IFCCOMPOSITECURVE((#22,#23,#24,#25),.F.);\n\
+         #22=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#30);\n\
+         #23=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#32);\n\
+         #24=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.F.,#31);\n\
+         #25=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#33);\n\
+         #30=IFCTRIMMEDCURVE(#40,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE({turn})),.T.,.PARAMETER.);\n\
+         #31=IFCTRIMMEDCURVE(#41,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE({turn})),.T.,.PARAMETER.);\n\
+         #32=IFCPOLYLINE((#50,#51));\n\
+         #33=IFCPOLYLINE((#52,#53));\n\
+         #40=IFCCIRCLE(#905,{outer});\n\
+         #41=IFCCIRCLE(#905,{inner});\n\
+         {}{}{}{}",
+        point(50, outer, turn),
+        point(51, inner, turn),
+        point(52, inner, 0.0),
+        point(53, outer, 0.0),
+    )
+}
+
+#[test]
+fn a_thin_wall_on_a_wide_curve_keeps_its_thickness() {
+    // Chords laid at 32 per turn would cut 370 mm into a 250 mm wall, and the wall would cross
+    // itself.
+    let (outer, inner, turn) = (43.3, 43.05, 32.0_f64.to_radians());
+    let mesh = evaluate(&curved_wall(outer, inner, turn));
+    let exact = turn * (outer * outer - inner * inner) / 2.0 * 6.75;
+    close(mesh.volume(), exact, exact * 1e-3);
+    assert_eq!(mesh.open_edges(), 0);
+}
+
+#[test]
+fn chords_stay_close_on_a_very_wide_curve() {
+    let (outer, inner, turn) = (500.0, 499.8, 0.05);
+    let mesh = evaluate(&curved_wall(outer, inner, turn));
+    let exact = turn * (outer * outer - inner * inner) / 2.0 * 6.75;
+    close(mesh.volume(), exact, exact * 1e-3);
+    for point in &mesh.positions {
+        let radius = point.truncate().length();
+        assert!(radius > inner - 0.006 && radius < outer + 0.006, "{point}");
+    }
+}
+
+#[test]
+fn a_small_curve_keeps_its_facet_count() {
+    // 200 mm is well inside the tolerance, so the count per turn still decides.
+    let mesh = evaluate(&curved_wall(0.2, 0.1, FRAC_PI_2));
+    assert_eq!(mesh.positions.len(), 2 * (2 * 9));
+}
+
+/// A box 2 by 1 by 3 at the origin, cut by a half space through x = 0.5 that keeps +X.
+fn boxed(enclosure: &str) -> Mesh {
+    evaluate(&format!(
+        "#5=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#20,#21);\n\
+         #20=IFCEXTRUDEDAREASOLID(#906,#903,#901,3.);\n\
+         #21=IFCBOXEDHALFSPACE(#22,.F.,#26);\n\
+         #22=IFCPLANE(#23);\n\
+         #23=IFCAXIS2PLACEMENT3D(#24,#25,#901);\n\
+         #24=IFCCARTESIANPOINT((0.5,0.,1.5));\n\
+         #25=IFCDIRECTION((-1.,0.,0.));\n\
+         {enclosure}"
+    ))
+}
+
+#[test]
+fn a_box_centred_on_the_plane_limits_the_cut_as_revit_means_it() {
+    // Revit writes the corner as half the box, in either sign. The notch is 0.2 deep.
+    for corner in ["1.5,0.5,0.", "-1.5,-0.5,0.", "1.5,-0.5,0."] {
+        let mesh = boxed(&format!(
+            "#26=IFCBOUNDINGBOX(#27,3.,1.,0.2);\n#27=IFCCARTESIANPOINT(({corner}));\n"
+        ));
+        close(mesh.volume(), 6.0 - 0.2 * 1.0 * 3.0, 1e-9);
+        assert_eq!(mesh.open_edges(), 0);
+    }
+}
+
+#[test]
+fn any_other_box_only_helps_searching_as_the_schema_says() {
+    // Each of these misses the shape in one way only, and all are the size of the notch above.
+    for corner in ["-1.5,-0.5,-0.1", "0.,-0.5,0.", "1.5,0.,0.", "0.,0.,0."] {
+        let mesh = boxed(&format!(
+            "#26=IFCBOUNDINGBOX(#27,3.,1.,0.2);\n#27=IFCCARTESIANPOINT(({corner}));\n"
+        ));
+        close(mesh.volume(), 0.5 * 1.0 * 3.0, 1e-9);
+    }
+}
+
+#[test]
+fn an_arc_given_by_three_points_holds_the_tolerance_at_its_real_size() {
+    // A quarter of a 100 m circle through three indexed points: the bar has to stay on the
+    // circle between them.
+    let mesh = evaluate(
+        "#5=IFCSWEPTDISKSOLID(#20,0.1,$,$,$);\n\
+         #20=IFCINDEXEDPOLYCURVE(#21,(IFCARCINDEX((1,2,3))),$);\n\
+         #21=IFCCARTESIANPOINTLIST3D(((100.,0.,0.),(70.71067811865476,70.71067811865476,0.),(0.,100.,0.)));\n",
+    );
+    for [a, b, c] in mesh.triangle_corners() {
+        for middle in [(a + b) / 2.0, (b + c) / 2.0, (c + a) / 2.0] {
+            let off = (middle.truncate().length() - 100.0).abs();
+            assert!(off <= 0.1 + 0.006, "{middle} is {off} from the circle");
+        }
+    }
+}
