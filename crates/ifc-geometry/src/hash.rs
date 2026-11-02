@@ -27,7 +27,8 @@ pub fn set_secret(secret: [u64; WORDS]) {
     for (word, value) in SECRET.iter().zip(secret) {
         word.store(value, Ordering::Relaxed);
     }
-    SECRET_SET.store(true, Ordering::Relaxed);
+    // Release, so a thread that sees the flag also sees the words.
+    SECRET_SET.store(true, Ordering::Release);
 }
 
 pub type KeyedMap<K, V> = HashMap<K, V, Keyed>;
@@ -42,7 +43,7 @@ impl Default for Keyed {
     /// Until the host sets a secret, the standard library's keys: random on native targets, the
     /// same on every run in WebAssembly, whose host always sets one.
     fn default() -> Self {
-        if SECRET_SET.load(Ordering::Relaxed) {
+        if SECRET_SET.load(Ordering::Acquire) {
             return Self::with_secret(SECRET.each_ref().map(|word| word.load(Ordering::Relaxed)));
         }
         let state = RandomState::new();
@@ -51,9 +52,10 @@ impl Default for Keyed {
 }
 
 impl Keyed {
-    /// A high half of zero would make every one-word key alike, so it is never zero.
+    /// A half of zero would make keys alike whose other half is zero, as in one-word ids and
+    /// whole-number coordinates, so both halves are odd.
     pub fn with_secret(secret: [u64; WORDS]) -> Self {
-        Self { secret: secret.map(|word| word | 1 << 32) }
+        Self { secret: secret.map(|word| word | (1 << 32 | 1)) }
     }
 }
 
@@ -89,6 +91,14 @@ impl Hasher for KeyedHasher {
             self.write_u64(u64::from_le_bytes(word));
         }
         self.write_u64(bytes.len() as u64);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write_u64(u64::from(value));
     }
 
     fn write_u32(&mut self, value: u32) {

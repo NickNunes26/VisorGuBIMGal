@@ -140,10 +140,21 @@ fn words_past_the_secret_cannot_trade_places() {
 }
 
 #[test]
-fn a_secret_with_zero_halves_still_tells_ids_apart() {
-    for secret in [[0; 4], [1, 2, 3, 4], [u64::MAX, 0, u64::MAX, 0]] {
+fn a_secret_with_zero_halves_still_tells_keys_apart() {
+    for secret in [[0; 4], [1, 2, 3, 4], [u64::MAX, 0, u64::MAX, 0], [0, u64::MAX, 0, u64::MAX]] {
         let keyed = Keyed::with_secret(secret);
         let hashes: Vec<u64> = (0..4096u32).map(|id| keyed.hash_one(id << 20)).collect();
         assert_spread("ids", &hashes);
+        // Whole numbers leave a coordinate's low half zero, at each word of the key.
+        let whole = |at: u32| f64::from(at).to_bits();
+        let fixed = 0.5f64.to_bits();
+        for (name, key) in [
+            ("first", &(|at| (whole(at), fixed, fixed)) as &dyn Fn(u32) -> (u64, u64, u64)),
+            ("second", &|at| (fixed, whole(at), fixed)),
+            ("third", &|at| (fixed, fixed, whole(at))),
+        ] {
+            let hashes: Vec<u64> = (0..4096).map(|at| keyed.hash_one(key(at))).collect();
+            assert_spread(name, &hashes);
+        }
     }
 }
