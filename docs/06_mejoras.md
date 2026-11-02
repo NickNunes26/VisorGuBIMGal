@@ -20,15 +20,15 @@ Objetivo medible: ningún bloqueo del hilo principal por encima de 200 ms (hoy 2
 
 | ID | Mejora | Evidencia en el código | Tam. | Origen | Comprobado |
 |---|---|---|---|---|---|
-| A1 | Quitar el bucle por vértice que calcula los límites del modelo en JavaScript; usar los límites del kernel | `WebGpuRenderer.ts:661-667`, equivalente en `WebGl2Renderer.ts` | S | C+G | Sí. Que sea la causa principal de los bloqueos es probable, no medido |
-| A2 | No reconstruir toda la tabla de registros cada vez que llega un lote; añadir en su sitio | `WebGpuRenderer.ts:1114-1120` copia palabra a palabra todos los registros | S | C | Sí |
+| A1 | Quitar el bucle por vértice que calcula los límites del modelo en JavaScript; usar los límites del kernel | `WebGpuRenderer.ts:661-667`, equivalente en `WebGl2Renderer.ts` | S | C+G | Sí. Medido el 2026-11-03: no es la causa de los bloqueos; el bucle no aparece en ningún tramo de más de 50 ms del hilo principal. Ganancia pequeña |
+| A2 | No reconstruir toda la tabla de registros cada vez que llega un lote; añadir en su sitio | `WebGpuRenderer.ts:1114-1120` copia palabra a palabra todos los registros | S | C | Sí. Medido el 2026-11-03: tampoco aparece en ningún tramo de más de 50 ms |
 | A3 | Repartir la subida a GPU entre fotogramas con un presupuesto de tiempo por fotograma | Ruta de `addBatch` en ambos renderizadores | M | C | Diseño |
 | A4 | Separar índices opacos y transparentes en el kernel, no en el hilo principal | `WebGpuRenderer.ts:765-782` copia con `subarray`/`set` por registro en lotes mixtos | M | G | Sí. Toca el contrato |
 | A5 | Canal con 1 o 2 lotes por adelantado entre Worker e hilo principal, en vez de petición y respuesta por lote | `WasmKernelAdapter.ts:133-145` espera cada `next-batch` | M | G | Sí. La ganancia está sin medir |
 | A6 | Descarte por frustum por lote; el kernel envía la caja de cada lote | `WebGpuRenderer.ts:1239-1257` dibuja todos los lotes visibles; los lotes no llevan caja, solo `MAX_BATCH_RADIUS` | M | C+G | Sí. Toca el contrato |
 | A7 | Podar lotes con un rayo contra cajas antes del pase de selección | `WebGpuRenderer.ts:1341` en adelante dibuja toda la escena con scissor 1x1 | S | G | Sí. Depende de A6 |
 | A8 | Descarte de caras traseras en mallas que el kernel marque cerradas | `cullMode: 'none'` en `WebGpuRenderer.ts:292,332,356`; `WebGl2Renderer.ts:1146` | M | C | Sí. Las mallas abiertas deben seguir sin descarte |
-| A9 | Perfilar la carga del kernel con el modelo público de 184 MB (23 s solo el kernel frente a 11,5 s de IFClite) | Registro de T-061 | M | C | Cifras en el registro |
+| A9 | Perfilar la carga del kernel con el modelo público de 184 MB (el 2026-11-03, en el mismo navegador: 11,6 a 13,3 s el kernel frente a 11,0 a 11,3 s IFClite) | Registro de T-061 | M | C | Cifras en el registro. Los demás modelos grandes ya cargan entre 1,8 y 3,7 veces más rápido que IFClite |
 | A10 | Caché de geometría en OPFS o IndexedDB por hash del archivo: reabrir un modelo sin analizar ni evaluar | Ninguna | M | C | Función nueva |
 | A11 | Compresión de vértices: posiciones de 16 bits respecto a la caja del lote, normales octaédricas | `GeometryBatch.ts` usa f32 | M | C | Sí. Toca el contrato |
 | A12 | Omitir objetos diminutos mientras la cámara se mueve; detalle completo al parar | Ninguna | M | C | Función nueva |
