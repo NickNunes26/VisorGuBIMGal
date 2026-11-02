@@ -11,7 +11,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "coi-serviceworker": "^0.1.7",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.475.0",
     "proj4": "^2.15.0",
