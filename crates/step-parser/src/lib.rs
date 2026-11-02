@@ -210,11 +210,32 @@ impl IdTable {
         }
     }
 
+    /// A gap holds `NO_ENTRY`, which no entry position reaches, so the caller's
+    /// bounds check on the entries rejects it.
     fn get(&self, id: u32) -> Option<u32> {
         match self {
-            Self::Dense(table) => table.get(id as usize).copied().filter(|&at| at != NO_ENTRY),
+            Self::Dense(table) => table.get(id as usize).copied(),
             Self::Sparse(map) => map.get(&id).copied(),
         }
+    }
+}
+
+#[cfg(test)]
+mod id_table_tests {
+    use super::{HashMap, IdTable};
+
+    fn table(ids: &[u32]) -> IdTable {
+        let by_id: HashMap<u32, u32> = ids.iter().enumerate().map(|(at, id)| (*id, at as u32)).collect();
+        IdTable::new(by_id)
+    }
+
+    #[test]
+    fn scattered_ids_never_get_a_table_sized_by_the_largest_id() {
+        // Inside WASM a table up to u32::MAX would need 16 GB and kill the model.
+        assert!(matches!(table(&[7, u32::MAX]), IdTable::Sparse(_)));
+        assert!(matches!(table(&[1, 2, 5_000]), IdTable::Sparse(_)));
+        assert!(matches!(table(&[1, 2, 3, 900]), IdTable::Dense(_)));
+        assert!(matches!(table(&[]), IdTable::Sparse(_)));
     }
 }
 
