@@ -11,10 +11,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@ifc-lite/drawing-2d": "^4.2.0",
-    "@ifc-lite/geometry": "^7.8.1",
-    "@ifc-lite/parser": "^9.5.1",
-    "@ifc-lite/renderer": "^6.4.0",
     "coi-serviceworker": "^0.1.7",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.475.0",

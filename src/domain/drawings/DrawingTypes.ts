@@ -20,8 +20,6 @@ export interface DrawingOptions {
   includeProjection: boolean;     // Visible and hidden lines, which come from one pass
   includeHiddenLines: boolean;    // Requires includeProjection
   includeHatching: boolean;
-  includeEdges: boolean;          // IFClite only: the kernel ignores it. Removed by T-051
-  mergeLines: boolean;            // IFClite only: the kernel ignores it. Removed by T-051
 }
 
 export interface DrawingExportConfig {

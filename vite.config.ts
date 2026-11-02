@@ -6,28 +6,11 @@ const isolationHeaders = {
   'Cross-Origin-Embedder-Policy': 'credentialless',
 };
 
-function fixIfcLiteWorkersPlugin() {
-  return {
-    name: 'fix-ifc-lite-workers',
-    transform(code: string, id: string) {
-      if (id.includes('@ifc-lite') && code.includes('geometry.worker.ts')) {
-        return {
-          code: code.replace(/geometry\.worker\.ts/g, 'geometry.worker.js'),
-          map: null,
-        };
-      }
-    },
-  };
-}
-
 export default defineConfig({
   base: process.env.NODE_ENV === 'production' ? '/VisorGuBIMGal/' : '/',
-  plugins: [react(), fixIfcLiteWorkersPlugin()],
+  plugins: [react()],
   worker: {
     format: 'es',
-  },
-  optimizeDeps: {
-    exclude: ['@ifc-lite/wasm'],
   },
   server: {
     headers: isolationHeaders,

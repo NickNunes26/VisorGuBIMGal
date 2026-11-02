@@ -64,7 +64,7 @@ export interface PropertyItem {
   name: string;
   value: PropertyScalar;          // Raw when single, never converted to SI. Otherwise for display: see `structured`
   type?: string;
-  kind?: 'property' | 'quantity'; // Absent means 'property'. The kernel always sets it; required at T-051
+  kind: 'property' | 'quantity';
   unit?: string;                  // Effective unit of `value`, when one is known
   structured?: PropertyValue;     // Present exactly when the value is not single
   methodOfMeasurement?: string;   // IfcElementQuantity.MethodOfMeasurement
