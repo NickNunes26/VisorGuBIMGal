@@ -93,6 +93,8 @@ pub struct ModelEvaluator<'a> {
     schema: &'static Schema,
     /// Schema definition of each type in `file.type_names()`, by position.
     defs: Vec<Option<EntityDef>>,
+    /// Position of `IFCCARTESIANPOINT` in `file.type_names()`, for the fast path in `point`.
+    cartesian_point: Option<u32>,
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
     curves: HashMap<u32, Rc<Stationed>>,
@@ -576,6 +578,10 @@ impl<'a> ModelEvaluator<'a> {
             file,
             schema: tables,
             defs: file.type_names().map(|name| tables.entity(name)).collect(),
+            cartesian_point: file
+                .type_names()
+                .position(|name| name == "IFCCARTESIANPOINT")
+                .and_then(|at| u32::try_from(at).ok()),
             units: project_units(file, tables),
             placements: HashMap::new(),
             curves: HashMap::new(),
@@ -1378,6 +1384,15 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     fn point(&self, id: u32) -> Option<DVec3> {
+        let found = self.file.get(id)?;
+        // Most points are plain numbers, read without building an entity. Anything else, or
+        // another type, takes the full path, which gives the same answer for those.
+        if Some(found.type_index) == self.cartesian_point {
+            if let Some(([x, y, z], count)) = self.file.decode_coordinates(found) {
+                let z = if count == 3 { z } else { 0.0 };
+                return Some(DVec3::new(x, y, z) * self.units.length);
+            }
+        }
         let (entity, def) = self.lookup(id)?;
         let coordinates = list(attribute(&entity, &def, "Coordinates"));
         let value = |index: usize| coordinates.get(index).and_then(number);

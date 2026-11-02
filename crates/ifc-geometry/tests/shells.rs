@@ -330,6 +330,33 @@ fn a_corner_that_cannot_be_read_is_reported() {
 }
 
 #[test]
+fn a_corner_that_is_not_a_point_is_not_read_as_one() {
+    // #99 holds three numbers, as a point would, but a direction has no coordinates.
+    let body = faces("#14,#15,#16,#99")
+        + "#99=IFCDIRECTION((0.,2.,3.));\n#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let (_, codes) = diagnostics_of(&body);
+    assert!(codes.iter().any(|code| code == "bad-face"), "{codes:?}");
+}
+
+#[test]
+fn points_written_in_other_ways_read_the_same() {
+    // A typed coordinate and a two-coordinate point take the full decoder; the rest do not.
+    let corners = CORNERS
+        .replace("#14=IFCCARTESIANPOINT((0.,0.,3.))", "#14=IFCCARTESIANPOINT((IFCLENGTHMEASURE(0.),0,3))")
+        .replace("#10=IFCCARTESIANPOINT((0.,0.,0.))", "#10=IFCCARTESIANPOINT((0.,0.))");
+    let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+    let text = format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC2X3'));ENDSEC;DATA;\n{corners}{body}ENDSEC;END-ISO-10303-21;"
+    );
+    assert_ne!(corners, CORNERS);
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    let mesh = evaluator.evaluate(2).unwrap().meshes.remove(0).mesh;
+    close(mesh.volume(), 6.0);
+    assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());
+}
+
+#[test]
 fn a_face_left_with_too_few_corners_is_reported() {
     let body = faces("#14,#15") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
     let (_, codes) = diagnostics_of(&body);

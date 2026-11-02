@@ -352,6 +352,14 @@ impl<'a> StepIndex<'a> {
         parser.parse_entity()
     }
 
+    /// The numbers of a record whose only parameter is a list of two or three plain numbers,
+    /// such as most `IFCCARTESIANPOINT`s, read with no allocation. `None` for any other shape,
+    /// valid or not: then [`Self::decode_ref`] has the answer. Whenever this answers, it
+    /// agrees with that.
+    pub fn decode_coordinates(&self, entity: EntityRef<'_>) -> Option<([f64; 3], usize)> {
+        parser::Parser::new(self.bytes, entity.start, entity.end).parse_coordinates()
+    }
+
     fn ref_for(&self, entry: &Entry) -> Option<EntityRef<'_>> {
         let type_name = self.types.get(entry.type_idx as usize)?;
         Some(EntityRef {

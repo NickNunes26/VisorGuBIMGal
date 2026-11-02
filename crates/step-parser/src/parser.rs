@@ -211,6 +211,58 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Reads `#id=NAME((a,b));` or `#id=NAME((a,b,c));` with plain numbers and no allocation.
+    /// Any other shape, valid or not, gives `None`, and [`Self::parse_entity`] has the answer.
+    pub(crate) fn parse_coordinates(&mut self) -> Option<([f64; 3], usize)> {
+        self.skip_ws_comments().ok()?;
+        self.expect(b'#').ok()?;
+        self.parse_u32_digits().ok()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b'=').ok()?;
+        self.skip_ws_comments().ok()?;
+        let name_start = self.pos;
+        while self.peek().is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            self.pos = self.pos.saturating_add(1);
+        }
+        if self.pos == name_start {
+            return None;
+        }
+        self.skip_ws_comments().ok()?;
+        self.expect(b'(').ok()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b'(').ok()?;
+        let mut values = [0.0; 3];
+        let mut count = 0;
+        loop {
+            self.skip_ws_comments().ok()?;
+            let number = match (self.peek()?, self.peek_at(1)) {
+                (b'+' | b'-' | b'0'..=b'9', _) => true,
+                (b'.', Some(next)) => next.is_ascii_digit(),
+                _ => false,
+            };
+            if !number || count == values.len() {
+                return None;
+            }
+            values[count] = match self.parse_number().ok()? {
+                Value::Real(value) => value,
+                Value::Integer(value) => value as f64,
+                _ => return None,
+            };
+            count += 1;
+            self.skip_ws_comments().ok()?;
+            match self.bump()? {
+                b',' => {}
+                b')' => break,
+                _ => return None,
+            }
+        }
+        self.skip_ws_comments().ok()?;
+        self.expect(b')').ok()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b';').ok()?;
+        (count >= 2).then_some((values, count))
+    }
+
     /// Parse `(NAME(params)NAME(params)...)`, the body of a complex instance.
     fn parse_complex_parts(&mut self) -> Result<Vec<(String, Vec<Value>)>, ParseError> {
         self.expect(b'(')?;
