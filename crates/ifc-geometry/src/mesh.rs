@@ -3,6 +3,9 @@
 use glam::DVec3;
 use std::collections::HashMap;
 
+/// A triangle side that is open, or shared by three or more faces.
+const NO_NEIGHBOUR: u32 = u32::MAX;
+
 /// Triangles wind counter-clockwise seen from outside the solid.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mesh {
@@ -106,23 +109,36 @@ impl Mesh {
     /// write faces of one shell in both directions. An edge of three or more faces joins nothing.
     /// Corners at one position count as one, because a face set need not share its indices.
     pub fn orient_shell(&mut self) {
-        let mut ids: HashMap<[u64; 3], u32> = HashMap::new();
-        let welded: Vec<u32> = self
-            .positions
-            .iter()
-            .map(|point| {
-                // Adding zero turns -0.0 into 0.0, which has other bits.
-                let key = (*point + DVec3::ZERO).to_array().map(f64::to_bits);
-                let next = ids.len() as u32;
-                *ids.entry(key).or_insert(next)
-            })
-            .collect();
+        // Adding zero turns -0.0 into 0.0, which has other bits.
+        let key = |index: u32| (self.positions[index as usize] + DVec3::ZERO).to_array().map(f64::to_bits);
+        // Corners sorted by position share a label with the one before when equal. Any labels
+        // work, as long as equal positions share one.
+        let mut order: Vec<u32> = (0..self.positions.len() as u32).collect();
+        order.sort_unstable_by_key(|index| key(*index));
+        let mut welded = vec![0u32; self.positions.len()];
+        if let Some(first) = order.first() {
+            welded[*first as usize] = *first;
+        }
+        for pair in order.windows(2) {
+            let same = key(pair[0]) == key(pair[1]);
+            welded[pair[1] as usize] = if same { welded[pair[0] as usize] } else { pair[1] };
+        }
         let corners = |triangle: [u32; 3]| triangle.map(|id| welded[id as usize]);
-        let mut edges: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        // Sorting the edges groups each one's faces with no allocation per edge, which a map of
+        // lists cost on every shell. Only an edge of exactly two faces joins them.
+        let mut edges: Vec<(u32, u32, u32, u8)> = Vec::with_capacity(self.triangles.len() * 3);
         for (index, triangle) in self.triangles.iter().enumerate() {
             let [a, b, c] = corners(*triangle);
-            for (from, to) in [(a, b), (b, c), (c, a)] {
-                edges.entry((from.min(to), from.max(to))).or_default().push(index as u32);
+            for (side, (from, to)) in [(a, b), (b, c), (c, a)].into_iter().enumerate() {
+                edges.push((from.min(to), from.max(to), index as u32, side as u8));
+            }
+        }
+        edges.sort_unstable();
+        let mut neighbours = vec![[NO_NEIGHBOUR; 3]; self.triangles.len()];
+        for group in edges.chunk_by(|one, two| (one.0, one.1) == (two.0, two.1)) {
+            if let [(_, _, one, one_side), (_, _, two, two_side)] = group {
+                neighbours[*one as usize][*one_side as usize] = *two;
+                neighbours[*two as usize][*two_side as usize] = *one;
             }
         }
         let mut flip = vec![false; self.triangles.len()];
@@ -141,13 +157,13 @@ impl Mesh {
                 let current = part[next];
                 next += 1;
                 let [a, b, c] = corners(self.triangles[current]);
-                for (from, to) in [(a, b), (b, c), (c, a)] {
-                    let users = &edges[&(from.min(to), from.max(to))];
-                    let [one, two] = users.as_slice() else {
+                for (side, (from, to)) in [(a, b), (b, c), (c, a)].into_iter().enumerate() {
+                    let other = neighbours[current][side];
+                    if other == NO_NEIGHBOUR {
                         closed = false;
                         continue;
-                    };
-                    let other = if *one as usize == current { *two } else { *one } as usize;
+                    }
+                    let other = other as usize;
                     if seen[other] {
                         continue;
                     }

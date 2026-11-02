@@ -152,8 +152,11 @@ fn an_edge_of_three_faces_does_not_panic_or_lose_triangles() {
         ],
         triangles: vec![[0, 1, 2], [0, 1, 3], [0, 1, 4]],
     };
+    let wanted = mesh.clone();
     mesh.orient_shell();
-    assert_eq!(mesh.triangles.len(), 3);
+    // Each face is a part of its own: joined across the fork, the second would turn to
+    // disagree with the first, since both run 0 to 1.
+    assert_eq!(mesh, wanted);
 }
 
 #[test]
