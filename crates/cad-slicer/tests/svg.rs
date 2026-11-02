@@ -161,3 +161,18 @@ fn without_labels_the_layer_name_does_not_appear() {
     let svg = to_svg(&drawing_with("Muros"));
     assert!(!svg.contains("Muros"));
 }
+
+
+#[test]
+fn a_sheet_opens_at_a_printed_scale() {
+    // 40 by 20 m plus 2% of 40 on each side, at 1:100.
+    let meshes = [DrawingMesh::new(1, 1, "wall", cuboid(v(0.0, 0.0, 0.0), v(40.0, 20.0, 3.0)))];
+    let drawing = draw(&meshes, &DrawingOptions::cut_only(Cut::Plan { z: 1.0 }));
+    let svg = to_svg(&drawing);
+    assert!(svg.contains(r#"width="416.0000mm" height="216.0000mm" viewBox="0 0 41.6000 21.6000""#), "{}", &svg[..200]);
+
+    // The same sheet in millimetres keeps its printed size.
+    let options = SvgOptions { millimetres_per_unit: 0.01, ..SvgOptions::default() };
+    let svg = to_svg_with(&drawing.scaled(1000.0), &options);
+    assert!(svg.contains(r#"width="416.0000mm""#), "{}", &svg[..200]);
+}

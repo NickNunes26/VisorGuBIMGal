@@ -312,6 +312,7 @@ impl SheetStore {
             let svg = SvgOptions {
                 include_hidden: options.show_hidden,
                 include_hatch: options.show_hatching,
+                millimetres_per_unit: 10.0 / options.scale,
                 ..SvgOptions::default()
             };
             to_svg_with(drawing, &svg).into_bytes()

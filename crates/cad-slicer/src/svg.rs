@@ -8,13 +8,16 @@ use crate::text::xml_text;
 use crate::{Drawing, Loop, Segment};
 use glam::DVec2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SvgOptions {
     /// Writes one line of text per layer below the drawing. Off by default: a drawing for a
     /// customer does not carry its layer list.
     pub layer_labels: bool,
     pub include_hidden: bool,
     pub include_hatch: bool,
+    /// Printed size of one drawing unit, so the file opens at a scale rather than as a speck:
+    /// a browser reads a bare width of 40 as 40 pixels. 10 is 1:100 for a drawing in metres.
+    pub millimetres_per_unit: f64,
 }
 
 impl Default for SvgOptions {
@@ -23,6 +26,7 @@ impl Default for SvgOptions {
             layer_labels: false,
             include_hidden: true,
             include_hatch: true,
+            millimetres_per_unit: 10.0,
         }
     }
 }
@@ -61,9 +65,9 @@ pub fn to_svg_with(drawing: &Drawing, options: &SvgOptions) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str(&format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">\n",
-        number(width),
-        number(height),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}mm\" height=\"{}mm\" viewBox=\"0 0 {} {}\">\n",
+        number(width * options.millimetres_per_unit),
+        number(height * options.millimetres_per_unit),
         number(width),
         number(height)
     ));
