@@ -1,6 +1,6 @@
 # 05 — Contrato del Kernel y del Renderizador
 
-**Estado:** v1, revisión 5, que recoge la revisión posterior de DeepSeek a la revisión 4. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
+**Estado:** v1, revisión 6: la revisión 5, que recogía la revisión de DeepSeek a la revisión 4, con dos aclaraciones de redacción de la sección 6 tras la revisión de Gemini. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
 **Propósito:** Fuente única de los límites entre kernel, renderizador y aplicación.  
 **Código normativo:** [`src/domain/kernel/`](../src/domain/kernel/), [`DrawingTypes.ts`](../src/domain/drawings/DrawingTypes.ts) y [`ModelRecord.ts`](../src/domain/models/ModelRecord.ts). Si este documento y los tipos discrepan, es un error que debe corregirse.
 
@@ -308,7 +308,7 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 
 1. El adaptador resuelve la lista de modelos y el CRS común (sección 5), y crea el Worker de plano con `Sheet::new`.
 2. Cada Worker de modelo evalúa sus elementos uno a uno y los pasa a coordenadas del marco en `f64`, aplicando su `localToMap` si el marco es `map`.
-3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, posiciones `f64` y triángulos. La trama de `IfcFillAreaStyleHatching` necesitará un campo más (sección 7). Descarta antes los elementos cuya caja, calculada en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también los que no tocan el plano. Un elemento fuera de esa zona no se ve ni oculta nada.
+3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, posiciones `f64` y triángulos. La trama de `IfcFillAreaStyleHatching` necesitará un campo más (sección 7). Cada elemento se evalúa entero, y antes de escribir el trozo se descarta cada parte de malla cuya profundidad, medida en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también las que no tocan el plano. Una parte fuera de esa zona no se ve ni oculta nada.
 4. El hilo principal transfiere cada trozo a `Sheet::add_chunk` sin leerlo ni guardarlo, y **solo pide el siguiente cuando `add_chunk` ha terminado**. Así los trozos nunca se acumulan en la cola de mensajes, y los de un modelo llegan en orden. `finish_drawing` devuelve los diagnósticos del modelo.
 5. Si un modelo se pierde a medias, el adaptador llama a `Sheet::drop_model` antes de seguir. Antes de generar repite la comprobación con los modelos que ya terminaron, porque pueden haberse cerrado mientras se atendía a otro.
 6. `Sheet::generate` ordena las mallas por `(model_index, expressId, parte)`, llama una vez a `cad_slicer::draw` con todas, libera las mallas y devuelve los diagnósticos, cuyo `model_index` el adaptador traduce a `ModelId`.
@@ -316,7 +316,7 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 
 `start_drawing` usa su propio evaluador, y el Worker atiende de uno en uno, así que un plano puede intercalarse con un flujo de geometría del mismo modelo. Los trozos son formato interno entre dos Workers de la misma versión, pero `add_chunk` los valida igual, incluidos los índices de triángulos, y nunca entra en pánico. Los modelos se atienden uno tras otro: un plano evalúa en serie, y la concurrencia entre Workers de modelo solo vale para `streamGeometry`.
 
-**Por qué una pasada conjunta y no un dibujo por modelo que luego se funde:** un dibujo por modelo deja sólidas las líneas que otro modelo oculta, y corregirlo exigiría un segundo protocolo de oclusores. Además, retener todas las mallas en el Worker de un modelo fija ese máximo de memoria hasta cerrarlo, mientras que el Worker de plano se destruye. El coste es un solo hilo para el corte, cuatro copias transitorias de cada triángulo (al trozo, al salir de WASM, al entrar en la otra instancia y de vuelta a malla), y un pico de memoria con la suma de los modelos, que sigue en esa instancia hasta `discardDrawing` y que T-061 mide. Un plano demasiado grande rechaza con `out-of-memory` sin afectar a los modelos.
+**Por qué una pasada conjunta y no un dibujo por modelo que luego se funde:** un dibujo por modelo deja sólidas las líneas que otro modelo oculta, y corregirlo exigiría un segundo protocolo de oclusores. Además, retener todas las mallas en el Worker de un modelo fija ese máximo de memoria hasta cerrarlo, mientras que el Worker de plano se destruye. El coste es un solo hilo para el corte, cuatro copias transitorias de cada triángulo (al trozo, al salir de WASM, al entrar en la otra instancia y de vuelta a malla), y un pico de memoria con la suma de los modelos. `Sheet::generate` libera las mallas, pero la memoria WASM no encoge, así que la instancia conserva ese pico reservado hasta que `discardDrawing` termina su Worker. T-061 lo mide. Un plano demasiado grande rechaza con `out-of-memory` sin afectar a los modelos.
 
 ---
 
