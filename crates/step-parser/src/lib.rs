@@ -360,6 +360,29 @@ impl<'a> StepIndex<'a> {
         parser::Parser::new(self.bytes, entity.start, entity.end).parse_coordinates()
     }
 
+    /// The references of a record whose only parameter is a list of references, such as most
+    /// `IFCPOLYLOOP`s and `IFCFACE`s, read into `out` with no other allocation. `false`, with
+    /// `out` empty, for any other shape, valid or not: then [`Self::decode_ref`] has the
+    /// answer. Whenever this answers, it agrees with that.
+    pub fn decode_references(&self, entity: EntityRef<'_>, out: &mut Vec<u32>) -> bool {
+        out.clear();
+        let read = parser::Parser::new(self.bytes, entity.start, entity.end)
+            .parse_reference_list(out)
+            .is_some();
+        if !read {
+            out.clear();
+        }
+        read
+    }
+
+    /// The parameters of a record written as a reference then `.T.` or `.F.`, such as most
+    /// `IFCFACEOUTERBOUND`s, read with no allocation. `None` for any other shape, valid or
+    /// not: then [`Self::decode_ref`] has the answer. Whenever this answers, it agrees with
+    /// that.
+    pub fn decode_reference_and_boolean(&self, entity: EntityRef<'_>) -> Option<(u32, bool)> {
+        parser::Parser::new(self.bytes, entity.start, entity.end).parse_reference_and_boolean()
+    }
+
     fn ref_for(&self, entry: &Entry) -> Option<EntityRef<'_>> {
         let type_name = self.types.get(entry.type_idx as usize)?;
         Some(EntityRef {

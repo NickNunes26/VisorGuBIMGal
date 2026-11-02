@@ -211,9 +211,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Reads `#id=NAME((a,b));` or `#id=NAME((a,b,c));` with plain numbers and no allocation.
-    /// Any other shape, valid or not, gives `None`, and [`Self::parse_entity`] has the answer.
-    pub(crate) fn parse_coordinates(&mut self) -> Option<([f64; 3], usize)> {
+    /// Skips `#id=NAME(`, the start of an ordinary record, for the readers below, which
+    /// allocate nothing and give `None` for any shape but their own, valid or not. Then
+    /// [`Self::parse_entity`] has the answer.
+    fn skip_record_start(&mut self) -> Option<()> {
         self.skip_ws_comments().ok()?;
         self.expect(b'#').ok()?;
         self.parse_u32_digits().ok()?;
@@ -228,7 +229,27 @@ impl<'a> Parser<'a> {
             return None;
         }
         self.skip_ws_comments().ok()?;
-        self.expect(b'(').ok()?;
+        self.expect(b'(').ok()
+    }
+
+    /// Skips `);`, the end of a record.
+    fn skip_record_end(&mut self) -> Option<()> {
+        self.skip_ws_comments().ok()?;
+        self.expect(b')').ok()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b';').ok()
+    }
+
+    /// Reads `#n`, a reference.
+    fn parse_reference(&mut self) -> Option<u32> {
+        self.skip_ws_comments().ok()?;
+        self.expect(b'#').ok()?;
+        self.parse_u32_digits().ok()
+    }
+
+    /// Reads `#id=NAME((a,b));` or `#id=NAME((a,b,c));` with plain numbers.
+    pub(crate) fn parse_coordinates(&mut self) -> Option<([f64; 3], usize)> {
+        self.skip_record_start()?;
         self.skip_ws_comments().ok()?;
         self.expect(b'(').ok()?;
         let mut values = [0.0; 3];
@@ -256,11 +277,48 @@ impl<'a> Parser<'a> {
                 _ => return None,
             }
         }
-        self.skip_ws_comments().ok()?;
-        self.expect(b')').ok()?;
-        self.skip_ws_comments().ok()?;
-        self.expect(b';').ok()?;
+        self.skip_record_end()?;
         (count >= 2).then_some((values, count))
+    }
+
+    /// Reads `#id=NAME((#a,#b,...));` into `out`, which may hold some of it on `None`.
+    pub(crate) fn parse_reference_list(&mut self, out: &mut Vec<u32>) -> Option<()> {
+        self.skip_record_start()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b'(').ok()?;
+        self.skip_ws_comments().ok()?;
+        if self.peek() == Some(b')') {
+            self.pos = self.pos.saturating_add(1);
+        } else {
+            loop {
+                out.push(self.parse_reference()?);
+                self.skip_ws_comments().ok()?;
+                match self.bump()? {
+                    b',' => {}
+                    b')' => break,
+                    _ => return None,
+                }
+            }
+        }
+        self.skip_record_end()
+    }
+
+    /// Reads `#id=NAME(#a,.T.);` or `#id=NAME(#a,.F.);`, in either case.
+    pub(crate) fn parse_reference_and_boolean(&mut self) -> Option<(u32, bool)> {
+        self.skip_record_start()?;
+        let reference = self.parse_reference()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b',').ok()?;
+        self.skip_ws_comments().ok()?;
+        self.expect(b'.').ok()?;
+        let value = match self.bump()?.to_ascii_uppercase() {
+            b'T' => true,
+            b'F' => false,
+            _ => return None,
+        };
+        self.expect(b'.').ok()?;
+        self.skip_record_end()?;
+        Some((reference, value))
     }
 
     /// Parse `(NAME(params)NAME(params)...)`, the body of a complex instance.

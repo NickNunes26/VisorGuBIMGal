@@ -93,8 +93,8 @@ pub struct ModelEvaluator<'a> {
     schema: &'static Schema,
     /// Schema definition of each type in `file.type_names()`, by position.
     defs: Vec<Option<EntityDef>>,
-    /// Position of `IFCCARTESIANPOINT` in `file.type_names()`, for the fast path in `point`.
-    cartesian_point: Option<u32>,
+    /// Types read without building an entity.
+    plain: PlainTypes,
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
     curves: HashMap<u32, Rc<Stationed>>,
@@ -107,6 +107,33 @@ pub struct ModelEvaluator<'a> {
     degraded: bool,
     items_used: usize,
     booleans_used: usize,
+}
+
+/// Positions in `file.type_names()` of the types whose usual records are read without
+/// building an entity. Each is a type whose attributes are the same in every schema.
+struct PlainTypes {
+    point: Option<u32>,
+    face: Option<u32>,
+    outer_bound: Option<u32>,
+    bound: Option<u32>,
+    poly_loop: Option<u32>,
+}
+
+impl PlainTypes {
+    fn new(file: &StepIndex<'_>) -> Self {
+        let position = |wanted: &str| {
+            file.type_names()
+                .position(|name| name == wanted)
+                .and_then(|at| u32::try_from(at).ok())
+        };
+        Self {
+            point: position("IFCCARTESIANPOINT"),
+            face: position("IFCFACE"),
+            outer_bound: position("IFCFACEOUTERBOUND"),
+            bound: position("IFCFACEBOUND"),
+            poly_loop: position("IFCPOLYLOOP"),
+        }
+    }
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -578,10 +605,7 @@ impl<'a> ModelEvaluator<'a> {
             file,
             schema: tables,
             defs: file.type_names().map(|name| tables.entity(name)).collect(),
-            cartesian_point: file
-                .type_names()
-                .position(|name| name == "IFCCARTESIANPOINT")
-                .and_then(|at| u32::try_from(at).ok()),
+            plain: PlainTypes::new(file),
             units: project_units(file, tables),
             placements: HashMap::new(),
             curves: HashMap::new(),
@@ -1387,7 +1411,7 @@ impl<'a> ModelEvaluator<'a> {
         let found = self.file.get(id)?;
         // Most points are plain numbers, read without building an entity. Anything else, or
         // another type, takes the full path, which gives the same answer for those.
-        if Some(found.type_index) == self.cartesian_point
+        if Some(found.type_index) == self.plain.point
             && let Some(([x, y, z], count)) = self.file.decode_coordinates(found)
         {
             let z = if count == 3 { z } else { 0.0 };
@@ -2363,41 +2387,28 @@ impl<'a> ModelEvaluator<'a> {
     }
 
     fn face(&mut self, id: u32, builder: &mut FaceBuilder) {
-        let Some((entity, def)) = self.lookup(id) else { return };
+        let Some(found) = self.file.get(id) else { return };
+        // Most faces of a faceted solid are plain `IfcFace`s, read without building entities,
+        // and have no surface. Anything else takes the full path, which agrees for those.
+        let mut bounds = Vec::new();
+        let full = if Some(found.type_index) == self.plain.face
+            && self.file.decode_references(found, &mut bounds)
+        {
+            None
+        } else {
+            let Some((entity, def)) = self.lookup(id) else { return };
+            bounds = list(attribute(&entity, &def, "Bounds")).iter().filter_map(reference).collect();
+            Some((entity, def))
+        };
         let mut outer: Option<Vec<DVec3>> = None;
         let mut holes: Vec<Vec<DVec3>> = Vec::new();
-        for bound in list(attribute(&entity, &def, "Bounds")) {
-            let Some((bound, bound_def)) = reference(bound).and_then(|id| self.lookup(id)) else {
-                continue;
-            };
-            let Some((poly, poly_def)) = attribute(&bound, &bound_def, "Bound")
-                .and_then(reference)
-                .and_then(|id| self.lookup(id))
-            else {
-                continue;
-            };
-            let ring = if poly_def.is_a("IfcPolyLoop") {
-                let corners = list(attribute(&poly, &poly_def, "Polygon"));
-                let points: Vec<DVec3> = corners
-                    .iter()
-                    .filter_map(reference)
-                    .filter_map(|point| builder.point(point, |id| self.point(id)))
-                    .collect();
-                if points.len() != corners.len() {
-                    self.warn("bad-face", format!("#{id} has a corner that cannot be read"));
-                }
-                Some(points)
-            } else if poly_def.is_a("IfcEdgeLoop") {
-                self.edge_loop(&poly, &poly_def)
-            } else {
-                self.warn("unsupported-face-bound", poly_def.name().to_string());
-                None
-            };
-            let Some(mut ring) = ring else { continue };
-            if flag(attribute(&bound, &bound_def, "Orientation")) == Some(false) {
+        for bound in bounds {
+            let Some((poly, forward, is_outer)) = self.face_bound(bound) else { continue };
+            let Some(mut ring) = self.face_ring(id, poly, builder) else { continue };
+            if !forward {
                 ring.reverse();
             }
-            if bound_def.is_a("IfcFaceOuterBound") && outer.is_none() {
+            if is_outer && outer.is_none() {
                 outer = Some(ring);
             } else {
                 holes.push(ring);
@@ -2412,8 +2423,12 @@ impl<'a> ModelEvaluator<'a> {
             return;
         }
 
-        let same_sense = flag(attribute(&entity, &def, "SameSense")).unwrap_or(true);
-        let surface = attribute(&entity, &def, "FaceSurface")
+        let Some((entity, def)) = &full else {
+            builder.flat_face(outer, holes, true);
+            return;
+        };
+        let same_sense = flag(attribute(entity, def, "SameSense")).unwrap_or(true);
+        let surface = attribute(entity, def, "FaceSurface")
             .and_then(reference)
             .and_then(|id| self.lookup(id));
         if let Some((surface, surface_def)) = &surface {
@@ -2438,16 +2453,54 @@ impl<'a> ModelEvaluator<'a> {
         }
 
         // Planar, or the nearest we can do: a flat face across the boundary.
-        let mut rings = std::iter::once(outer).chain(holes).map(|ring| {
-            let mut ids: Vec<u32> = ring.into_iter().map(|point| builder.vertex(point)).collect();
-            if !same_sense {
-                ids.reverse();
+        builder.flat_face(outer, holes, same_sense);
+    }
+
+    /// The loop of a face bound, whether it keeps its direction, and whether it is the
+    /// outer bound.
+    fn face_bound(&self, id: u32) -> Option<(u32, bool, bool)> {
+        let found = self.file.get(id)?;
+        let is_outer = Some(found.type_index) == self.plain.outer_bound;
+        if (is_outer || Some(found.type_index) == self.plain.bound)
+            && let Some((poly, forward)) = self.file.decode_reference_and_boolean(found)
+        {
+            return Some((poly, forward, is_outer));
+        }
+        let (bound, def) = self.lookup(id)?;
+        let poly = attribute(&bound, &def, "Bound").and_then(reference)?;
+        let forward = flag(attribute(&bound, &def, "Orientation")) != Some(false);
+        Some((poly, forward, def.is_a("IfcFaceOuterBound")))
+    }
+
+    /// The corners of a face's loop, `None` if it has none we can read.
+    fn face_ring(&mut self, face: u32, poly: u32, builder: &mut FaceBuilder) -> Option<Vec<DVec3>> {
+        let found = self.file.get(poly)?;
+        let mut corners = Vec::new();
+        let expected = if Some(found.type_index) == self.plain.poly_loop
+            && self.file.decode_references(found, &mut corners)
+        {
+            corners.len()
+        } else {
+            let (poly, def) = self.lookup(poly)?;
+            if def.is_a("IfcPolyLoop") {
+                let values = list(attribute(&poly, &def, "Polygon"));
+                corners = values.iter().filter_map(reference).collect();
+                values.len()
+            } else if def.is_a("IfcEdgeLoop") {
+                return self.edge_loop(&poly, &def);
+            } else {
+                self.warn("unsupported-face-bound", def.name().to_string());
+                return None;
             }
-            ids
-        });
-        let first = rings.next().unwrap_or_default();
-        let others: Vec<Vec<u32>> = rings.collect();
-        builder.face(&first, &others);
+        };
+        let points: Vec<DVec3> = corners
+            .into_iter()
+            .filter_map(|point| builder.point(point, |id| self.point(id)))
+            .collect();
+        if points.len() != expected {
+            self.warn("bad-face", format!("#{face} has a corner that cannot be read"));
+        }
+        Some(points)
     }
 
     fn coordinate_list(&self, entity: &Entity, def: &EntityDef) -> Option<Vec<DVec3>> {
@@ -2563,6 +2616,20 @@ impl FaceBuilder {
             self.mesh.positions.push(position);
             (self.mesh.positions.len() - 1) as u32
         })
+    }
+
+    /// A face across its corners, sharing them with the faces before it.
+    fn flat_face(&mut self, outer: Vec<DVec3>, holes: Vec<Vec<DVec3>>, same_sense: bool) {
+        let mut rings = std::iter::once(outer).chain(holes).map(|ring| {
+            let mut ids: Vec<u32> = ring.into_iter().map(|point| self.vertex(point)).collect();
+            if !same_sense {
+                ids.reverse();
+            }
+            ids
+        });
+        let first = rings.next().unwrap_or_default();
+        let others: Vec<Vec<u32>> = rings.collect();
+        self.face(&first, &others);
     }
 
     fn face(&mut self, outer: &[u32], holes: &[Vec<u32>]) {

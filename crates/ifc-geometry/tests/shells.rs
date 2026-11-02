@@ -323,10 +323,12 @@ fn diagnostics_of(body: &str) -> (Mesh, Vec<String>) {
 
 #[test]
 fn a_corner_that_cannot_be_read_is_reported() {
-    // #99 does not exist: the quad would quietly become a triangle.
-    let body = faces("#14,#15,#16,#99") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
-    let (_, codes) = diagnostics_of(&body);
-    assert!(codes.iter().any(|code| code == "bad-face"), "{codes:?}");
+    // #99 does not exist, and `$` is no corner: the quad would quietly become a triangle.
+    for corners in ["#14,#15,#16,#99", "#14,#15,#16,$"] {
+        let body = faces(corners) + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+        let (_, codes) = diagnostics_of(&body);
+        assert!(codes.iter().any(|code| code == "bad-face"), "{corners}: {codes:?}");
+    }
 }
 
 #[test]
@@ -336,6 +338,21 @@ fn a_corner_that_is_not_a_point_is_not_read_as_one() {
         + "#99=IFCDIRECTION((0.,2.,3.));\n#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
     let (_, codes) = diagnostics_of(&body);
     assert!(codes.iter().any(|code| code == "bad-face"), "{codes:?}");
+}
+
+#[test]
+fn records_that_are_not_a_face_or_a_bound_are_not_read_as_one() {
+    // Each is written as a face or a bound would be, but a face set has no bounds and an
+    // edge no loop, so the top is missing.
+    for (from, to) in [
+        ("#25=IFCFACE((#24))", "#25=IFCCONNECTEDFACESET((#24))"),
+        ("#24=IFCFACEOUTERBOUND(#23,.T.)", "#24=IFCEDGE(#23,.T.)"),
+    ] {
+        let body = faces("#14,#15,#16,#17").replace(from, to) + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
+        assert!(body.contains(to));
+        let (mesh, _) = diagnostics_of(&body);
+        assert_eq!(mesh.triangles.len(), 10, "{to}");
+    }
 }
 
 #[test]
@@ -356,6 +373,53 @@ fn points_written_in_other_ways_read_the_same() {
     let mesh = evaluator.evaluate(2).unwrap().meshes.remove(0).mesh;
     close(mesh.volume(), 6.0);
     assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());
+}
+
+/// The bottom of the box as one face with a 0.5 by 0.5 hole, whose bound is listed first.
+/// `complex` writes each record of the face as a complex instance of one part, which the full
+/// decoder reads and the fast paths leave to it.
+fn holed_face(face: &str, orientation: &str, complex: bool) -> String {
+    let records = [
+        "#20=IFCPOLYLOOP((#10,#11,#12,#13))".to_string(),
+        "#23=IFCPOLYLOOP((#50,#51,#52,#53))".to_string(),
+        format!("#21=IFCFACEOUTERBOUND(#20,{orientation})"),
+        format!("#24=IFCFACEBOUND(#23,{orientation})"),
+        format!("#22={face}"),
+    ];
+    let mut text = String::new();
+    for record in records {
+        let (id, body) = record.split_once('=').unwrap();
+        text += &if complex { format!("{id}=({body});\n") } else { format!("{id}={body};\n") };
+    }
+    text + "#50=IFCCARTESIANPOINT((0.25,0.25,0.));\n#51=IFCCARTESIANPOINT((0.25,0.75,0.));\n\
+        #52=IFCCARTESIANPOINT((0.75,0.75,0.));\n#53=IFCCARTESIANPOINT((0.75,0.25,0.));\n\
+        #60=IFCPLANE(#61);\n#61=IFCAXIS2PLACEMENT3D(#10,$,$);\n\
+        #40=IFCCONNECTEDFACESET((#22));\n#5=IFCFACEBASEDSURFACEMODEL((#40));\n"
+}
+
+/// Twice the area of each triangle along its normal, summed: the way the mesh faces.
+fn facing(mesh: &Mesh) -> DVec3 {
+    mesh.triangle_corners().map(|[a, b, c]| (b - a).cross(c - a)).sum()
+}
+
+#[test]
+fn a_face_reads_the_same_however_its_records_are_written() {
+    for (face, orientation, up) in [
+        ("IFCFACE((#24,#21))", ".T.", 1.0),
+        ("IFCFACE((#24,#21))", ".F.", -1.0),
+        ("IFCFACESURFACE((#24,#21),#60,.T.)", ".T.", 1.0),
+        ("IFCFACESURFACE((#24,#21),#60,.F.)", ".T.", -1.0),
+    ] {
+        let case = format!("{face} {orientation}");
+        let plain = evaluate(&holed_face(face, orientation, false));
+        let complex = evaluate(&holed_face(face, orientation, true));
+        assert_eq!(plain, complex, "{case}");
+        // The hole is cut from the outer loop, not the other way round.
+        let facing = facing(&plain);
+        close(facing.z, up * 2.0 * (2.0 - 0.25));
+        close(facing.x, 0.0);
+        close(facing.y, 0.0);
+    }
 }
 
 #[test]
