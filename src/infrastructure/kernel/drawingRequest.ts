@@ -2,6 +2,12 @@ import type { DrawingOptions } from '../../domain/drawings/DrawingTypes';
 import type { CoordinateReference, ModelId } from '../../domain/models/ModelRecord';
 import type { KernelDiagnostic } from '../../domain/kernel/KernelPort';
 
+/** NaN on the wire means no depth was given, so a depth given as NaN must not look like that. */
+function wireDepth(depth: number | undefined): number {
+  if (depth === undefined) return Number.NaN;
+  return Number.isNaN(depth) ? -1 : depth;
+}
+
 /** The flat numbers of `DrawingRequest::decode`. Models also get their `localToMap`. */
 export function drawingRequest(options: DrawingOptions, localToMap?: readonly number[]): number[] {
   const { cut } = options;
@@ -12,7 +18,7 @@ export function drawingRequest(options: DrawingOptions, localToMap?: readonly nu
     kind,
     position,
     look,
-    cut.depth ?? Number.NaN,
+    wireDepth(cut.depth),
     options.includeProjection ? 1 : 0,
     options.includeHatching ? 1 : 0,
     options.includeProjection && options.includeHiddenLines ? 1 : 0,
@@ -36,7 +42,7 @@ function sameCrs(a: CoordinateReference, b: CoordinateReference): boolean {
 /** Applies the frame rules of `docs/05` section 5 to a list of models. */
 export function frameModels(
   frame: DrawingOptions['frame'],
-  models: ReadonlyArray<{ modelId: ModelId; reference?: CoordinateReference }>
+  models: ReadonlyArray<{ modelId: ModelId; open: boolean; reference?: CoordinateReference }>
 ): FramedModels {
   if (frame.kind === 'project') {
     return {
@@ -47,7 +53,12 @@ export function frameModels(
   const diagnostics: KernelDiagnostic[] = [];
   const included: FramedModels['included'] = [];
   let common: CoordinateReference | undefined;
-  models.forEach(({ modelId, reference }, index) => {
+  models.forEach(({ modelId, open, reference }, index) => {
+    // A closed model has lost its reference too, and that is not the same as never having one.
+    if (!open) {
+      included.push({ index, modelId });
+      return;
+    }
     if (!reference?.localToMap) {
       diagnostics.push({
         severity: 'warning',

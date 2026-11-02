@@ -158,9 +158,14 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
         void kernel.discardDrawing(currentDrawing.drawingId);
       }
 
-      const firstModel = models.find((m) => m.id === modelIds[0]);
+      // A model lost on the way is not in this drawing, so closing it must not clear the drawing.
+      const lost = generated.diagnostics
+        .filter((item) => item.code === 'drawing-model-lost')
+        .map((item) => item.modelId);
+      const drawnIds = modelIds.filter((id) => !lost.includes(id));
+      const firstModel = models.find((m) => m.id === drawnIds[0]);
       setDrawingFirstModelFileName(firstModel ? firstModel.fileName : null);
-      setDrawingModelIds(modelIds);
+      setDrawingModelIds(drawnIds);
       setCurrentDrawing(generated);
       setPreviewSvg(svgText);
       setStatusMessage(drawingStatus(generated.diagnostics));

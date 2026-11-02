@@ -1,6 +1,6 @@
 # 05 — Contrato del Kernel y del Renderizador
 
-**Estado:** v1, revisión 4, aceptada por Gemini tras una revisión adversaria. Esa revisión sustituye a la de DeepSeek, sin cuota entonces, por decisión de Nick; lo que DeepSeek señale después será un cambio normal. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
+**Estado:** v1, revisión 5, que recoge la revisión posterior de DeepSeek a la revisión 4. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
 **Propósito:** Fuente única de los límites entre kernel, renderizador y aplicación.  
 **Código normativo:** [`src/domain/kernel/`](../src/domain/kernel/), [`DrawingTypes.ts`](../src/domain/drawings/DrawingTypes.ts) y [`ModelRecord.ts`](../src/domain/models/ModelRecord.ts). Si este documento y los tipos discrepan, es un error que debe corregirse.
 
@@ -116,7 +116,7 @@ Definidos en `GeometryBatch.ts`.
 |---|---|---|
 | 0 | `Transparent` | `rgba` tiene alfa menor que 255, exactamente |
 | 1 | `Degraded` | Se evaluó solo en parte. Hay un diagnóstico con su `expressId` en `complete.diagnostics` |
-| 2 | `HiddenByDefault` | Seleccionable, pero empieza oculto. Hoy solo `IfcSpace`; añadir tipos no rompe el contrato |
+| 2 | `HiddenByDefault` | Seleccionable, pero empieza oculto. Hoy solo `IfcSpace`; añadir tipos no rompe el contrato, y esos tipos también quedan fuera de los planos (sección 5) |
 
 - **`complete.meshCount`** cuenta registros de `meshTable`, no elementos.
 - **`complete.bounds`** son coordenadas absolutas de modelo de todo lo que no lleva `HiddenByDefault`. Queda indefinido si no queda nada.
@@ -143,7 +143,7 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 | `name` | Siempre |
 | `value` | Siempre. En `single`, el valor bruto. En los demás casos, un escalar solo para mostrar: el dato real está en `structured` |
 | `structured` | Solo si el valor no es `single` |
-| `kind` | Siempre, `property` o `quantity`. Sigue opcional en el tipo solo por el adaptador de IFClite, y T-051 lo hace obligatorio |
+| `kind` | Siempre, `property` o `quantity` |
 | `type` | Si el archivo da un tipo de medida |
 | `unit` | Si se resuelve, ver sección 2 |
 | `methodOfMeasurement` | Solo en cantidades, si el archivo lo declara |
@@ -157,7 +157,7 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 | `openModel` | `parse`, `unsupported-schema`, `out-of-memory`, `internal` |
 | `streamGeometry` | `model-not-open` si no estaba abierto; `out-of-memory`, `internal` |
 | `getElementDetails`, `getSpatialTree` | `out-of-memory`, `internal`. Un modelo cerrado o un elemento desconocido da `null`, no un error |
-| `generateDrawing` | `model-not-open` si no queda ningún modelo; `out-of-memory`, `internal` |
+| `generateDrawing` | `model-not-open` si no queda ningún modelo abierto; `drawing-frame-empty` si hay modelos abiertos y el marco los excluye a todos, con el motivo en el mensaje; `out-of-memory`, `internal` |
 | `exportDrawing` | `drawing-not-found`, `out-of-memory`, `internal` |
 | `discardDrawing`, `closeModel` | Nunca: son idempotentes |
 
@@ -176,14 +176,14 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 
 - `generateDrawing` se ejecuta dentro del kernel y devuelve `GeneratedDrawing`, con su marco y diagnósticos. La UI ya no maneja mallas.
 - **Marco:** un plano pertenece a un marco, no a un modelo. `project` toma las coordenadas absolutas de modelo como compartidas por todos los modelos, igual que la vista 3D. `map` pasa cada modelo por su `localToMap`; los modelos sin él se omiten con `map-frame-no-georeference`. Las posiciones de corte se expresan en metros del marco.
-- **CRS común de `map`:** es el del primer modelo de la lista con `localToMap`. Otro modelo lo comparte si coincide `verticalDatum` y además coincide `crsId`, o ninguno tiene `crsId` y coincide `crsName`. El que difiera se omite con `map-frame-crs-mismatch`. `GeneratedDrawing.crsId` es ese CRS si está verificado, y queda indefinido si no.
+- **CRS común de `map`:** es el del primer modelo de la lista con `localToMap`. Otro modelo lo comparte si coincide `verticalDatum` y además coincide `crsId`, o ninguno tiene `crsId` y ambos tienen el mismo `crsName`. Dos modelos sin `crsId` ni `crsName` no se consideran iguales. El que difiera se omite con `map-frame-crs-mismatch`. `GeneratedDrawing.crsId` es ese CRS si está verificado, y queda indefinido si no.
 - **Generar y exportar:** `DrawingOptions` decide qué se calcula. `exportDrawing` solo serializa y puede omitir capas ya calculadas, nunca añadirlas.
   - `includeProjection` activa juntas las líneas visibles y ocultas, que salen de la misma pasada.
   - `includeHiddenLines` exige `includeProjection`. Sin él, las ocultas se descartan antes de guardar el plano.
-  - El kernel ignora `includeEdges` y `mergeLines`: las aristas siempre forman parte de la proyección y las líneas siempre se fusionan. Siguen en el tipo solo por el adaptador de IFClite, y T-051 los elimina.
+  - Las aristas siempre forman parte de la proyección y las líneas siempre se fusionan.
   - `units` escala las coordenadas exportadas a metros o milímetros.
 - **Tramas:** la trama procede de `IfcFillAreaStyleHatching` si existe, tomando su ángulo y separación. Si no, se aplica la regla del anexo A.
-- **Capas:** cada elemento va a una capa, que también decide su trama. Es el nombre del material del elemento, con la asignación del elemento por delante de la de su tipo: el nombre del material, o del conjunto de capas, perfiles o constituyentes; si no tiene, el del material de su primer miembro. Sin material, es la clase IFC, como `IfcWall`. Un muro multicapa es una sola capa y una sola trama, porque el kernel no separa su geometría por capas de material.
+- **Capas:** cada elemento va a una capa, que también decide su trama. Es el nombre del material del elemento, con la asignación del elemento por delante de la de su tipo: el nombre del material, o del conjunto de capas, perfiles o constituyentes; si no tiene, el del material de su primer miembro. Sin material, es la clase IFC, como `IfcWall`. Un muro multicapa es una sola capa y una sola trama, porque el kernel no separa su geometría por capas de material. La trama se calcula por parte de la malla: un elemento de varias partes recibe la suya en cada una, y si se solapan, sus tramas también.
 - **Ciclo de vida:** un dibujo guarda sus propios datos 2D y sobrevive a `closeModel`. `discardDrawing` es idempotente. Exportar un dibujo descartado produce `drawing-not-found`.
 
 ### Corte
@@ -199,7 +199,7 @@ Se conserva lo que queda detrás del plano, en el sentido de la mirada.
 | `section`, `y`, `negative` | −Y | −X | +Z |
 
 - `positive` significa mirar hacia el sentido positivo del eje, desde el ojo hacia el modelo. Así la hoja queda a derechas vista desde el ojo.
-- `depth` son metros desde el plano en el sentido de la mirada, y solo limita la proyección. Si se omite, llega hasta el final de la geometría. Un valor negativo o no finito se ignora con `bad-depth`.
+- `depth` son metros desde el plano en el sentido de la mirada, y solo limita la proyección. Si se omite, llega hasta el final de la geometría. Un valor negativo o `NaN` se ignora con `bad-depth`, igual que un infinito, y el plano se genera como si no tuviera `depth`.
 - **Plano coplanario con una cara:** se genera el lazo solo si el material queda detrás del plano. En una planta, un plano en la cara superior de una losa da su contorno, y uno en la cara inferior no da nada.
 
 ### Planos de varios modelos
@@ -207,14 +207,14 @@ Se conserva lo que queda detrás del plano, en el sentido de la mirada.
 - **Lista de modelos:** vacía significa todos los abiertos, en orden de apertura. Su orden numera los modelos dentro del plano, y esa posición no cambia aunque otro modelo de la lista se omita.
 - **Concurrencia:** el adaptador atiende `generateDrawing` de una en una, en orden de llegada. Una llamada espera a que termine la anterior.
 - **Ocultación cruzada:** las líneas ocultas se calculan entre todos los modelos del plano. Un elemento de un modelo oculta a los de otro, como en la realidad.
-- **Exclusiones:** `IfcSpace` no entra en los planos, porque sus lazos taparían cada estancia con una trama. La visibilidad por elemento de la vista 3D no se aplica.
+- **Exclusiones:** lo marcado `HiddenByDefault`, hoy solo `IfcSpace`, no entra en los planos, porque sus lazos taparían cada estancia con una trama. La visibilidad por elemento de la vista 3D no se aplica.
 - **Determinismo:** los mismos modelos, en el mismo orden y con las mismas opciones dan bytes idénticos en DXF y SVG (TC-005), sea cual sea el orden de llegada de los datos y aunque cambie `ModelId`, que es aleatorio. El kernel ordena las mallas por `(posición en la lista, expressId, parte)` antes de cortar, donde `parte` es el orden de la malla dentro de su elemento. Esa clave es única, así que los límites de trabajo también cortan siempre en el mismo sitio.
-- **Fallos:** un modelo que no está abierto, que se cierra durante la generación o cuyo Worker falla se omite entero con `drawing-model-lost`: lo que ya hubiera enviado se descarta, para no dibujar medio modelo. Si no queda ninguno, `generateDrawing` rechaza con `model-not-open`. Si falla el Worker de plano, rechaza con `out-of-memory` o `internal`, y los modelos no se ven afectados.
-- **Límites:** los límites de trabajo de `cad-slicer` son por plano, no por modelo. Al alcanzarlos, el plano se entrega incompleto con un diagnóstico.
+- **Fallos:** un modelo que no está abierto, que se cierra antes de `Sheet::generate` o cuyo Worker falla se omite entero con `drawing-model-lost`: lo que ya hubiera enviado se descarta, para no dibujar medio modelo. Un modelo que se cierra durante `Sheet::generate`, que es síncrono, queda en ese plano. Un modelo cerrado da `drawing-model-lost` también en un marco `map`, no `map-frame-no-georeference`. Un trozo mal formado también pierde su modelo entero, con `bad-drawing-chunk`. Si no queda ninguno, `generateDrawing` rechaza con `model-not-open`, o con `drawing-frame-empty` si los modelos siguen abiertos y el marco los excluye. Si falla el Worker de plano, rechaza con `out-of-memory` o `internal`, y los modelos no se ven afectados.
+- **Límites:** los límites de oclusores y de pruebas de oclusión de `cad-slicer` son por plano, no por modelo. Los de triángulos y aristas son por parte de malla. Al alcanzar cualquiera, el plano se entrega incompleto con un diagnóstico.
 
 ### Seguridad del SVG
 
-`SectionDxfPanel.tsx:188` lo inserta con `dangerouslySetInnerHTML` y los nombres vienen del archivo IFC, que no es de confianza. El exportador usa una **lista blanca**:
+`SectionDxfPanel.tsx` lo inserta con `dangerouslySetInnerHTML` y los nombres vienen del archivo IFC, que no es de confianza. El exportador usa una **lista blanca**:
 
 | Elemento | Atributos propios |
 |---|---|
@@ -227,7 +227,7 @@ Se conserva lo que queda detrás del plano, en el sentido de la mirada.
 | `text`, `tspan` | `x`, `y` |
 
 - Todos admiten además `fill`, `stroke`, `stroke-width`, `stroke-linejoin`, `stroke-dasharray` y `font-size`.
-- Los valores los genera el propio exportador: números, colores `#rrggbb`, `none` o `round`. Los textos IFC solo aparecen como texto escapado (`& < > " '`), nunca como nombre o valor de un atributo.
+- Los valores los genera el propio exportador: números, números con el sufijo `mm` en `width` y `height` de `svg`, colores `#rrggbb`, `none` o `round`. Los textos IFC solo aparecen como texto escapado (`& < > " '`), nunca como nombre o valor de un atributo.
 - La lista es un máximo: el exportador puede usar solo una parte. Se admite la declaración XML inicial.
 - Se eliminan los caracteres de control no válidos en XML 1.0.
 - Sin `<style>`, `<use>`, `<image>`, `<a>`, `<animate>`, `<set>`, `<foreignObject>`, ni los atributos `style`, `class`, `id`, `href`, `xlink:href` u `on*`, ni entidades externas.
@@ -308,15 +308,15 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 
 1. El adaptador resuelve la lista de modelos y el CRS común (sección 5), y crea el Worker de plano con `Sheet::new`.
 2. Cada Worker de modelo evalúa sus elementos uno a uno y los pasa a coordenadas del marco en `f64`, aplicando su `localToMap` si el marco es `map`.
-3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, trama, posiciones `f64` y triángulos. Descarta antes los elementos cuya caja, calculada en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también los que no tocan el plano. Un elemento fuera de esa zona no se ve ni oculta nada.
+3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, posiciones `f64` y triángulos. La trama de `IfcFillAreaStyleHatching` necesitará un campo más (sección 7). Descarta antes los elementos cuya caja, calculada en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también los que no tocan el plano. Un elemento fuera de esa zona no se ve ni oculta nada.
 4. El hilo principal transfiere cada trozo a `Sheet::add_chunk` sin leerlo ni guardarlo, y **solo pide el siguiente cuando `add_chunk` ha terminado**. Así los trozos nunca se acumulan en la cola de mensajes, y los de un modelo llegan en orden. `finish_drawing` devuelve los diagnósticos del modelo.
-5. Si un modelo se pierde a medias, el adaptador llama a `Sheet::drop_model` antes de seguir.
+5. Si un modelo se pierde a medias, el adaptador llama a `Sheet::drop_model` antes de seguir. Antes de generar repite la comprobación con los modelos que ya terminaron, porque pueden haberse cerrado mientras se atendía a otro.
 6. `Sheet::generate` ordena las mallas por `(model_index, expressId, parte)`, llama una vez a `cad_slicer::draw` con todas, libera las mallas y devuelve los diagnósticos, cuyo `model_index` el adaptador traduce a `ModelId`.
 7. `exportDrawing` llama a `Sheet::export`, que serializa en Rust. El adaptador decodifica el SVG de UTF-8 a texto y deja el DXF en bytes. Nada de geometría se procesa en el hilo principal.
 
-`start_drawing` usa su propio evaluador, y el Worker atiende de uno en uno, así que un plano puede intercalarse con un flujo de geometría del mismo modelo. Los trozos son formato interno entre dos Workers de la misma versión, pero `add_chunk` los valida igual y nunca entra en pánico.
+`start_drawing` usa su propio evaluador, y el Worker atiende de uno en uno, así que un plano puede intercalarse con un flujo de geometría del mismo modelo. Los trozos son formato interno entre dos Workers de la misma versión, pero `add_chunk` los valida igual, incluidos los índices de triángulos, y nunca entra en pánico. Los modelos se atienden uno tras otro: un plano evalúa en serie, y la concurrencia entre Workers de modelo solo vale para `streamGeometry`.
 
-**Por qué una pasada conjunta y no un dibujo por modelo que luego se funde:** un dibujo por modelo deja sólidas las líneas que otro modelo oculta, y corregirlo exigiría un segundo protocolo de oclusores. Además, retener todas las mallas en el Worker de un modelo fija ese máximo de memoria hasta cerrarlo, mientras que el Worker de plano se destruye. El coste es un solo hilo para el corte, dos copias transitorias de cada triángulo al cruzar, y un pico de memoria con la suma de los modelos, que sigue en esa instancia hasta `discardDrawing` y que T-061 mide. Un plano demasiado grande rechaza con `out-of-memory` sin afectar a los modelos.
+**Por qué una pasada conjunta y no un dibujo por modelo que luego se funde:** un dibujo por modelo deja sólidas las líneas que otro modelo oculta, y corregirlo exigiría un segundo protocolo de oclusores. Además, retener todas las mallas en el Worker de un modelo fija ese máximo de memoria hasta cerrarlo, mientras que el Worker de plano se destruye. El coste es un solo hilo para el corte, cuatro copias transitorias de cada triángulo (al trozo, al salir de WASM, al entrar en la otra instancia y de vuelta a malla), y un pico de memoria con la suma de los modelos, que sigue en esa instancia hasta `discardDrawing` y que T-061 mide. Un plano demasiado grande rechaza con `out-of-memory` sin afectar a los modelos.
 
 ---
 
@@ -329,8 +329,6 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 | `getSpatialHierarchy` (`byStorey`) | `getSpatialTree`, árbol real con nombres |
 | `Atributo #n` posicional | `attributes` con nombres EXPRESS del esquema |
 | `BimEngine.isWebGpuSupported` en `Header` | `initialize` informa del fallo; la cabecera deja de depender del motor |
-| `PropertyItem.kind` opcional | Obligatorio al eliminar el adaptador de IFClite (T-051) |
-| `includeEdges`, `mergeLines` | Se eliminan en T-051 |
 
 ### Conformidad pendiente
 
@@ -338,7 +336,7 @@ El código aún no cumple esta revisión en los puntos siguientes.
 
 | Contrato | Código actual |
 |---|---|
-| Trama desde `IfcFillAreaStyleHatching` | No se lee: todas las tramas salen del anexo A |
+| Trama desde `IfcFillAreaStyleHatching` | No se lee: todas las tramas salen del anexo A. Hace falta leerla y añadir su campo a los trozos |
 | `crsComment` | Solo llega al DXF. El SVG no admite comentarios en su lista blanca |
 
 ---
@@ -370,4 +368,4 @@ Se aplica a los elementos sin `IfcFillAreaStyleHatching`, de modo que otra imple
 - Los ángulos son antihorarios desde el eje X de la hoja.
 - Las líneas se anclan en el origen de la hoja, así que los elementos vecinos se traman de forma continua, también entre modelos.
 - Cada línea se recorta contra todos los lazos cerrados del elemento con la regla par-impar, de modo que el material se rellena y los huecos quedan vacíos. Una línea sobre el propio contorno se omite.
-- La separación se limita a 0,005–10 m, y cada elemento recibe como máximo 4096 líneas, con `hatch-truncated` si se alcanza.
+- La separación se limita a 0,005–10 m, y cada parte de malla recibe como máximo 4096 líneas, con `hatch-truncated` si se alcanza.

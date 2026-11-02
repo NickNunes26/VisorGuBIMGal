@@ -294,3 +294,87 @@ fn every_file_reaches_a_sheet() {
         }
     }
 }
+
+
+#[test]
+fn a_bad_depth_is_ignored_and_reported_without_losing_the_model() {
+    // Depth is checked only inside draw, so a negative or infinite one must not reach the filter
+    // on the model's side: docs/05 section 5, a value like that is ignored with bad-depth.
+    let good = vec![0.0, 50.0, -1.0, NO_DEPTH, 1.0, 0.0, 1.0];
+    for bad in [-5.0, f64::NEG_INFINITY, f64::INFINITY] {
+        let mut wall = model("public/samples/SimpleWall.ifc");
+        let words = vec![0.0, 50.0, -1.0, bad, 1.0, 0.0, 1.0];
+        assert_eq!(
+            chunks(&mut wall, &words, 65536).len(),
+            chunks(&mut wall, &good, 65536).len(),
+            "depth {bad}"
+        );
+        let mut sheet = SheetStore::new(request(&words));
+        for chunk in chunks(&mut wall, &words, 65536) {
+            sheet.add_chunk(0, &chunk);
+        }
+        assert!(sheet.generate().contains("bad-depth"), "depth {bad}");
+    }
+}
+
+/// One element's chunk: `express_id`, part 0, a layer, and the triangles of one small triangle.
+fn chunk_with(express_id: u32, triangle: [u32; 3]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for word in [express_id, 0, 1] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out.push(b'w');
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    for value in [0.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    for index in triangle {
+        out.extend_from_slice(&index.to_le_bytes());
+    }
+    out
+}
+
+fn wall_chunk(id: u32) -> Vec<u8> {
+    // A real element, so that a sheet which keeps it has lines to show.
+    let mut wall = model("public/samples/SimpleWall.ifc");
+    let words = plan(3.9);
+    let mut all = chunks(&mut wall, &words, 65536).remove(0);
+    all[..4].copy_from_slice(&id.to_le_bytes());
+    all
+}
+
+#[test]
+fn a_bad_triangle_index_loses_that_model_whole_and_says_so() {
+    let words = plan(3.9);
+    let mut sheet = SheetStore::new(request(&words));
+    sheet.add_chunk(0, &wall_chunk(7));
+    sheet.add_chunk(0, &chunk_with(8, [0, 1, 99]));
+    let report = sheet.generate();
+    assert!(report.contains("bad-drawing-chunk"), "{report}");
+    assert_eq!(line_length(&dxf(&sheet)), 0.0, "half a model must not be drawn");
+}
+
+#[test]
+fn a_chunk_cut_short_loses_that_model_whole_and_later_chunks_too() {
+    let words = plan(3.9);
+    let mut sheet = SheetStore::new(request(&words));
+    sheet.add_chunk(0, &wall_chunk(7));
+    let good = chunk_with(8, [0, 1, 2]);
+    sheet.add_chunk(0, &good[..good.len() - 4]);
+    sheet.add_chunk(0, &wall_chunk(9));
+    let report = sheet.generate();
+    assert_eq!(report.matches("bad-drawing-chunk").count(), 1, "{report}");
+    assert_eq!(line_length(&dxf(&sheet)), 0.0);
+}
+
+#[test]
+fn a_bad_chunk_leaves_other_models_alone() {
+    let words = plan(3.9);
+    let mut sheet = SheetStore::new(request(&words));
+    sheet.add_chunk(0, &chunk_with(8, [0, 1, 99]));
+    sheet.add_chunk(1, &wall_chunk(7));
+    let report = sheet.generate();
+    assert!(report.contains("bad-drawing-chunk"), "{report}");
+    assert!((line_length(&dxf(&sheet)) - 8.4).abs() < 1e-6);
+}

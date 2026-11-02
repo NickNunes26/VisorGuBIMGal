@@ -118,7 +118,11 @@ impl<'a> Reader<'a> {
             mesh.positions.push(DVec3::new(x, y, z));
         }
         for _ in 0..triangles {
-            mesh.triangles.push([self.u32()?, self.u32()?, self.u32()?]);
+            let triangle = [self.u32()?, self.u32()?, self.u32()?];
+            if triangle.iter().any(|index| *index as usize >= vertices) {
+                return None;
+            }
+            mesh.triangles.push(triangle);
         }
         let mesh = DrawingMesh::new(model_index, express_id, layer, mesh);
         Some(Item { part, mesh })
@@ -137,7 +141,9 @@ fn reaches_sheet(mesh: &Mesh, frame: &Frame, options: &DrawingOptions) -> bool {
     if far < 0.0 {
         return false;
     }
-    if options.depth.is_some_and(|limit| near > limit) {
+    // A depth that is not a length is ignored, and `draw` reports it.
+    let limit = options.depth.filter(|limit| *limit >= 0.0);
+    if limit.is_some_and(|limit| near > limit) {
         return false;
     }
     options.include_projection || near <= 0.0
@@ -247,13 +253,18 @@ impl SheetStore {
         Self { request, items: Vec::new(), bad_chunks: Vec::new(), drawing: None }
     }
 
-    /// A malformed chunk loses what it still held and is reported. It never panics.
+    /// A malformed chunk loses that model whole, what it sent before and after, so half a model
+    /// is never drawn. It is reported once, and it never panics.
     pub fn add_chunk(&mut self, model_index: u32, chunk: &[u8]) {
+        if self.bad_chunks.contains(&model_index) {
+            return;
+        }
         let mut reader = Reader { bytes: chunk };
         while !reader.bytes.is_empty() {
             match reader.element(model_index) {
                 Some(item) => self.items.push(item),
                 None => {
+                    self.items.retain(|item| item.mesh.model_id != model_index);
                     self.bad_chunks.push(model_index);
                     return;
                 }

@@ -37,6 +37,7 @@ export type KernelErrorCode =
   | 'out-of-memory'
   | 'model-not-open'
   | 'drawing-not-found'
+  | 'drawing-frame-empty'
   | 'internal';
 
 /** Thrown for failures of a whole operation. Per-element problems are diagnostics instead. */

@@ -224,8 +224,16 @@ export class WasmKernelAdapter implements KernelPort {
     onProgress?: ProgressHandler
   ): Promise<GeneratedDrawing> {
     const listed = modelIds.length > 0 ? modelIds : Array.from(this.workers.keys());
-    const models = listed.map((modelId) => ({ modelId, reference: this.references.get(modelId) }));
+    const models = listed.map((modelId) => ({
+      modelId,
+      open: this.workers.has(modelId),
+      reference: this.references.get(modelId)
+    }));
     const { included, crsId, diagnostics } = frameModels(options.frame, models);
+    if (included.length === 0 && models.some(({ open }) => open)) {
+      const reason = diagnostics[0]?.message ?? 'Ningún modelo encaja en el marco del plano.';
+      throw new KernelError('drawing-frame-empty', reason);
+    }
 
     const sheet = new ModelWorker();
     try {
@@ -240,6 +248,14 @@ export class WasmKernelAdapter implements KernelPort {
           kept.set(index, modelId);
           diagnostics.push(...found.map((diagnostic) => ({ ...diagnostic, modelId })));
         } else {
+          diagnostics.push(lostModel(modelId));
+        }
+      }
+      // A model that finished its relay can still close while the next one runs.
+      for (const [index, modelId] of kept) {
+        if (!this.workers.has(modelId)) {
+          await sheet.call({ op: 'sheet-drop', modelIndex: index });
+          kept.delete(index);
           diagnostics.push(lostModel(modelId));
         }
       }
