@@ -340,10 +340,12 @@ fn a_corner_that_is_not_a_point_is_not_read_as_one() {
 
 #[test]
 fn points_written_in_other_ways_read_the_same() {
-    // A typed coordinate and a two-coordinate point take the full decoder; the rest do not.
+    // A typed coordinate takes the full decoder; integers and a point with no z take the fast
+    // path, where z is zero. Each changes a coordinate that is not zero, so a reader that
+    // returned zero would lose volume.
     let corners = CORNERS
-        .replace("#14=IFCCARTESIANPOINT((0.,0.,3.))", "#14=IFCCARTESIANPOINT((IFCLENGTHMEASURE(0.),0,3))")
-        .replace("#10=IFCCARTESIANPOINT((0.,0.,0.))", "#10=IFCCARTESIANPOINT((0.,0.))");
+        .replace("#16=IFCCARTESIANPOINT((1.,2.,3.))", "#16=IFCCARTESIANPOINT((IFCLENGTHMEASURE(1.),2,3))")
+        .replace("#11=IFCCARTESIANPOINT((1.,0.,0.))", "#11=IFCCARTESIANPOINT((1.,0.))");
     let body = faces("#14,#15,#16,#17") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
     let text = format!(
         "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC2X3'));ENDSEC;DATA;\n{corners}{body}ENDSEC;END-ISO-10303-21;"
