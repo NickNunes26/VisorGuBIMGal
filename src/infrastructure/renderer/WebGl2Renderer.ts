@@ -12,6 +12,7 @@ import type {
   ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { Camera } from './Camera';
+import { waitForSync } from './glSync';
 import type { RendererDebugStats } from './WebGpuRenderer';
 
 const FLAG_VISIBLE = 8;
@@ -1355,14 +1356,11 @@ export class WebGl2Renderer implements RendererPort {
   }
 
   async waitForGpuIdle(): Promise<void> {
-    if (this.gl) {
-      const sync = this.gl.fenceSync(this.gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-      this.gl.flush();
-      if (sync) {
-        this.gl.clientWaitSync(sync, 0, 100_000_000);
-        this.gl.deleteSync(sync);
-      }
-    }
+    const gl = this.gl;
+    if (!gl) return;
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    if (sync) await waitForSync(gl, sync, 2000);
   }
 
   getDebugStats(): RendererDebugStats {

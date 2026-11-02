@@ -43,7 +43,7 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 
 | ID | Mejora | Evidencia en el código | Tam. | Origen | Comprobado |
 |---|---|---|---|---|---|
-| B1 | Precisión de profundidad en WebGL2: búfer de 24 bits y reverse-Z deshecho por `z*2-w`. Con el plano cercano en 2 m, la resolución es de unos 3 cm a 1 km, 0,75 m a 5 km y 12 m a 20 km: capas y marcas viales parpadean en vistas generales. WebGPU usa `depth32float` con reverse-Z y no lo sufre | `WebGl2Renderer.ts:112,193,468`; `Camera.ts:153` | M | C | Sí, calculado; no visto en pantalla |
+| B1 | Precisión de profundidad en WebGL2: búfer de 24 bits y reverse-Z deshecho por `z*2-w`. Con el plano cercano en 2 m, la resolución es de unos 3 cm a 1 km, 0,75 m a 5 km y 12 m a 20 km: capas y marcas viales parpadean en vistas generales. WebGPU usa `depth32float` con reverse-Z y no lo sufre | `WebGl2Renderer.ts:112,193` y el búfer por defecto pedido con `depth: true` (24 bits medidos en Chrome); `Camera.ts:153` | M | C | Sí, calculado; no visto en pantalla |
 | B2 | Partir en varios lotes los elementos de más de unos 8 km (radio 4096 m). Hoy se dibujan con aviso `batch-radius-exceeded` y pierden precisión poco a poco, alrededor de 1 mm a 20 km | `batches.rs:8,270-276` | S | C | Sí |
 | B3 | Prueba a escala de carretera con un modelo IFC4X3 público y largo: navegación, encuadre, plano lejano (`Camera.ts:154`, máximo de 50 km y 250 veces la distancia), estacas de alineación y planos frente al presupuesto de oclusión | Ningún modelo de carretera real probado | S | C | Pendiente |
 
