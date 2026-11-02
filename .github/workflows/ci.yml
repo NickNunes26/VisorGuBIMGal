@@ -80,6 +80,12 @@ jobs:
       - name: Build kernel bindings
         run: npm run kernel
 
+      - name: Check the kernel binary
+        run: node --experimental-strip-types scripts/check-kernel.mjs
+
+      - name: Check out-of-memory handling
+        run: node --experimental-strip-types scripts/check-oom.mjs
+
       - name: Type check
         run: npx tsc --noEmit
 
