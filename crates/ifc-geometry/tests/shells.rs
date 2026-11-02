@@ -41,8 +41,12 @@ fn faces(top: &str) -> String {
 }
 
 fn evaluate(body: &str) -> Mesh {
+    evaluate_in("IFC2X3", body)
+}
+
+fn evaluate_in(schema: &str, body: &str) -> Mesh {
     let text = format!(
-        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC2X3'));ENDSEC;DATA;\n{CORNERS}{body}ENDSEC;END-ISO-10303-21;"
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('{schema}'));ENDSEC;DATA;\n{CORNERS}{body}ENDSEC;END-ISO-10303-21;"
     );
     let file = index(text.as_bytes()).unwrap();
     let mut evaluator = ModelEvaluator::new(&file).unwrap();
@@ -170,4 +174,26 @@ fn a_large_shell_is_walked_without_recursion() {
     mesh.orient_shell();
     let up = mesh.triangle_corners().filter(|[a, b, c]| (b - a).cross(c - a).z > 0.0).count();
     assert_eq!(up, mesh.triangles.len());
+}
+
+
+const CUBE_POINTS: &str = "#20=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(2.,0.,0.),(2.,2.,0.),(0.,2.,0.),(0.,0.,2.),(2.,0.,2.),(2.,2.,2.),(0.,2.,2.)));\n";
+
+#[test]
+fn a_triangulated_set_written_inward_turns_outward() {
+    // The twelve triangles of a 2 m cube, every one wound towards the inside.
+    let faces = "((1,2,3),(1,3,4),(5,7,6),(5,8,7),(1,6,2),(1,5,6),(2,7,3),(2,6,7),(3,8,4),(3,7,8),(4,5,1),(4,8,5))";
+    let body = format!("{CUBE_POINTS}#5=IFCTRIANGULATEDFACESET(#20,$,.T.,{faces},$);\n");
+    close(evaluate_in("IFC4", &body).volume(), 8.0);
+}
+
+#[test]
+fn a_polygonal_set_written_inward_turns_outward() {
+    let loops = ["1,2,3,4", "5,8,7,6", "1,5,6,2", "2,6,7,3", "3,7,8,4", "4,8,5,1"];
+    let mut body = CUBE_POINTS.to_string();
+    for (index, points) in loops.iter().enumerate() {
+        body += &format!("#{}=IFCINDEXEDPOLYGONALFACE(({points}));\n", 30 + index);
+    }
+    body += "#5=IFCPOLYGONALFACESET(#20,.T.,(#30,#31,#32,#33,#34,#35),$);\n";
+    close(evaluate_in("IFC4", &body).volume(), 8.0);
 }

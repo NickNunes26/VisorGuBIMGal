@@ -2420,10 +2420,9 @@ impl<'a> ModelEvaluator<'a> {
                 Some([corner(0)?, corner(1)?, corner(2)?])
             })
             .collect();
-        (!triangles.is_empty()).then_some(Mesh {
-            positions,
-            triangles,
-        })
+        let mut mesh = Mesh { positions, triangles };
+        mesh.orient_shell();
+        (!mesh.is_empty()).then_some(mesh)
     }
 
     fn polygonal_face_set(&mut self, entity: &Entity, def: &EntityDef) -> Option<Mesh> {
@@ -2452,6 +2451,7 @@ impl<'a> ModelEvaluator<'a> {
                 .collect();
             builder.face(&outer, &holes);
         }
+        builder.mesh.orient_shell();
         (!builder.mesh.is_empty()).then_some(builder.mesh)
     }
 }
