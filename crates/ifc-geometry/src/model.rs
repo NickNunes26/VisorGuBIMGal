@@ -24,8 +24,11 @@ const MAX_ITEMS_PER_ELEMENT: usize = 100_000;
 /// Booleans one element may evaluate. Each costs far more than a plain item.
 const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
-/// Consecutive profile points closer than this are one point. Metres.
+/// Consecutive curve points closer than this are one point. Metres.
 const POINT_TOLERANCE: f64 = 1e-9;
+/// The same for the rings of a profile. Exporters round the ends of arcs and lines apart by
+/// microns, and triangulation loses such a sliver, which leaves the solid open. Metres.
+const RING_TOLERANCE: f64 = 1e-5;
 /// Points one alignment curve may reach: far beyond a real one, and hostile files can ask
 /// for thousands of segments of thousands of points.
 const MAX_CURVE_POINTS: usize = 200_000;
@@ -131,9 +134,9 @@ fn ring_area(ring: &[DVec2]) -> f64 {
 
 /// Drops repeated points, including a closing point equal to the first.
 fn clean_ring(mut ring: Vec<DVec2>) -> Vec<DVec2> {
-    ring.dedup_by(|a, b| a.distance_squared(*b) <= POINT_TOLERANCE * POINT_TOLERANCE);
+    ring.dedup_by(|a, b| a.distance_squared(*b) <= RING_TOLERANCE * RING_TOLERANCE);
     while ring.len() > 1
-        && ring[0].distance_squared(ring[ring.len() - 1]) <= POINT_TOLERANCE * POINT_TOLERANCE
+        && ring[0].distance_squared(ring[ring.len() - 1]) <= RING_TOLERANCE * RING_TOLERANCE
     {
         ring.pop();
     }

@@ -310,3 +310,19 @@ fn an_arc_given_by_three_points_holds_the_tolerance_at_its_real_size() {
         }
     }
 }
+
+#[test]
+fn ends_that_miss_an_arc_by_a_hair_still_close_the_wall() {
+    // Exporters round arc ends and line ends apart: here by 2 microns, on a 160 m wall.
+    let (outer, inner, turn) = (160.979, 160.629, 15.0_f64.to_radians());
+    let hair = 2e-6;
+    let body = curved_wall(outer, inner, turn).replace(
+        &format!("#53=IFCCARTESIANPOINT(({},{}));", outer, 0.0),
+        &format!("#53=IFCCARTESIANPOINT(({},{}));", outer, hair),
+    );
+    assert!(body.contains(&format!("{hair}")), "the end moved");
+    let mesh = evaluate(&body);
+    assert_eq!(mesh.open_edges(), 0);
+    let exact = turn * (outer * outer - inner * inner) / 2.0 * 6.75;
+    close(mesh.volume(), exact, exact * 1e-3);
+}
