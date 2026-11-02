@@ -1,4 +1,4 @@
-use step_parser::{index, Entity, Value};
+use step_parser::{index, Entity, ErrorKind, Value};
 
 fn decode_first(input: &[u8]) -> Entity {
     let index = index(input).unwrap();
@@ -134,6 +134,44 @@ fn value_enum() {
         params(b"DATA;\n#1=IFCA(.foo.);\nENDSEC;"),
         [Value::Enum("FOO".to_owned())]
     );
+}
+
+#[test]
+fn names_and_enumerations_keep_every_character_upper_cased() {
+    let index = index(
+        b"DATA;\n#1=ifc_a2(.not_Defined2.,ifcLabel_x9('a'));\n#2=(ifcb()ifc_c(.t.));\nENDSEC;",
+    )
+    .unwrap();
+    let first = index.decode(1).unwrap();
+    assert_eq!(first.type_name, "IFC_A2");
+    assert_eq!(
+        first.params,
+        [
+            Value::Enum("NOT_DEFINED2".to_owned()),
+            Value::Typed {
+                name: "IFCLABEL_X9".to_owned(),
+                value: Box::new(Value::String("a".to_owned())),
+            },
+        ]
+    );
+    let complex = index.decode(2).unwrap();
+    assert_eq!(complex.type_name, "IFCB");
+    assert_eq!(
+        complex.other_parts,
+        [("IFC_C".to_owned(), vec![Value::Enum("T".to_owned())])]
+    );
+}
+
+#[test]
+fn a_broken_enumeration_is_an_error_at_the_byte_that_breaks_it() {
+    let text = b"DATA;\n#1=IFCA(.AB-C.);\n#2=IFCA(..);\nENDSEC;";
+    let index = index(text).unwrap();
+    let error = |id| index.decode(id).unwrap_err();
+    let at = |needle: &[u8]| text.windows(needle.len()).position(|w| w == needle).unwrap();
+    assert_eq!(error(1).kind, ErrorKind::UnexpectedByte(b'-'));
+    assert_eq!(error(1).offset, at(b"-C."));
+    assert_eq!(error(2).kind, ErrorKind::InvalidIdentifier);
+    assert_eq!(error(2).offset, at(b"..)") + 2);
 }
 
 #[test]

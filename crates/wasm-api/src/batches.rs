@@ -119,7 +119,9 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
             indices: Vec::new(),
             rgba: element_mesh.rgba,
         };
-        let mut shared: HashMap<(u32, [i16; 3]), u32> = HashMap::new();
+        // A mesh normally uses each of its positions at least once, so reserving that many
+        // saves the map from growing step by step.
+        let mut shared: HashMap<(u32, [i16; 3]), u32> = HashMap::with_capacity(mesh.positions.len());
         for triangle in &mesh.triangles {
             let corners = triangle.map(|id| mesh.positions[id as usize]);
             let Some(normal) = usable_normal(corners) else {

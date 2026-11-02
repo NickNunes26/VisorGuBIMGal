@@ -35,6 +35,12 @@ fn flush_raw_bytes(out: &mut String, raw: &mut Vec<u8>) {
     raw.clear();
 }
 
+/// Upper-cases an ASCII name in one allocation of its exact length, rather than one per
+/// doubling as pushing a character at a time does.
+fn upper_case(name: &[u8]) -> String {
+    name.iter().map(|byte| char::from(byte.to_ascii_uppercase())).collect()
+}
+
 /// A cursor over one entity record (or a header statement).
 pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
@@ -141,19 +147,13 @@ impl<'a> Parser<'a> {
 
     fn parse_ident(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
-        let mut out = String::new();
-        while let Some(byte) = self.peek() {
-            if byte.is_ascii_alphanumeric() || byte == b'_' {
-                out.push(byte.to_ascii_uppercase() as char);
-                self.pos = self.pos.saturating_add(1);
-            } else {
-                break;
-            }
+        while self.peek().is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            self.pos = self.pos.saturating_add(1);
         }
         if self.pos == start {
             Err(self.error(ErrorKind::InvalidIdentifier))
         } else {
-            Ok(out)
+            Ok(upper_case(self.bytes.get(start..self.pos).unwrap_or_default()))
         }
     }
 
@@ -398,13 +398,11 @@ impl<'a> Parser<'a> {
 
     fn parse_enum(&mut self) -> Result<String, ParseError> {
         self.expect(b'.')?;
-        let mut value = String::new();
+        let start = self.pos;
         loop {
             match self.bump() {
                 Some(b'.') => break,
-                Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_' => {
-                    value.push(byte.to_ascii_uppercase() as char);
-                }
+                Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_' => {}
                 Some(byte) => {
                     return Err(self.error_at(
                         self.pos.saturating_sub(1),
@@ -414,10 +412,11 @@ impl<'a> Parser<'a> {
                 None => return Err(self.error(ErrorKind::UnexpectedEof)),
             }
         }
+        let value = self.bytes.get(start..self.pos.saturating_sub(1)).unwrap_or_default();
         if value.is_empty() {
             Err(self.error(ErrorKind::InvalidIdentifier))
         } else {
-            Ok(value)
+            Ok(upper_case(value))
         }
     }
 
