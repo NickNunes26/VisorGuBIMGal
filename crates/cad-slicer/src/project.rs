@@ -23,7 +23,8 @@ const MAX_ELEMENT_TRIANGLES: usize = 150_000;
 /// Feature edges one element may contribute.
 const MAX_FEATURE_EDGES: usize = 100_000;
 /// Edge against triangle tests one drawing may run before the projection stops and says so.
-const MAX_OCCLUSION_TESTS: usize = 200_000_000;
+/// Half a minute at worst, in a Worker of its own: a 4 m plan of a 77 MB model needs a third of it.
+const MAX_OCCLUSION_TESTS: usize = 2_000_000_000;
 /// Cosines above this are the same plane: a tessellated curve, not a crease.
 const CREASE_COSINE: f64 = 0.94;
 /// A point this far behind a surface is not hidden by the surface itself. Metres.

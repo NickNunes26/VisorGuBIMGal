@@ -4,6 +4,7 @@ import type { DrawingCut, DrawingOptions } from '../../domain/drawings/DrawingTy
 import type {
   ExportedDrawing,
   GeneratedDrawing,
+  KernelDiagnostic,
   KernelPort
 } from '../../domain/kernel/KernelPort';
 import type { ModelId, ModelRecord } from '../../domain/models/ModelRecord';
@@ -27,6 +28,19 @@ function downloadExportedDrawing(res: ExportedDrawing): void {
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+}
+
+/** A drawing that lost lines must not read as a success. */
+function drawingStatus(diagnostics: readonly KernelDiagnostic[]): string {
+  const warnings = diagnostics.filter((item) => item.severity !== 'info');
+  if (warnings.length === 0) return 'Plano 2D generado correctamente.';
+  const summary = `Plano 2D generado con ${warnings.length} ${warnings.length === 1 ? 'aviso' : 'avisos'}.`;
+  const incomplete = warnings.some(
+    (item) => item.code === 'projection-truncated' || item.code === 'projection-skipped'
+  );
+  return incomplete
+    ? `${summary} Faltan líneas proyectadas: indica una profundidad de proyección menor.`
+    : summary;
 }
 
 export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel }) => {
@@ -149,7 +163,7 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
       setDrawingModelIds(modelIds);
       setCurrentDrawing(generated);
       setPreviewSvg(svgText);
-      setStatusMessage('Plano 2D generado correctamente.');
+      setStatusMessage(drawingStatus(generated.diagnostics));
     } catch (err) {
       if (generated && !mountedRef.current) {
         void kernel.discardDrawing(generated.drawingId);
