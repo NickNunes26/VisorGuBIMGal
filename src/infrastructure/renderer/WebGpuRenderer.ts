@@ -137,86 +137,91 @@ export class WebGpuRenderer implements RendererPort {
     this.isDestroyed = false;
     this.canvas = canvas;
 
-    if (typeof navigator === 'undefined' || !('gpu' in navigator) || !navigator.gpu) {
-      throw new Error(
-        'WebGPU no está disponible en este navegador o equipo. Por favor, utiliza un navegador compatible (Chrome o Edge) con aceleración gráfica habilitada.'
-      );
-    }
-
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-      throw new Error(
-        'No se pudo obtener un adaptador gráfico WebGPU compatible en este equipo. Verifica que los controladores de tu tarjeta gráfica estén actualizados.'
-      );
-    }
-
-    let device: GPUDevice;
     try {
-      device = await adapter.requestDevice();
-    } catch (err) {
-      throw new Error(
-        `No se pudo inicializar el dispositivo gráfico WebGPU: ${err instanceof Error ? err.message : 'Error desconocido'}`
-      );
-    }
+      if (typeof navigator === 'undefined' || !('gpu' in navigator) || !navigator.gpu) {
+        throw new Error(
+          'WebGPU no está disponible en este navegador o equipo. Por favor, utiliza un navegador compatible (Chrome o Edge) con aceleración gráfica habilitada.'
+        );
+      }
 
-    if (this.isDestroyed || gen !== this.initGeneration) {
-      device.destroy();
-      return;
-    }
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) {
+        throw new Error(
+          'No se pudo obtener un adaptador gráfico WebGPU compatible en este equipo. Verifica que los controladores de tu tarjeta gráfica estén actualizados.'
+        );
+      }
 
-    const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
-    if (!context) {
-      device.destroy();
-      throw new Error('No se pudo crear el contexto WebGPU en el lienzo 3D.');
-    }
+      let device: GPUDevice;
+      try {
+        device = await adapter.requestDevice();
+      } catch (err) {
+        throw new Error(
+          `No se pudo inicializar el dispositivo gráfico WebGPU: ${err instanceof Error ? err.message : 'Error desconocido'}`
+        );
+      }
 
-    this.device = device;
-    this.context = context;
-    this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+      if (this.isDestroyed || gen !== this.initGeneration) {
+        device.destroy();
+        return;
+      }
 
-    context.configure({
-      device,
-      format: this.canvasFormat,
-      alphaMode: 'opaque'
-    });
+      const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
+      if (!context) {
+        device.destroy();
+        throw new Error('No se pudo crear el contexto WebGPU en el lienzo 3D.');
+      }
 
-    void device.lost.then((info) => {
-      if (this.isDestroyed || info.reason === 'destroyed') return;
-      const msg = `Se perdió la conexión con el dispositivo gráfico WebGPU${info.message ? ` (${info.message})` : ''}. Recarga la página para restaurar el visor 3D.`;
-      console.error(msg);
-      this.showDeviceLostBanner(msg);
-    });
+      this.device = device;
+      this.context = context;
+      this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
 
-    this.createPipelinesAndBuffers(device);
-    this.setupListeners(canvas);
-    this.syncCanvasSize();
+      context.configure({
+        device,
+        format: this.canvasFormat,
+        alphaMode: 'opaque'
+      });
 
-    if (import.meta.env.DEV && typeof window !== 'undefined') {
-      (window as unknown as Record<string, unknown>).__gubim_dev__ = {
-        renderer: this,
-        findBatchError
-      };
-    }
+      void device.lost.then((info) => {
+        if (this.isDestroyed || info.reason === 'destroyed') return;
+        const msg = `Se perdió la conexión con el dispositivo gráfico WebGPU${info.message ? ` (${info.message})` : ''}. Recarga la página para restaurar el visor 3D.`;
+        console.error(msg);
+        this.showDeviceLostBanner(msg);
+      });
 
-    // Drain any batches and finishModel calls that arrived before initialize resolved
-    if (this.preInitQueue.length > 0) {
-      const queued = this.preInitQueue.splice(0, this.preInitQueue.length);
-      for (const op of queued) {
-        if (op.kind === 'batch' && this.models.has(op.batch.modelId)) {
-          this.uploadBatchInternal(op.batch);
+      this.createPipelinesAndBuffers(device);
+      this.setupListeners(canvas);
+      this.syncCanvasSize();
+
+      if (import.meta.env.DEV && typeof window !== 'undefined') {
+        (window as unknown as Record<string, unknown>).__gubim_dev__ = {
+          renderer: this,
+          findBatchError
+        };
+      }
+
+      // Drain any batches and finishModel calls that arrived before initialize resolved
+      if (this.preInitQueue.length > 0) {
+        const queued = this.preInitQueue.splice(0, this.preInitQueue.length);
+        for (const op of queued) {
+          if (op.kind === 'batch' && this.models.has(op.batch.modelId)) {
+            this.uploadBatchInternal(op.batch);
+          }
         }
       }
-    }
 
-    if (this.pendingFinishBounds.size > 0) {
-      const entries = Array.from(this.pendingFinishBounds.entries());
-      this.pendingFinishBounds.clear();
-      for (const [modelId, bounds] of entries) {
-        this.finishModel(modelId, bounds);
+      if (this.pendingFinishBounds.size > 0) {
+        const entries = Array.from(this.pendingFinishBounds.entries());
+        this.pendingFinishBounds.clear();
+        for (const [modelId, bounds] of entries) {
+          this.finishModel(modelId, bounds);
+        }
       }
-    }
 
-    this.requestRender();
+      this.requestRender();
+    } catch (err) {
+      this.releaseGpuDeviceAndListeners();
+      throw err;
+    }
   }
 
   private createPipelinesAndBuffers(device: GPUDevice): void {
