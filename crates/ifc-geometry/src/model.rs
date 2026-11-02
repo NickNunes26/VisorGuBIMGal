@@ -1387,11 +1387,11 @@ impl<'a> ModelEvaluator<'a> {
         let found = self.file.get(id)?;
         // Most points are plain numbers, read without building an entity. Anything else, or
         // another type, takes the full path, which gives the same answer for those.
-        if Some(found.type_index) == self.cartesian_point {
-            if let Some(([x, y, z], count)) = self.file.decode_coordinates(found) {
-                let z = if count == 3 { z } else { 0.0 };
-                return Some(DVec3::new(x, y, z) * self.units.length);
-            }
+        if Some(found.type_index) == self.cartesian_point
+            && let Some(([x, y, z], count)) = self.file.decode_coordinates(found)
+        {
+            let z = if count == 3 { z } else { 0.0 };
+            return Some(DVec3::new(x, y, z) * self.units.length);
         }
         let (entity, def) = self.lookup(id)?;
         let coordinates = list(attribute(&entity, &def, "Coordinates"));
