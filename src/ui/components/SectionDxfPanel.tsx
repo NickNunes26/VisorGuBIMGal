@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Scissors, Download, FileCode, CheckCircle, RefreshCw } from 'lucide-react';
 import type { DrawingCut, DrawingOptions } from '../../domain/drawings/DrawingTypes';
 import type {
@@ -6,7 +6,7 @@ import type {
   GeneratedDrawing,
   KernelPort
 } from '../../domain/kernel/KernelPort';
-import type { ModelRecord } from '../../domain/models/ModelRecord';
+import type { ModelId, ModelRecord } from '../../domain/models/ModelRecord';
 
 interface SectionDxfPanelProps {
   models: ModelRecord[];
@@ -32,13 +32,26 @@ function downloadExportedDrawing(res: ExportedDrawing): void {
 export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel }) => {
   const [cutPreset, setCutPreset] = useState<CutPreset>('plan');
   const [position, setPosition] = useState<number>(1.2); // 1.2m typical floor cut
+  const [depthStr, setDepthStr] = useState<string>(''); // Optional projection depth
   const [includeHidden, setIncludeHidden] = useState<boolean>(true);
   const [includeHatching, setIncludeHatching] = useState<boolean>(true);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [previewSvg, setPreviewSvg] = useState<string | null>(null);
   const [currentDrawing, setCurrentDrawing] = useState<GeneratedDrawing | null>(null);
+  const [drawingModelIds, setDrawingModelIds] = useState<ModelId[]>([]);
+  const [drawingFirstModelFileName, setDrawingFirstModelFileName] = useState<string | null>(null);
 
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Discard drawing on unmount or when drawing changes
   useEffect(() => {
     return () => {
       if (currentDrawing) {
@@ -46,6 +59,21 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
       }
     };
   }, [currentDrawing, kernel]);
+
+  // When a model that a shown drawing came from is closed, clear preview, status, and discard drawing
+  useEffect(() => {
+    if (!currentDrawing || drawingModelIds.length === 0) return;
+    const currentModelIds = new Set(models.map((m) => m.id));
+    const anyClosed = drawingModelIds.some((id) => !currentModelIds.has(id));
+    if (anyClosed) {
+      void kernel.discardDrawing(currentDrawing.drawingId);
+      setCurrentDrawing(null);
+      setPreviewSvg(null);
+      setStatusMessage('');
+      setDrawingModelIds([]);
+      setDrawingFirstModelFileName(null);
+    }
+  }, [models, currentDrawing, drawingModelIds, kernel]);
 
   const handleGenerate = async () => {
     const visibleIds = models.filter((m) => m.visible).map((m) => m.id);
@@ -58,15 +86,21 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
     setIsGenerating(true);
     setStatusMessage('Calculando corte 2D...');
 
+    let generated: GeneratedDrawing | null = null;
     try {
+      const parsedDepth = depthStr.trim() !== '' ? parseFloat(depthStr) : undefined;
+      const depth =
+        parsedDepth !== undefined && !Number.isNaN(parsedDepth) ? parsedDepth : undefined;
+
       const cut: DrawingCut =
         cutPreset === 'plan'
-          ? { kind: 'plan', elevation: position }
+          ? { kind: 'plan', elevation: position, ...(depth !== undefined ? { depth } : {}) }
           : {
               kind: 'section',
               axis: cutPreset === 'section-x' ? 'x' : 'y',
               position,
-              look: 'positive'
+              look: 'positive',
+              ...(depth !== undefined ? { depth } : {})
             };
 
       const options: DrawingOptions = {
@@ -74,14 +108,19 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
         frame: { kind: 'project' },
         includeProjection: true,
         includeHiddenLines: includeHidden,
-        includeHatching,
-        includeEdges: true,
-        mergeLines: true
+        includeHatching
       };
 
-      const generated = await kernel.generateDrawing(modelIds, options, (stage, pct) => {
-        setStatusMessage(`${stage} (${pct}%)`);
+      generated = await kernel.generateDrawing(modelIds, options, (stage, pct) => {
+        if (mountedRef.current) {
+          setStatusMessage(`${stage} (${pct}%)`);
+        }
       });
+
+      if (!mountedRef.current) {
+        void kernel.discardDrawing(generated.drawingId);
+        return;
+      }
 
       const svgRes = await kernel.exportDrawing(generated.drawingId, {
         format: 'svg',
@@ -91,19 +130,38 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
         showHatching: includeHatching
       });
 
+      if (!mountedRef.current) {
+        void kernel.discardDrawing(generated.drawingId);
+        return;
+      }
+
       const svgText =
         typeof svgRes.content === 'string'
           ? svgRes.content
           : new TextDecoder().decode(svgRes.content);
 
+      if (currentDrawing) {
+        void kernel.discardDrawing(currentDrawing.drawingId);
+      }
+
+      const firstModel = models.find((m) => m.id === modelIds[0]);
+      setDrawingFirstModelFileName(firstModel ? firstModel.fileName : null);
+      setDrawingModelIds(modelIds);
       setCurrentDrawing(generated);
       setPreviewSvg(svgText);
       setStatusMessage('Plano 2D generado correctamente.');
     } catch (err) {
-      console.error(err);
-      setStatusMessage(`Error: ${err instanceof Error ? err.message : 'Error desconocido'}`);
+      if (generated && !mountedRef.current) {
+        void kernel.discardDrawing(generated.drawingId);
+      }
+      if (mountedRef.current) {
+        console.error(err);
+        setStatusMessage(`Error: ${err instanceof Error ? err.message : 'Error desconocido'}`);
+      }
     } finally {
-      setIsGenerating(false);
+      if (mountedRef.current) {
+        setIsGenerating(false);
+      }
     }
   };
 
@@ -113,8 +171,9 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
       return;
     }
     try {
-      const activeModel = models[0];
-      const baseName = activeModel ? activeModel.fileName.replace(/\.ifc$/i, '') : 'plano-ifc';
+      const baseName = drawingFirstModelFileName
+        ? drawingFirstModelFileName.replace(/\.ifc$/i, '')
+        : 'plano-ifc';
       const fileName = `${baseName}-${cutPreset}`;
 
       const res = await kernel.exportDrawing(currentDrawing.drawingId, {
@@ -164,6 +223,22 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
           style={{ width: '100%' }}
           value={position}
           onChange={(e) => setPosition(parseFloat(e.target.value) || 0)}
+        />
+      </div>
+
+      <div style={{ marginBottom: '12px' }}>
+        <label style={{ display: 'block', fontSize: '11px', color: '#94a3b8', marginBottom: '4px', fontWeight: 600 }}>
+          Profundidad de proyección (m)
+        </label>
+        <input
+          type="number"
+          step="0.1"
+          min="0"
+          placeholder="Opcional (sin límite)"
+          className="select"
+          style={{ width: '100%' }}
+          value={depthStr}
+          onChange={(e) => setDepthStr(e.target.value)}
         />
       </div>
 
