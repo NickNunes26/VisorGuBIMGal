@@ -210,11 +210,9 @@ impl IdTable {
         }
     }
 
-    /// A gap holds `NO_ENTRY`, which no entry position reaches, so the caller's
-    /// bounds check on the entries rejects it.
     fn get(&self, id: u32) -> Option<u32> {
         match self {
-            Self::Dense(table) => table.get(id as usize).copied(),
+            Self::Dense(table) => table.get(id as usize).copied().filter(|at| *at != NO_ENTRY),
             Self::Sparse(map) => map.get(&id).copied(),
         }
     }
@@ -230,12 +228,25 @@ mod id_table_tests {
     }
 
     #[test]
-    fn scattered_ids_never_get_a_table_sized_by_the_largest_id() {
+    fn a_table_by_id_is_kept_within_twice_the_entities_plus_1024() {
         // Inside WASM a table up to u32::MAX would need 16 GB and kill the model.
         assert!(matches!(table(&[7, u32::MAX]), IdTable::Sparse(_)));
         assert!(matches!(table(&[1, 2, 5_000]), IdTable::Sparse(_)));
+        // Mostly empty, but 901 slots are 3.6 KB: any small file may use a table.
         assert!(matches!(table(&[1, 2, 3, 900]), IdTable::Dense(_)));
         assert!(matches!(table(&[]), IdTable::Sparse(_)));
+    }
+
+    #[test]
+    fn both_layouts_answer_none_for_an_id_they_do_not_hold() {
+        for ids in [&[1, 2, 4][..], &[1, 2, 4, 5_000]] {
+            let table = table(ids);
+            assert_eq!(table.get(2), Some(1));
+            assert_eq!(table.get(4), Some(2));
+            assert_eq!(table.get(3), None, "a gap, {table:?}");
+            assert_eq!(table.get(0), None);
+            assert_eq!(table.get(u32::MAX), None);
+        }
     }
 }
 

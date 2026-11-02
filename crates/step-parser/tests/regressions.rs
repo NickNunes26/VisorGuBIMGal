@@ -249,7 +249,9 @@ fn lookup_by_id_works_for_dense_sparse_and_missing_ids() {
     assert!(sparse.get(4_000_000_001).is_none());
 
     // A duplicate keeps the first record in both layouts.
-    let duplicate = complete("#1=IFCA(1);\n#1=IFCB(2);");
-    let duplicate = index(&duplicate).unwrap();
-    assert_eq!(duplicate.get(1).unwrap().type_name, "IFCA");
+    for text in ["#1=IFCA(1);\n#1=IFCB(2);", "#1=IFCA(1);\n#1=IFCB(2);\n#9000=IFCC(3);"] {
+        let bytes = complete(text);
+        let duplicate = index(&bytes).unwrap();
+        assert_eq!(duplicate.get(1).unwrap().type_name, "IFCA", "{text}");
+    }
 }
