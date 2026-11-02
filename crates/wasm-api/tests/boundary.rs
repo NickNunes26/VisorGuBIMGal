@@ -186,6 +186,29 @@ fn a_box_shares_corners_within_a_side_and_splits_them_between_sides() {
     let batch = &batches[0];
     // Eight corners, each on three sides, and two triangles per side.
     assert_eq!((batch.positions.len() / 3, batch.indices.len() / 3), (24, 12));
+    assert_normals_follow_triangles(batch);
+}
+
+#[test]
+fn corners_whose_facings_differ_only_above_the_low_byte_are_not_shared() {
+    // Facings (0, -9636, 31318) and (0, -22692, 23638): equal in each low byte.
+    let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
+        #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+        #2=IFCPROXY('w',$,$,$,$,$,#3,$,.PRODUCT.,$);\n\
+        #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+        #4=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#5));\n\
+        #5=IFCTRIANGULATEDFACESET(#6,$,$,((1,2,3),(2,1,4)),$);\n\
+        #6=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,13.,4.),(0.,-200.,-192.)));\n\
+        ENDSEC;END-ISO-10303-21;";
+    let mut model = LoadedModel::open(text.as_bytes().to_vec()).unwrap();
+    let batches = stream(&mut model, usize::MAX);
+    batches.iter().for_each(check);
+    assert_eq!(batches[0].positions.len() / 3, 6);
+    assert_normals_follow_triangles(&batches[0]);
+}
+
+/// Each corner's normal is the normal of every triangle that uses it.
+fn assert_normals_follow_triangles(batch: &Batch) {
     let vector = |values: &[f32], index: u32| -> [f32; 3] {
         std::array::from_fn(|axis| values[index as usize * 3 + axis])
     };

@@ -2,7 +2,7 @@
 
 use ifc_geometry::hash::{Keyed, set_secret};
 use std::collections::HashSet;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hasher};
 
 /// Secrets as a random source gives them, from SplitMix64. The bound needs a random secret: one
 /// such as `[1, 2, 3, 4]`, with a zero half, makes every key alike.
@@ -111,5 +111,39 @@ fn the_secret_changes_every_hash_and_new_maps_take_it() {
         let current = Keyed::default();
         let expected = Keyed::with_secret(secret);
         assert!(keys.iter().all(|key| current.hash_one(key) == expected.hash_one(key)));
+    }
+}
+
+#[test]
+fn bytes_that_differ_only_by_trailing_zeros_hash_apart() {
+    for secret in SECRETS {
+        let keyed = Keyed::with_secret(secret);
+        let raw = |bytes: &[u8]| {
+            let mut hasher = keyed.build_hasher();
+            hasher.write(bytes);
+            hasher.finish()
+        };
+        assert_ne!(raw(&[1]), raw(&[1, 0]));
+        assert_ne!(raw(&[]), raw(&[0]));
+        assert_ne!(raw(&[1; 8]), raw(&[1, 1, 1, 1, 1, 1, 1, 1, 0]));
+    }
+}
+
+#[test]
+fn words_past_the_secret_cannot_trade_places() {
+    for secret in SECRETS {
+        let keyed = Keyed::with_secret(secret);
+        let key = (1u64, 2u64, 3u64, 4u64, 5u64, 6u64);
+        assert_ne!(keyed.hash_one(key), keyed.hash_one((5u64, 2u64, 3u64, 4u64, 1u64, 6u64)));
+        assert_ne!(keyed.hash_one(key), keyed.hash_one((1u64, 6u64, 3u64, 4u64, 5u64, 2u64)));
+    }
+}
+
+#[test]
+fn a_secret_with_zero_halves_still_tells_ids_apart() {
+    for secret in [[0; 4], [1, 2, 3, 4], [u64::MAX, 0, u64::MAX, 0]] {
+        let keyed = Keyed::with_secret(secret);
+        let hashes: Vec<u64> = (0..4096u32).map(|id| keyed.hash_one(id << 20)).collect();
+        assert_spread("ids", &hashes);
     }
 }
