@@ -1,5 +1,3 @@
-import sys
-sys.path.insert(0, r'D:\Sysmaqs\guBIM-tools\blender-py')
 """Author road-alignment.ifc with Blender 5.0 + IfcOpenShell 0.8.4.
 
 Design (all lengths in metres, project length unit metre):
@@ -20,7 +18,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import sys
 from pathlib import Path
+
+# The alignment API needs shapely, which Blender's Python lacks: name a folder that has it.
+if "GUBIM_BLENDER_PY" in os.environ:
+    sys.path.insert(0, os.environ["GUBIM_BLENDER_PY"])
 
 import ifcopenshell
 import ifcopenshell.api.alignment as alignment_api
