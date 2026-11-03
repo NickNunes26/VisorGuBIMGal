@@ -46,6 +46,7 @@ interface ModelEntry {
   visibilityOverrides: Map<number, boolean>;
   /** Starting record index in the global GPU record buffer. */
   recordBaseOffset: number;
+  /** The kernel's 'complete' bounds, set by finishModel; not valid while the model streams. */
   bounds: {
     minX: number;
     minY: number;
@@ -683,23 +684,6 @@ export class WebGl2Renderer implements RendererPort {
       }
 
       const hiddenByDefault = (rawFlags & MeshFlag.HiddenByDefault) !== 0;
-      if (!hiddenByDefault) {
-        const endVert = firstVertex + vCount;
-        for (let v = firstVertex; v < endVert; v++) {
-          const pIdx = v * 3;
-          const wx = ox + positions[pIdx];
-          const wy = oy + positions[pIdx + 1];
-          const wz = oz + positions[pIdx + 2];
-          if (wx < model.bounds.minX) model.bounds.minX = wx;
-          if (wy < model.bounds.minY) model.bounds.minY = wy;
-          if (wz < model.bounds.minZ) model.bounds.minZ = wz;
-          if (wx > model.bounds.maxX) model.bounds.maxX = wx;
-          if (wy > model.bounds.maxY) model.bounds.maxY = wy;
-          if (wz > model.bounds.maxZ) model.bounds.maxZ = wz;
-          model.bounds.valid = true;
-        }
-      }
-
       const visOverride = model.visibilityOverrides.get(expressId);
       const isCurrentlyVisible = visOverride !== undefined ? visOverride : !hiddenByDefault;
       const isSelected =
@@ -822,7 +806,7 @@ export class WebGl2Renderer implements RendererPort {
     }
 
     const model = this.models.get(modelId);
-    if (model && !model.bounds.valid && bounds) {
+    if (model && bounds) {
       model.bounds.minX = bounds.min.x;
       model.bounds.minY = bounds.min.y;
       model.bounds.minZ = bounds.min.z;
