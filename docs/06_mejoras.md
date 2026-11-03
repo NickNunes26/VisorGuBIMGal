@@ -20,7 +20,7 @@ Objetivo medible: ningún bloqueo del hilo principal por encima de 200 ms (hoy 2
 
 | ID | Mejora | Evidencia en el código | Tam. | Origen | Comprobado |
 |---|---|---|---|---|---|
-| A1 | Quitar el bucle por vértice que calcula los límites del modelo en JavaScript; usar los límites del kernel | `WebGpuRenderer.ts:661-667`, equivalente en `WebGl2Renderer.ts` | S | C+G | Sí. Medido el 2026-11-03: no es la causa de los bloqueos; el bucle no aparece en ningún tramo de más de 50 ms del hilo principal. Ganancia pequeña |
+| A1 | Quitar el bucle por vértice que calcula los límites del modelo en JavaScript; usar los límites del kernel | `WebGpuRenderer.ts:661-667`, equivalente en `WebGl2Renderer.ts` | S | C+G | Sí. Medido el 2026-11-03: no es la causa de los bloqueos; el bucle no aparece en ningún tramo de más de 50 ms del hilo principal. Ganancia pequeña. **Hecho en T-101** (2026-11-04): los límites vienen del evento `complete` del kernel. Tiempo propio de `uploadBatchInternal` por carga, modelos de 184 y 108 MB en WebGPU y WebGL2: de 97 a 159 ms a 23 a 42 ms. El bloqueo más largo y el tiempo de carga no cambian de forma medible |
 | A2 | No reconstruir toda la tabla de registros cada vez que llega un lote; añadir en su sitio | `WebGpuRenderer.ts:1114-1120` copia palabra a palabra todos los registros | S | C | Sí. Medido el 2026-11-03: tampoco aparece en ningún tramo de más de 50 ms |
 | A3 | Repartir la subida a GPU entre fotogramas con un presupuesto de tiempo por fotograma | Ruta de `addBatch` en ambos renderizadores | M | C | Diseño |
 | A4 | Separar índices opacos y transparentes en el kernel, no en el hilo principal | `WebGpuRenderer.ts:765-782` copia con `subarray`/`set` por registro en lotes mixtos | M | G | Sí. Toca el contrato |
