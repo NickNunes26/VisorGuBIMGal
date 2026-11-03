@@ -207,6 +207,26 @@ fn axes_may_be_lines_bent_polylines_or_circles() {
     // Axis B at x = 30 meets the second leg, at (30, 20), heading +x.
     frame(body, DVec3::new(30.0, 20.0, 0.0), DVec3::X, DVec3::Y, 1e-9);
 
+    // Offset, the legs meet at a mitred corner: 2 to the left it is at (22 - 2√2, 22), so
+    // x = 19.5 is on the second leg, though past the end of the first leg moved on its own.
+    let bent = |x: f64, offset: f64| {
+        format!(
+            "#70=IFCCARTESIANPOINT((0.,0.));\n#71=IFCCARTESIANPOINT((20.,20.));\n\
+             #72=IFCCARTESIANPOINT((40.,20.));\n#73=IFCPOLYLINE((#70,#71,#72));\n\
+             #74=IFCGRIDAXIS('P',#73,.T.);\n#80=IFCCARTESIANPOINT(({x:?},-5.));\n\
+             #81=IFCCARTESIANPOINT(({x:?},40.));\n#82=IFCPOLYLINE((#80,#81));\n#83=IFCGRIDAXIS('V',#82,.T.);\n\
+             #50=IFCGRIDPLACEMENT(#10,#51,$);\n#51=IFCVIRTUALGRIDINTERSECTION((#74,#83),({offset:?},0.,0.));\n"
+        )
+    };
+    let (body, diagnostics) = on_grid(&grid(1.0, location, direction, ".T."), &bent(19.5, 2.0));
+    clean(&diagnostics);
+    frame(body, DVec3::new(19.5, 22.0, 0.0), DVec3::X, DVec3::Y, 1e-9);
+    // 2 to the right the corner is at (18 + 2√2, 18), so x = 21 is on the first leg moved on
+    // its own, but before the corner, on the second leg.
+    let (body, diagnostics) = on_grid(&grid(1.0, location, direction, ".T."), &bent(21.0, -2.0));
+    clean(&diagnostics);
+    frame(body, DVec3::new(21.0, 18.0, 0.0), DVec3::X, DVec3::Y, 1e-9);
+
     // A circle of radius 10 round the origin, offset 2 to its left, which is inward.
     let entities = "#70=IFCCARTESIANPOINT((0.,0.));\n#71=IFCAXIS2PLACEMENT2D(#70,$);\n#73=IFCCIRCLE(#71,10.);\n\
                     #74=IFCGRIDAXIS('R',#73,.T.);\n#75=IFCCARTESIANPOINT((-20.,0.));\n\

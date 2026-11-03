@@ -307,18 +307,41 @@ fn flag(value: Option<&Value>) -> Option<bool> {
     }
 }
 
+/// Where two lines cross, as shares of each run; `None` when they are parallel.
+fn line_crossing(start_a: DVec2, run_a: DVec2, start_b: DVec2, run_b: DVec2) -> Option<(f64, f64)> {
+    let turn = run_a.perp_dot(run_b);
+    if turn.abs() <= CROSSING_TOLERANCE * run_a.length() * run_b.length() {
+        return None;
+    }
+    let gap = start_b - start_a;
+    Some((gap.perp_dot(run_b) / turn, gap.perp_dot(run_a) / turn))
+}
+
+/// A polyline moved sideways by `offset`, positive to its left, as legs of start and run.
+/// Each leg is moved on its own, then cut or lengthened to meet the next at a mitre, so a bend
+/// leaves neither a gap nor an overlap.
+fn offset_legs(points: &[DVec2], offset: f64) -> Vec<(DVec2, DVec2)> {
+    let moved = |pair: &[DVec2]| {
+        let side = (pair[1] - pair[0]).try_normalize()?.perp() * offset;
+        Some([pair[0] + side, pair[1] + side])
+    };
+    let mut legs: Vec<[DVec2; 2]> = points.windows(2).filter_map(moved).collect();
+    for index in 1..legs.len() {
+        let ([start, end], [next_start, next_end]) = (legs[index - 1], legs[index]);
+        if let Some((at, _)) = line_crossing(start, end - start, next_start, next_end - next_start) {
+            let corner = start + (end - start) * at;
+            legs[index - 1][1] = corner;
+            legs[index][0] = corner;
+        }
+    }
+    legs.into_iter().map(|[start, end]| (start, end - start)).collect()
+}
+
 /// Where two polylines cross once each is moved sideways by its offset, positive to its left:
 /// the first crossing along `a`, and the heading of `a` there. The end legs run on past the
 /// ends, since grid axes are drawn to a length of their own choosing.
 fn offset_crossing(a: &[DVec2], offset_a: f64, b: &[DVec2], offset_b: f64) -> Option<(DVec2, DVec2)> {
-    let legs = |points: &[DVec2], offset: f64| -> Vec<(DVec2, DVec2)> {
-        let shifted = |pair: &[DVec2]| {
-            let run = pair[1] - pair[0];
-            Some((pair[0] + run.try_normalize()?.perp() * offset, run))
-        };
-        points.windows(2).filter_map(shifted).collect()
-    };
-    let (a, b) = (legs(a, offset_a), legs(b, offset_b));
+    let (a, b) = (offset_legs(a, offset_a), offset_legs(b, offset_b));
     if a.len().saturating_mul(b.len()) > MAX_CROSSING_PAIRS {
         return None;
     }
@@ -327,12 +350,7 @@ fn offset_crossing(a: &[DVec2], offset_a: f64, b: &[DVec2], offset_b: f64) -> Op
     };
     for (i, &(start_a, run_a)) in a.iter().enumerate() {
         for (j, &(start_b, run_b)) in b.iter().enumerate() {
-            let turn = run_a.perp_dot(run_b);
-            if turn.abs() <= CROSSING_TOLERANCE * run_a.length() * run_b.length() {
-                continue;
-            }
-            let gap = start_b - start_a;
-            let (at_a, at_b) = (gap.perp_dot(run_b) / turn, gap.perp_dot(run_a) / turn);
+            let Some((at_a, at_b)) = line_crossing(start_a, run_a, start_b, run_b) else { continue };
             if within(at_a, i, a.len()) && within(at_b, j, b.len()) {
                 return Some((start_a + run_a * at_a, run_a.normalize()));
             }
