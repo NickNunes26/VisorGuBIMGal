@@ -47,6 +47,12 @@ const RING_TOLERANCE: f64 = 1e-5;
 /// Points one alignment curve may reach: far beyond a real one, and hostile files can ask
 /// for thousands of segments of thousands of points.
 const MAX_CURVE_POINTS: usize = 200_000;
+/// Pairs of legs compared to find where two grid axes cross. Real axes have a few legs, and a
+/// tessellated arc a few hundred, each met by a straight axis.
+const MAX_CROSSING_PAIRS: usize = 100_000;
+/// Slack at the ends of a leg, as a share of its length, and the sine below which two legs
+/// count as parallel.
+const CROSSING_TOLERANCE: f64 = 1e-9;
 /// Face surfaces built as an exact B-spline for each face.
 const ANALYTIC_SURFACES: [&str; 5] = [
     "IfcCylindricalSurface",
@@ -115,6 +121,8 @@ pub struct ModelEvaluator<'a> {
     instance_triangles: usize,
     openings: HashMap<u32, Vec<u32>>,
     item_colors: HashMap<u32, u32>,
+    /// The placement of the grid each grid axis belongs to.
+    grid_axes: HashMap<u32, u32>,
     diagnostics: Vec<Diagnostic>,
     current: Option<u32>,
     degraded: bool,
@@ -297,6 +305,40 @@ fn flag(value: Option<&Value>) -> Option<bool> {
         Some(Value::Enum(flag)) if flag == "F" => Some(false),
         _ => None,
     }
+}
+
+/// Where two polylines cross once each is moved sideways by its offset, positive to its left:
+/// the first crossing along `a`, and the heading of `a` there. The end legs run on past the
+/// ends, since grid axes are drawn to a length of their own choosing.
+fn offset_crossing(a: &[DVec2], offset_a: f64, b: &[DVec2], offset_b: f64) -> Option<(DVec2, DVec2)> {
+    let legs = |points: &[DVec2], offset: f64| -> Vec<(DVec2, DVec2)> {
+        let shifted = |pair: &[DVec2]| {
+            let run = pair[1] - pair[0];
+            Some((pair[0] + run.try_normalize()?.perp() * offset, run))
+        };
+        points.windows(2).filter_map(shifted).collect()
+    };
+    let (a, b) = (legs(a, offset_a), legs(b, offset_b));
+    if a.len().saturating_mul(b.len()) > MAX_CROSSING_PAIRS {
+        return None;
+    }
+    let within = |at: f64, index: usize, count: usize| {
+        (index == 0 || at >= -CROSSING_TOLERANCE) && (index + 1 == count || at <= 1.0 + CROSSING_TOLERANCE)
+    };
+    for (i, &(start_a, run_a)) in a.iter().enumerate() {
+        for (j, &(start_b, run_b)) in b.iter().enumerate() {
+            let turn = run_a.perp_dot(run_b);
+            if turn.abs() <= CROSSING_TOLERANCE * run_a.length() * run_b.length() {
+                continue;
+            }
+            let gap = start_b - start_a;
+            let (at_a, at_b) = (gap.perp_dot(run_b) / turn, gap.perp_dot(run_a) / turn);
+            if within(at_a, i, a.len()) && within(at_b, j, b.len()) {
+                return Some((start_a + run_a * at_a, run_a.normalize()));
+            }
+        }
+    }
+    None
 }
 
 /// Appends a curve segment, dropping the joint it shares with what came before.
@@ -639,6 +681,7 @@ impl<'a> ModelEvaluator<'a> {
             instance_triangles: 0,
             openings: HashMap::new(),
             item_colors: HashMap::new(),
+            grid_axes: HashMap::new(),
             diagnostics: Vec::new(),
             current: None,
             degraded: false,
@@ -647,6 +690,7 @@ impl<'a> ModelEvaluator<'a> {
         };
         evaluator.index_openings();
         evaluator.index_colors();
+        evaluator.index_grids();
         Ok(evaluator)
     }
 
@@ -699,6 +743,22 @@ impl<'a> ModelEvaluator<'a> {
                 .find_map(|style| self.style_color(style, 0, &mut HashSet::new()));
             if let Some(color) = color {
                 self.item_colors.insert(item, color);
+            }
+        }
+    }
+
+    /// Grid placements before IFC 4.3 have no parent of their own: their grid places them.
+    fn index_grids(&mut self) {
+        let ids: Vec<u32> = self.file.ids_by_type("IFCGRID").collect();
+        for id in ids {
+            let Some((entity, def)) = self.lookup(id) else { continue };
+            let Some(placement) = attribute(&entity, &def, "ObjectPlacement").and_then(reference) else {
+                continue;
+            };
+            for axes in ["UAxes", "VAxes", "WAxes"] {
+                for axis in list(attribute(&entity, &def, axes)).iter().filter_map(reference) {
+                    self.grid_axes.insert(axis, placement);
+                }
             }
         }
     }
@@ -1527,16 +1587,27 @@ impl<'a> ModelEvaluator<'a> {
             return DMat4::IDENTITY;
         };
         let along_curve = def.is_a("IfcLinearPlacement");
-        if !def.is_a("IfcLocalPlacement") && !along_curve {
+        let on_grid = def.is_a("IfcGridPlacement");
+        if !def.is_a("IfcLocalPlacement") && !along_curve && !on_grid {
             self.warn("unsupported-placement", format!("#{id} {}", def.name()));
             return DMat4::IDENTITY;
         }
-        let parent = match attribute(&entity, &def, "PlacementRelTo").and_then(reference) {
+        let mut parent = attribute(&entity, &def, "PlacementRelTo").and_then(reference);
+        if on_grid && parent.is_none() {
+            parent = self.grid_of(&entity, &def);
+        }
+        let parent = match parent {
             Some(parent) => self.placement(parent, depth + 1),
             None => DMat4::IDENTITY,
         };
         let relative = attribute(&entity, &def, "RelativePlacement").and_then(reference);
-        let relative = if along_curve {
+        let relative = if on_grid {
+            let on_axes = self.grid_matrix(&entity, &def);
+            if on_axes.is_none() {
+                self.warn("bad-placement", format!("#{id} names grid axes that do not cross"));
+            }
+            on_axes
+        } else if along_curve {
             relative.and_then(|id| self.linear_matrix(id, depth + 1)).or_else(|| {
                 let fallback = attribute(&entity, &def, "CartesianPosition").and_then(reference);
                 fallback.map(|id| self.placement_matrix(id))
@@ -1547,6 +1618,68 @@ impl<'a> ModelEvaluator<'a> {
         let world = parent * relative.unwrap_or(DMat4::IDENTITY);
         self.placements.insert(id, world);
         world
+    }
+
+    /// The placement of the grid an `IfcGridPlacement`'s first axis belongs to.
+    fn grid_of(&self, entity: &Entity, def: &EntityDef) -> Option<u32> {
+        let location = attribute(entity, def, "PlacementLocation").and_then(reference)?;
+        let (crossing, crossing_def) = self.lookup(location)?;
+        let first = list(attribute(&crossing, &crossing_def, "IntersectingAxes")).first().and_then(reference)?;
+        self.grid_axes.get(&first).copied()
+    }
+
+    /// An `IfcGridPlacement` in its grid's coordinates. Its x runs toward the explicit direction,
+    /// else toward the second crossing, else along the first axis; its z is the grid's.
+    fn grid_matrix(&mut self, entity: &Entity, def: &EntityDef) -> Option<DMat4> {
+        let location = attribute(entity, def, "PlacementLocation").and_then(reference)?;
+        let (origin, along) = self.grid_crossing(location)?;
+        let toward = attribute(entity, def, "PlacementRefDirection").and_then(reference);
+        let x = match toward.and_then(|id| Some((id, self.lookup(id)?.1))) {
+            Some((id, toward_def)) if toward_def.is_a("IfcDirection") => self.direction(id).map(DVec3::truncate),
+            Some((id, _)) => self.grid_crossing(id).map(|(other, _)| (other - origin).truncate()),
+            None => None,
+        };
+        let x = x.and_then(DVec2::try_normalize).unwrap_or(along);
+        Some(DMat4::from_cols(
+            x.extend(0.0).extend(0.0),
+            x.perp().extend(0.0).extend(0.0),
+            DVec4::Z,
+            origin.extend(1.0),
+        ))
+    }
+
+    /// An `IfcVirtualGridIntersection`: where its two axes cross once offset, raised by its
+    /// third offset, and the heading of the first axis there.
+    fn grid_crossing(&mut self, id: u32) -> Option<(DVec3, DVec2)> {
+        let (entity, def) = self.lookup(id)?;
+        let axes: Vec<u32> = list(attribute(&entity, &def, "IntersectingAxes")).iter().filter_map(reference).collect();
+        let offsets = numbers(attribute(&entity, &def, "OffsetDistances"));
+        let scale = self.units.length;
+        let offset = |index: usize| offsets.get(index).copied().unwrap_or(0.0) * scale;
+        let [first, second] = axes[..] else { return None };
+        let (first, second) = (self.grid_axis(first)?, self.grid_axis(second)?);
+        let (point, along) = offset_crossing(&first, offset(0), &second, offset(1))?;
+        Some((point.extend(offset(2)), along))
+    }
+
+    /// An `IfcGridAxis` as a polyline in its grid's coordinates, running the axis's own way. An
+    /// unbounded line is two of its points, which is enough since axes run on past their ends.
+    fn grid_axis(&mut self, id: u32) -> Option<Vec<DVec2>> {
+        let (entity, def) = self.lookup(id)?;
+        let curve = attribute(&entity, &def, "AxisCurve").and_then(reference)?;
+        let (line, line_def) = self.lookup(curve)?;
+        let mut points = if line_def.is_a("IfcLine") {
+            let start = attribute(&line, &line_def, "Pnt").and_then(reference).and_then(|id| self.point(id))?;
+            let (vector, vector_def) = attribute(&line, &line_def, "Dir").and_then(reference).and_then(|id| self.lookup(id))?;
+            let heading = attribute(&vector, &vector_def, "Orientation").and_then(reference).and_then(|id| self.direction(id))?;
+            vec![start.truncate(), start.truncate() + heading.truncate()]
+        } else {
+            self.curve_points(curve)?
+        };
+        if flag(attribute(&entity, &def, "SameSense")) == Some(false) {
+            points.reverse();
+        }
+        Some(points)
     }
 
     fn curve_points(&mut self, id: u32) -> Option<Vec<DVec2>> {
