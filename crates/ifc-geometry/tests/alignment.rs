@@ -415,6 +415,166 @@ fn spirals_stay_within_the_chord_tolerance_where_they_curve_most() {
 }
 
 #[test]
+fn linear_placement_between_samples_is_on_the_true_arc_and_its_tangent() {
+    // Chords of radius 500 sag by up to 2 cm between samples; a placement must not.
+    let radius = 500.0_f64;
+    let quarter = FRAC_PI_2 * radius;
+    let curves = format!(
+        "#20=IFCCARTESIANPOINT((0.,{radius:?}));\n#21=IFCAXIS2PLACEMENT2D(#20,$);\n\
+         #24=IFCCIRCLE(#21,{radius:?});\n\
+         #48=IFCCURVESEGMENT(.DISCONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE({quarter:?}),#24);\n\
+         #50=IFCCOMPOSITECURVE((#48),.F.);\n"
+    );
+    for at in [7.0, 111.0, 333.3, 700.0] {
+        let corner = linear_placement(&curves, at, 0.0, 0.0, 0.0).positions[0];
+        let angle = at / radius;
+        let expected = DVec3::new(radius * angle.sin(), radius - radius * angle.cos(), 0.0);
+        near(corner, expected, 1e-6);
+        // Offset to the left, towards the centre: a chord's direction would turn the offset.
+        let inside = linear_placement(&curves, at, 7.0, 0.0, 0.0).positions[0];
+        let towards = DVec3::new(angle.sin(), -angle.cos(), 0.0);
+        near(inside, DVec3::new(0.0, radius, 0.0) + towards * (radius - 7.0), 1e-6);
+    }
+    // The block's 2 m side lies along the tangent there, not along a chord.
+    let at = 333.3;
+    let angle = at / radius;
+    let mesh = linear_placement(&curves, at, 0.0, 0.0, 0.0);
+    let tip = DVec3::new(radius * angle.sin(), radius - radius * angle.cos(), 0.0)
+        + DVec3::new(angle.cos(), angle.sin(), 0.0) * 2.0;
+    assert!(mesh.positions.iter().any(|point| point.distance(tip) < 1e-6), "{tip}");
+}
+
+#[test]
+fn linear_placement_at_the_end_heads_along_the_curve_and_past_it_carries_on_straight() {
+    // The arc of LINE_AND_ARC ends at (200, 100) heading along +Y, 100 + 50 pi along.
+    let end = 100.0 + 50.0 * PI;
+    let placed = linear_placement(LINE_AND_ARC, end, 0.0, 0.0, 0.0);
+    near(placed.positions[0], DVec3::new(200.0, 100.0, 0.0), 1e-6);
+    let tip = DVec3::new(200.0, 102.0, 0.0);
+    assert!(placed.positions.iter().any(|point| point.distance(tip) < 1e-6), "{tip}");
+    // Not on round the circle, which would be half a metre to the left by then.
+    near(linear_placement(LINE_AND_ARC, end + 10.0, 0.0, 0.0, 0.0).positions[0], DVec3::new(200.0, 110.0, 0.0), 1e-6);
+}
+
+#[test]
+fn linear_placement_on_a_part_with_no_segment_follows_its_polyline() {
+    // Up +Y to the origin as a plain polyline, 100 m along +X as a segment, then up +Y again.
+    let curves = "#20=IFCCARTESIANPOINT((0.,-50.));\n#21=IFCCARTESIANPOINT((100.,0.));\n\
+        #22=IFCCARTESIANPOINT((100.,50.));\n\
+        #23=IFCPOLYLINE((#20,#904));\n#24=IFCPOLYLINE((#21,#22));\n\
+        #40=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#23);\n\
+        #41=IFCCURVESEGMENT(.CONTINUOUS.,#905,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(100.),#908);\n\
+        #42=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#24);\n\
+        #50=IFCCOMPOSITECURVE((#40,#41,#42),.F.);\n";
+    near(linear_placement(curves, 25.0, 0.0, 0.0, 0.0).positions[0], DVec3::new(0.0, -25.0, 0.0), 1e-6);
+    near(linear_placement(curves, 170.0, 0.0, 0.0, 0.0).positions[0], DVec3::new(100.0, 20.0, 0.0), 1e-6);
+}
+
+#[test]
+fn linear_placement_between_samples_is_on_the_true_spiral_entered_from_either_end() {
+    let heading = |s: f64| s * s / (2.0 * 300.0 * 300.0);
+    let curves = single_segment("#30=IFCCLOTHOID(#905,300.);\n", 0.0, 400.0);
+    for at in [123.4, 250.0, 390.0] {
+        let placed = linear_placement(&curves, at, 0.0, 0.0, 0.0);
+        near(placed.positions[0], integrated(heading, 0.0, at).extend(0.0), 1e-5);
+    }
+    // A segment run backwards from 400 m towards the origin, straightening as it goes, as an
+    // exporter writes a transition out of a curve. Its own start is the placement origin.
+    let curves = single_segment("#30=IFCCLOTHOID(#905,300.);\n", 400.0, -400.0);
+    // 150 m along is 250 m from the spiral's origin. In the spiral's own frame, from its end:
+    let moved = integrated(heading, 0.0, 250.0) - integrated(heading, 0.0, 400.0);
+    // The segment's X runs back along the spiral's tangent at 400 m, and its Y to the left of that.
+    let end = heading(400.0);
+    let x = DVec2::new(-end.cos(), -end.sin());
+    let y = DVec2::new(end.sin(), -end.cos());
+    let placed = linear_placement(&curves, 150.0, 0.0, 0.0, 0.0);
+    let corner = DVec3::new(moved.dot(x), moved.dot(y), 0.0);
+    near(placed.positions[0], corner, 1e-5);
+    // Its 2 m side points the way the segment runs: back along the spiral.
+    let back = DVec2::new(-heading(250.0).cos(), -heading(250.0).sin());
+    let tip = corner + DVec3::new(back.dot(x), back.dot(y), 0.0) * 2.0;
+    assert!(placed.positions.iter().any(|point| point.distance(tip) < 1e-5), "{tip}");
+}
+
+#[test]
+fn linear_placement_between_samples_of_a_crest_takes_its_true_height() {
+    // Samples of the crest are 1.56 m apart, so a chord between them sags by 0.06 mm.
+    let height = |x: f64| 11.0 + 0.02 * x - 0.0001 * x * x;
+    for along in [50.78, 63.3, 99.2] {
+        let placed = linear_placement(&format!("{STRAIGHT_BASE}{GRADIENT}"), along, 0.0, 0.0, 0.0);
+        close(placed.positions[0].z, height(along - 50.0), 1e-7);
+        // Its 2 m side climbs with the gradient there.
+        let rising = DVec3::new(1.0, 0.0, 0.02 - 0.0002 * (along - 50.0)).normalize();
+        let tip = placed.positions[0] + rising * 2.0;
+        assert!(placed.positions.iter().any(|point| point.distance(tip) < 1e-6), "{tip}");
+    }
+}
+
+/// The authored road alignment's stations, as `(station, [x, y, z], [tolerance; 3])` from its
+/// expected values file, read without a JSON library: each station holds four values in order.
+fn authored_stations(json: &str) -> Vec<(f64, DVec3, DVec3)> {
+    let stations = &json[json.find("\"stations\"").expect("a stations list")..];
+    let numbers = |key: &str| -> Vec<f64> {
+        stations
+            .split(key)
+            .skip(1)
+            .map(|rest| rest.split([',', '\n']).next().unwrap().trim().parse().unwrap())
+            .collect()
+    };
+    let (values, tolerances) = (numbers("\"value\":"), numbers("\"tolerance\":"));
+    values
+        .chunks(4)
+        .zip(tolerances.chunks(4))
+        .map(|(value, tolerance)| {
+            (value[0], DVec3::new(value[1], value[2], value[3]), DVec3::new(tolerance[1], tolerance[2], tolerance[3]))
+        })
+        .collect()
+}
+
+#[test]
+fn authored_road_stations_are_where_their_expected_values_say() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/authored");
+    let text = std::fs::read_to_string(folder.join("road-alignment.ifc")).unwrap();
+    let stations = authored_stations(&std::fs::read_to_string(folder.join("road-alignment.expected.json")).unwrap());
+    assert_eq!(stations.len(), 14);
+    let gradient = text.lines().find(|line| line.contains("=IFCGRADIENTCURVE(")).expect("a gradient curve");
+    let gradient = &gradient[..gradient.find('=').unwrap()];
+    // A 2 cm cube centred on each station, placed along the gradient curve.
+    let mut probes = String::from(
+        "#100000=IFCCARTESIANPOINT((-0.01,-0.01,-0.01));\n#100001=IFCAXIS2PLACEMENT3D(#100000,$,$);\n\
+         #100002=IFCBLOCK(#100001,0.02,0.02,0.02);\n\
+         #100003=IFCSHAPEREPRESENTATION($,'Body','CSG',(#100002));\n\
+         #100004=IFCPRODUCTDEFINITIONSHAPE($,$,(#100003));\n",
+    );
+    for (index, (station, _, _)) in stations.iter().enumerate() {
+        let id = 100_010 + index * 4;
+        probes += &format!(
+            "#{id}=IFCPOINTBYDISTANCEEXPRESSION(IFCLENGTHMEASURE({station:?}),$,$,$,{gradient});\n\
+             #{}=IFCAXIS2PLACEMENTLINEAR(#{id},$,$);\n#{}=IFCLINEARPLACEMENT($,#{},$);\n\
+             #{}=IFCBUILDINGELEMENTPROXY('probe{index}',$,$,$,$,#{},#100004,$,$);\n",
+            id + 1,
+            id + 2,
+            id + 1,
+            id + 3,
+            id + 2
+        );
+    }
+    let end = text.rfind("ENDSEC;").unwrap();
+    let text = format!("{}{probes}{}", &text[..end], &text[end..]);
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    for (index, (station, expected, tolerance)) in stations.iter().enumerate() {
+        let element = evaluator.evaluate((100_013 + index * 4) as u32).expect("the probe evaluates");
+        let mesh = &element.meshes[0].mesh;
+        let (min, max) = bounds(mesh);
+        let centre = (min + max) / 2.0;
+        let off = (centre - *expected).abs();
+        assert!(off.cmple(*tolerance).all(), "station {station}: {centre} against {expected}");
+    }
+    assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());
+}
+
+#[test]
 fn sectioned_solid_blends_the_offsets_of_its_sections() {
     let curves = format!(
         "{STRAIGHT_BASE}#50=IFCCOMPOSITECURVE((#48),.F.);\n\

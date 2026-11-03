@@ -4,6 +4,7 @@
 use crate::solids::CIRCLE_SEGMENTS;
 use glam::{DMat4, DVec2, DVec3};
 use std::f64::consts::{PI, TAU};
+use std::rc::Rc;
 
 const MAX_SEGMENT_POINTS: usize = 4096;
 /// How far a chord of an alignment curve may stray from it, in metres.
@@ -16,6 +17,8 @@ const SPIRAL_INTERVALS: usize = 512;
 const STEP_INTERVALS: usize = 4;
 /// Samples used to measure how far a spiral turns over a segment.
 const TURN_SAMPLES: usize = 32;
+/// Halvings that find where a vertical profile reaches a distance: 2⁻⁶⁰ of a segment.
+const PROFILE_HALVINGS: usize = 60;
 
 /// How a transition spiral turns with arc length.
 pub(crate) enum Heading {
@@ -165,11 +168,41 @@ impl Parent {
     }
 }
 
+/// The part of a parent curve that one segment places, kept to find points between samples.
+#[derive(Clone)]
+struct Piece {
+    /// Where the piece starts along the whole curve, and how long it is.
+    from: f64,
+    length: f64,
+    parent: Rc<Parent>,
+    moved: DMat4,
+    /// The parent's own measure at the piece's start, and +1 or -1 for the way it runs.
+    start: f64,
+    sense: f64,
+}
+
+impl Piece {
+    fn covers(&self, station: f64) -> bool {
+        station >= self.from && station <= self.from + self.length
+    }
+
+    /// The point and unit tangent `station` along the whole curve, on the parent itself.
+    fn at(&self, station: f64) -> (DVec3, DVec3) {
+        let (point, tangent) = self.parent.at(self.start + self.sense * (station - self.from));
+        let tangent = self.moved.transform_vector3(tangent * self.sense).normalize_or_zero();
+        (self.moved.transform_point3(point), tangent)
+    }
+}
+
 /// A polyline, with how far along the true curve each of its points is.
 #[derive(Clone, Default)]
 pub(crate) struct Stationed {
     pub points: Vec<DVec3>,
     pub stations: Vec<f64>,
+    /// The segments the points were sampled from, in order, where they are known.
+    pieces: Vec<Piece>,
+    /// For a curve raised by a gradient: the vertical profile, as distance along and height.
+    profile: Option<Rc<Stationed>>,
 }
 
 impl Stationed {
@@ -183,7 +216,7 @@ impl Stationed {
             }
             stations.push(walked);
         }
-        Self { points, stations }
+        Self { points, stations, ..Self::default() }
     }
 
     /// Appends a run, measured from its own start, and drops a joint they share.
@@ -196,6 +229,73 @@ impl Stationed {
         let skip = shared as usize;
         self.points.extend(run.points.into_iter().skip(skip));
         self.stations.extend(run.stations.into_iter().skip(skip).map(|station| station + offset));
+        self.pieces.extend(run.pieces.into_iter().map(|piece| Piece { from: piece.from + offset, ..piece }));
+    }
+
+    fn piece(&self, station: f64) -> Option<&Piece> {
+        let after = self.pieces.partition_point(|piece| piece.from <= station);
+        self.pieces[..after].last().filter(|piece| piece.covers(station))
+    }
+
+    /// The point and unit tangent at `station` on the curve itself, not on its chords, where
+    /// the segments it was sampled from are known. Elsewhere, as [`Self::at`].
+    pub fn exact(&self, station: f64) -> Option<(DVec3, DVec3)> {
+        let Some((point, tangent)) = self.on_pieces(station) else {
+            return self.at(station);
+        };
+        let Some(profile) = &self.profile else {
+            return Some((point, tangent));
+        };
+        let (height, gradient) = match profile.height(station) {
+            Some(found) => found,
+            None => {
+                let (point, tangent) = self.at(station)?;
+                (point.z, tangent.z / tangent.truncate().length().max(1e-12))
+            }
+        };
+        let run = tangent.truncate().normalize_or_zero();
+        Some((point.truncate().extend(height), run.extend(gradient).normalize_or_zero()))
+    }
+
+    /// On the segment at `station`, or past either end of the curve, straight on along its
+    /// tangent there. `None` where no segment is known.
+    fn on_pieces(&self, station: f64) -> Option<(DVec3, DVec3)> {
+        if let Some(piece) = self.piece(station) {
+            return Some(piece.at(station));
+        }
+        let (first, last) = (self.pieces.first()?, self.pieces.last()?);
+        let (start, end) = (*self.stations.first()?, *self.stations.last()?);
+        let (edge, piece) = if station < first.from && first.from <= start {
+            (first.from, first)
+        } else if station > last.from + last.length && last.from + last.length >= end {
+            (last.from + last.length, last)
+        } else {
+            return None;
+        };
+        let (point, tangent) = piece.at(edge);
+        Some((point + tangent * (station - edge), tangent))
+    }
+
+    /// Height and gradient where this vertical profile is `distance` along, on its segments.
+    /// A segment that runs back against the distance is left to the polyline.
+    fn height(&self, distance: f64) -> Option<(f64, f64)> {
+        self.pieces.iter().find_map(|piece| {
+            let along = |station: f64| piece.at(station).0.x;
+            let (mut low, mut high) = (piece.from, piece.from + piece.length);
+            if !(along(low) <= distance && distance <= along(high)) {
+                return None;
+            }
+            for _ in 0..PROFILE_HALVINGS {
+                let middle = 0.5 * (low + high);
+                if along(middle) < distance {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            let (point, tangent) = piece.at(0.5 * (low + high));
+            (tangent.x.abs() > 1e-12).then(|| (point.y, tangent.y / tangent.x))
+        })
     }
 
     fn chord(&self, index: usize) -> DVec3 {
@@ -220,15 +320,26 @@ impl Stationed {
         Some((point, tangent))
     }
 
-    /// The point and the axes at `station`: along the curve, to its left and up.
+    /// The point and the axes at `station` on the polyline, as meshes follow it: along the
+    /// curve, to its left and up.
     pub fn frame(&self, station: f64) -> Option<(DVec3, [DVec3; 3])> {
-        let (point, tangent) = self.at(station)?;
-        let left = DVec3::Z.cross(tangent).try_normalize().unwrap_or(DVec3::Y);
-        Some((point, [tangent, left, tangent.cross(left)]))
+        self.at(station).map(axes)
     }
 
-    /// The vertical profile, as `(distance, height)` points, raised onto this base.
-    pub fn lifted(&self, profile: &mut [DVec2]) -> Self {
+    /// The point and the axes at `station` on the curve itself, for placing things on it.
+    pub fn exact_frame(&self, station: f64) -> Option<(DVec3, [DVec3; 3])> {
+        self.exact(station).map(axes)
+    }
+
+    /// The vertical `profile`, whose points are distance along and height, raised onto this base.
+    pub fn lifted(&self, profile: Stationed) -> Self {
+        let profile = Rc::new(profile);
+        let mut points: Vec<DVec2> = profile.points.iter().map(|point| point.truncate()).collect();
+        let lifted = self.lifted_points(&mut points);
+        Self { pieces: self.pieces.clone(), profile: Some(profile), ..lifted }
+    }
+
+    fn lifted_points(&self, profile: &mut [DVec2]) -> Self {
         profile.sort_by(|a, b| a.x.total_cmp(&b.x));
         let height = |station: f64| {
             let after = profile.partition_point(|point| point.x <= station);
@@ -255,13 +366,18 @@ impl Stationed {
                 Some(DVec3::new(point.x, point.y, height(*station)))
             })
             .collect();
-        Self { points, stations }
+        Self { points, stations, ..Self::default() }
     }
+}
+
+fn axes((point, tangent): (DVec3, DVec3)) -> (DVec3, [DVec3; 3]) {
+    let left = DVec3::Z.cross(tangent).try_normalize().unwrap_or(DVec3::Y);
+    (point, [tangent, left, tangent.cross(left)])
 }
 
 /// A part of `parent`, from `start` by `length`, moved so that it sets off from `placement`
 /// along its X axis. The sign of `length` is the sense.
-pub(crate) fn segment(parent: &Parent, placement: DMat4, start: f64, length: f64) -> Option<Stationed> {
+pub(crate) fn segment(parent: Parent, placement: DMat4, start: f64, length: f64) -> Option<Stationed> {
     let (origin, tangent) = parent.at(start);
     let x = (tangent * length.signum()).try_normalize()?;
     let z = parent.plane();
@@ -276,5 +392,6 @@ pub(crate) fn segment(parent: &Parent, placement: DMat4, start: f64, length: f64
         .map(|point| moved.transform_point3(point))
         .collect();
     let stations = (0..=steps).map(|step| length.abs() * step as f64 / steps as f64).collect();
-    points.iter().all(|point| point.is_finite()).then_some(Stationed { points, stations })
+    let piece = Piece { from: 0.0, length: length.abs(), parent: Rc::new(parent), moved, start, sense: length.signum() };
+    points.iter().all(|point| point.is_finite()).then(|| Stationed { points, stations, pieces: vec![piece], profile: None })
 }

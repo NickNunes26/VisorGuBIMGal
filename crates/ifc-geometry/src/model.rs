@@ -1579,9 +1579,7 @@ impl<'a> ModelEvaluator<'a> {
             (*self.stationed(base?, depth + 1)?).clone()
         } else if def.is_a("IfcGradientCurve") {
             let base = self.stationed(base?, depth + 1)?;
-            let profile = self.curve_segments(&entity, &def, depth)?;
-            let mut profile: Vec<DVec2> = profile.points.iter().map(|point| point.truncate()).collect();
-            base.lifted(&mut profile)
+            base.lifted(self.curve_segments(&entity, &def, depth)?)
         } else if self.is_segmented(&entity, &def) {
             self.curve_segments(&entity, &def, depth)?
         } else {
@@ -1607,7 +1605,7 @@ impl<'a> ModelEvaluator<'a> {
                 let placement = attribute(&segment, &segment_def, "Placement").and_then(reference)?;
                 let placement = self.any_placement(placement, depth + 1)?;
                 let parent = self.parent_curve(parent, length.abs())?;
-                let run = curves::segment(&parent, placement, start, length);
+                let run = curves::segment(parent, placement, start, length);
                 if run.is_none() {
                     self.warn("bad-curve", format!("#{id} has no usable points"));
                 }
@@ -1710,7 +1708,8 @@ impl<'a> ModelEvaluator<'a> {
         let (basis, station, offsets) = self.distance_along(location)?;
         // A segment can be placed along the curve it belongs to, so depth carries through.
         let curve = self.stationed(basis?, depth + 1)?;
-        let (point, [along, left, up]) = curve.frame(station)?;
+        // On the curve itself: its chords stray by up to their tolerance between samples.
+        let (point, [along, left, up]) = curve.exact_frame(station)?;
         let origin = point + left * offsets.x + up * offsets.y + along * offsets.z;
         let on_curve = DMat4::from_cols(along.extend(0.0), left.extend(0.0), up.extend(0.0), origin.extend(1.0));
         Some(on_curve * self.placement_matrix(id))
