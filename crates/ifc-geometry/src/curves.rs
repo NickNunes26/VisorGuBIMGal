@@ -306,6 +306,10 @@ impl Stationed {
         let (first, last) = (self.pieces.first()?, self.pieces.last()?);
         let (start, end) = (*self.stations.first()?, *self.stations.last()?);
         let (begins, ends) = (first.at(first.from), last.at(last.from + last.length));
+        // A profile that runs back against the distance has no before and after.
+        if begins.0.x >= ends.0.x {
+            return None;
+        }
         let (point, tangent) = if first.from <= start && distance < begins.0.x {
             begins
         } else if last.from + last.length >= end && distance > ends.0.x {

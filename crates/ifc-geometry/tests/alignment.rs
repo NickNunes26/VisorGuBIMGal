@@ -535,6 +535,52 @@ fn past_the_end_of_a_gradient_the_height_carries_on_at_its_last_gradient() {
         #50=IFCGRADIENTCURVE((#37),.F.,#49,$);\n";
     let placed = linear_placement(&format!("{STRAIGHT_BASE}{crest_first}"), -10.0, 0.0, 0.0, 0.0);
     near(placed.positions[0], DVec3::new(-10.0, 0.0, 9.8), 1e-7);
+    let tip = placed.positions[0] + DVec3::new(1.0, 0.0, 0.02).normalize() * 2.0;
+    assert!(placed.positions.iter().any(|point| point.distance(tip) < 1e-7), "{tip}");
+}
+
+#[test]
+fn a_profile_that_ends_in_a_plain_polyline_carries_on_along_it() {
+    // Level at 10 m to 20 m, the crest to 70 m, level again at 10.75 m to 100 m.
+    let profile = "#20=IFCCARTESIANPOINT((0.,10.));\n#21=IFCCARTESIANPOINT((20.,10.));\n\
+        #22=IFCCARTESIANPOINT((70.,10.75));\n#23=IFCCARTESIANPOINT((100.,10.75));\n\
+        #24=IFCPOLYLINE((#20,#21));\n#25=IFCPOLYLINE((#22,#23));\n\
+        #26=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#24);\n#27=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#25);\n\
+        #31=IFCDIRECTION((1.,0.02));\n#32=IFCAXIS2PLACEMENT2D(#21,#31);\n\
+        #35=IFCPOLYNOMIALCURVE(#905,(0.,1.),(0.,0.02,-0.0001),$);\n\
+        #37=IFCCURVESEGMENT(.CONTINUOUS.,#32,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(50.),#35);\n\
+        #50=IFCGRADIENTCURVE((#26,#37,#27),.F.,#49,$);\n";
+    let curves = format!("{STRAIGHT_BASE}{profile}");
+    // Past either end of the crest, but on the level parts: not on along the crest's gradients.
+    close(linear_placement(&curves, 110.0, 0.0, 0.0, 0.0).positions[0].z, 10.75, 1e-7);
+    close(linear_placement(&curves, -10.0, 0.0, 0.0, 0.0).positions[0].z, 10.0, 1e-7);
+    close(linear_placement(&curves, 45.0, 0.0, 0.0, 0.0).positions[0].z, 10.0 + 0.5 - 0.0625, 1e-7);
+}
+
+#[test]
+fn a_profile_segment_running_back_against_the_distance_is_left_to_the_polyline() {
+    // The crest, turned to run back from 100 m towards 0: it heads along -X from 11.75 m.
+    let profile = "#30=IFCCARTESIANPOINT((100.,11.75));\n#31=IFCDIRECTION((-1.,0.));\n\
+        #32=IFCAXIS2PLACEMENT2D(#30,#31);\n\
+        #35=IFCPOLYNOMIALCURVE(#905,(0.,1.),(0.,0.02,-0.0001),$);\n\
+        #37=IFCCURVESEGMENT(.DISCONTINUOUS.,#32,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(100.),#35);\n\
+        #50=IFCGRADIENTCURVE((#37),.F.,#49,$);\n";
+    // In world terms the curve's tangent (1, 0.02) is turned onto (-1, 0).
+    let turn = PI - 0.02_f64.atan();
+    let world = |t: f64| {
+        let (u, v) = (t, 0.02 * t - 0.0001 * t * t);
+        DVec2::new(100.0 + u * turn.cos() - v * turn.sin(), 11.75 + u * turn.sin() + v * turn.cos())
+    };
+    let (mut low, mut high) = (0.0, 100.0);
+    for _ in 0..80 {
+        let middle = (low + high) / 2.0;
+        if world(middle).x > 50.0 { low = middle } else { high = middle }
+    }
+    let height = world(low).y;
+    // About 12 m: carrying on level from the segment's start would say 11.75 m.
+    assert!((height - 11.75).abs() > 0.2, "{height}");
+    let placed = linear_placement(&format!("{STRAIGHT_BASE}{profile}"), 50.0, 0.0, 0.0, 0.0);
+    close(placed.positions[0].z, height, 1e-3);
 }
 
 /// The authored road alignment's stations, as `(station, [x, y, z], [tolerance; 3])` from its
