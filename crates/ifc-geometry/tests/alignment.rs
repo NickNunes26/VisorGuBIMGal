@@ -510,6 +510,33 @@ fn linear_placement_between_samples_of_a_crest_takes_its_true_height() {
     }
 }
 
+#[test]
+fn a_profile_segment_running_past_the_next_one_gives_way_to_it() {
+    // The 2% grade is written 10 m too long, over the start of the crest at 50 m.
+    let overlapping = GRADIENT.replace("IFCLENGTHMEASURE(50.0100),#908", "IFCLENGTHMEASURE(60.),#908");
+    assert_ne!(overlapping, GRADIENT);
+    let placed = linear_placement(&format!("{STRAIGHT_BASE}{overlapping}"), 55.0, 0.0, 0.0, 0.0);
+    // The crest's 11.0975 m, not the grade's 11.1 m.
+    close(placed.positions[0].z, 11.0 + 0.02 * 5.0 - 0.0001 * 25.0, 1e-7);
+}
+
+#[test]
+fn past_the_end_of_a_gradient_the_height_carries_on_at_its_last_gradient() {
+    // The crest ends at 100 m, 11.75 m high, rising 1%.
+    let placed = linear_placement(&format!("{STRAIGHT_BASE}{GRADIENT}"), 110.0, 0.0, 0.0, 0.0);
+    near(placed.positions[0], DVec3::new(110.0, 0.0, 11.85), 1e-7);
+    let tip = placed.positions[0] + DVec3::new(1.0, 0.0, 0.01).normalize() * 2.0;
+    assert!(placed.positions.iter().any(|point| point.distance(tip) < 1e-7), "{tip}");
+    // Before a profile that starts on the crest, back down its first gradient of 2%.
+    let crest_first = "#30=IFCCARTESIANPOINT((0.,10.));\n#31=IFCDIRECTION((1.,0.02));\n\
+        #32=IFCAXIS2PLACEMENT2D(#30,#31);\n\
+        #35=IFCPOLYNOMIALCURVE(#905,(0.,1.),(0.,0.02,-0.0001),$);\n\
+        #37=IFCCURVESEGMENT(.DISCONTINUOUS.,#32,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(100.),#35);\n\
+        #50=IFCGRADIENTCURVE((#37),.F.,#49,$);\n";
+    let placed = linear_placement(&format!("{STRAIGHT_BASE}{crest_first}"), -10.0, 0.0, 0.0, 0.0);
+    near(placed.positions[0], DVec3::new(-10.0, 0.0, 9.8), 1e-7);
+}
+
 /// The authored road alignment's stations, as `(station, [x, y, z], [tolerance; 3])` from its
 /// expected values file, read without a JSON library: each station holds four values in order.
 fn authored_stations(json: &str) -> Vec<(f64, DVec3, DVec3)> {

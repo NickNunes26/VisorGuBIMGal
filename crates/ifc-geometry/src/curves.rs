@@ -276,10 +276,12 @@ impl Stationed {
         Some((point + tangent * (station - edge), tangent))
     }
 
-    /// Height and gradient where this vertical profile is `distance` along, on its segments.
-    /// A segment that runs back against the distance is left to the polyline.
+    /// Height and gradient where this vertical profile is `distance` along, on its segments,
+    /// and past either end straight on. A segment that runs back against the distance is left
+    /// to the polyline.
     fn height(&self, distance: f64) -> Option<(f64, f64)> {
-        self.pieces.iter().find_map(|piece| {
+        // Where segments overlap, the later holds: each starts where its own placement says.
+        let found = self.pieces.iter().rev().find_map(|piece| {
             let along = |station: f64| piece.at(station).0.x;
             let (mut low, mut high) = (piece.from, piece.from + piece.length);
             if !(along(low) <= distance && distance <= along(high)) {
@@ -295,6 +297,25 @@ impl Stationed {
             }
             let (point, tangent) = piece.at(0.5 * (low + high));
             (tangent.x.abs() > 1e-12).then(|| (point.y, tangent.y / tangent.x))
+        });
+        found.or_else(|| self.height_beyond(distance))
+    }
+
+    /// Past either end of this profile, straight on along its gradient there.
+    fn height_beyond(&self, distance: f64) -> Option<(f64, f64)> {
+        let (first, last) = (self.pieces.first()?, self.pieces.last()?);
+        let (start, end) = (*self.stations.first()?, *self.stations.last()?);
+        let (begins, ends) = (first.at(first.from), last.at(last.from + last.length));
+        let (point, tangent) = if first.from <= start && distance < begins.0.x {
+            begins
+        } else if last.from + last.length >= end && distance > ends.0.x {
+            ends
+        } else {
+            return None;
+        };
+        (tangent.x.abs() > 1e-12).then(|| {
+            let gradient = tangent.y / tangent.x;
+            (point.y + gradient * (distance - point.x), gradient)
         })
     }
 
