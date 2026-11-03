@@ -8,7 +8,7 @@ use step_parser::{Value, index};
 fn ifc_files() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    for folder in ["public/samples", "test/fixtures"] {
+    for folder in ["public/samples", "test/fixtures", "test/fixtures/authored"] {
         for entry in fs::read_dir(root.join(folder)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "ifc") {
@@ -27,6 +27,11 @@ fn every_entity_in_every_file_matches_its_schema() {
     for path in ifc_files() {
         let bytes = fs::read(&path).unwrap();
         let file = index(&bytes).unwrap();
+        // The parser keeps the first of two records with one id, so a test file that repeats
+        // an id tests something other than what it reads as.
+        if !file.duplicate_ids().is_empty() {
+            problems.push(format!("{}: repeated ids {:?}", path.display(), file.duplicate_ids()));
+        }
         let id = SchemaId::from_identifiers(file.schema_identifiers())
             .unwrap_or_else(|| panic!("{}: unsupported schema", path.display()));
         let tables = schema(id);
