@@ -1659,8 +1659,13 @@ impl<'a> ModelEvaluator<'a> {
             let (segment, segment_def) = self.lookup(id)?;
             let parent = attribute(&segment, &segment_def, "ParentCurve").and_then(reference)?;
             let run = if segment_def.is_a("IfcCurveSegment") {
-                let measure = |name: &str| attribute(&segment, &segment_def, name).and_then(number);
-                let (start, length) = (measure("SegmentStart")? * scale, measure("SegmentLength")? * scale);
+                let per_parameter = self.parameter_length(parent);
+                let measure = |name: &str| {
+                    let value = attribute(&segment, &segment_def, name)?;
+                    let by_parameter = matches!(value, Value::Typed { name, .. } if name == "IFCPARAMETERVALUE");
+                    Some(number(value)? * if by_parameter { per_parameter } else { scale })
+                };
+                let (start, length) = (measure("SegmentStart")?, measure("SegmentLength")?);
                 if length == 0.0 {
                     continue;
                 }
@@ -1682,6 +1687,27 @@ impl<'a> ModelEvaluator<'a> {
             whole.extend(run);
         }
         (whole.points.len() >= 2).then_some(whole)
+    }
+
+    /// The length along curve `id` per unit of its own parameter, for a segment measured by
+    /// parameter value: the direction vector on a line, the radius per plane angle unit on a
+    /// circle. Segments on other curves count it as a length: no parameter space for them is
+    /// agreed yet, and the exporters seen measure spirals by length.
+    fn parameter_length(&self, id: u32) -> f64 {
+        let scale = self.units.length;
+        let Some((entity, def)) = self.lookup(id) else {
+            return scale;
+        };
+        if def.is_a("IfcLine") {
+            let vector = attribute(&entity, &def, "Dir").and_then(reference).and_then(|id| self.lookup(id));
+            let magnitude = vector.and_then(|(vector, vector_def)| attribute(&vector, &vector_def, "Magnitude").and_then(number));
+            magnitude.map_or(scale, |magnitude| magnitude * scale)
+        } else if def.is_a("IfcCircle") {
+            let radius = attribute(&entity, &def, "Radius").and_then(number);
+            radius.map_or(scale, |radius| radius * scale * self.units.plane_angle)
+        } else {
+            scale
+        }
     }
 
     /// The curve a segment cuts from. `length` is the length of that segment.

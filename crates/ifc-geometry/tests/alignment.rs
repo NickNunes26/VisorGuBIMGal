@@ -23,8 +23,12 @@ const COMMON: &str = "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
     #908=IFCLINE(#904,#907);\n";
 
 fn run(body: &str, placement: &str) -> (Mesh, Vec<Diagnostic>) {
+    run_in(COMMON, body, placement)
+}
+
+fn run_in(common: &str, body: &str, placement: &str) -> (Mesh, Vec<Diagnostic>) {
     let text = format!(
-        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4X3'));ENDSEC;DATA;\n{COMMON}\
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4X3'));ENDSEC;DATA;\n{common}\
          #2=IFCWALL('w',$,$,$,$,{placement},#3,$,$);\n{body}ENDSEC;END-ISO-10303-21;"
     );
     let file = index(text.as_bytes()).unwrap();
@@ -188,6 +192,102 @@ fn composite_of_segments_places_each_where_it_says() {
     assert_ends_at(&mesh, DVec2::new(200.0, 100.0));
     assert_ends_at(&mesh, DVec2::new(100.0, 0.0));
     close(bounds(&mesh).1.x, 200.0, 0.01);
+}
+
+/// [`LINE_AND_ARC`] with the arc's length given as a parameter value of its circle.
+fn line_and_arc_by_parameter(turn: f64) -> String {
+    LINE_AND_ARC.replace("IFCLENGTHMEASURE(157.07963267948966),#24", &format!("IFCPARAMETERVALUE({turn:?}),#24"))
+}
+
+#[test]
+fn segment_lengths_given_as_parameter_values_follow_the_parents_own_parameter() {
+    // A circle's parameter is its angle: a quarter turn of radius 100 is 157.08 m long.
+    let quarter = wire(&line_and_arc_by_parameter(FRAC_PI_2));
+    assert_ends_at(&quarter, DVec2::new(200.0, 100.0));
+    close(bounds(&quarter).1.x, 200.0, 0.01);
+    // A line's is a multiple of its direction vector: 12.5 times a vector of 2 m.
+    let line = "#31=IFCVECTOR(#906,2.);\n#30=IFCLINE(#904,#31);\n\
+        #40=IFCCURVESEGMENT(.CONTINUOUS.,#905,IFCPARAMETERVALUE(0.),IFCPARAMETERVALUE(12.5),#30);\n\
+        #50=IFCCOMPOSITECURVE((#40),.F.);\n";
+    close(bounds(&wire(line)).1.x, 25.0, 1e-6);
+}
+
+#[test]
+fn a_circles_parameter_is_in_the_projects_plane_angle_unit() {
+    let degrees = COMMON.replace(
+        "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);",
+        "#1=IFCPROJECT('p',$,$,$,$,$,$,$,#800);\n\
+         #800=IFCUNITASSIGNMENT((#801));\n\
+         #801=IFCCONVERSIONBASEDUNIT(#802,.PLANEANGLEUNIT.,'DEGREE',#803);\n\
+         #802=IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);\n\
+         #803=IFCMEASUREWITHUNIT(IFCPLANEANGLEMEASURE(0.017453292519943295),#804);\n\
+         #804=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);",
+    );
+    let body = format!("{}#5=IFCSWEPTDISKSOLID(#50,{WIRE:?},$,$,$);\n", line_and_arc_by_parameter(90.0));
+    let (mesh, diagnostics) = run_in(&degrees, &body, "$");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_ends_at(&mesh, DVec2::new(200.0, 100.0));
+    close(bounds(&mesh).1.x, 200.0, 0.01);
+}
+
+#[test]
+fn parameter_values_are_measured_in_the_files_length_unit_and_count_as_lengths_on_spirals() {
+    let millimetres = COMMON.replace(
+        "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);",
+        "#1=IFCPROJECT('p',$,$,$,$,$,$,$,#800);\n\
+         #800=IFCUNITASSIGNMENT((#801));\n\
+         #801=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);",
+    );
+    let wire_in = |curves: &str| {
+        let (mesh, diagnostics) = run_in(&millimetres, &format!("{curves}#5=IFCSWEPTDISKSOLID(#50,1.,$,$,$);\n"), "$");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        mesh
+    };
+    // 12 500 times a vector of 2 mm.
+    let line = wire_in(
+        "#31=IFCVECTOR(#906,2.);\n#30=IFCLINE(#904,#31);\n\
+         #40=IFCCURVESEGMENT(.CONTINUOUS.,#905,IFCPARAMETERVALUE(0.),IFCPARAMETERVALUE(12500.),#30);\n\
+         #50=IFCCOMPOSITECURVE((#40),.F.);\n",
+    );
+    close(bounds(&line).1.x, 25.0, 1e-6);
+    // A clothoid of constant 100 m, 100 m long, given in millimetres by parameter value.
+    let theta = 0.5_f64;
+    let x = 100.0 * (1.0 - theta.powi(2) / 10.0 + theta.powi(4) / 216.0 - theta.powi(6) / 9360.0);
+    let y = 100.0 * (theta / 3.0 - theta.powi(3) / 42.0 + theta.powi(5) / 1320.0);
+    let spiral = wire_in(
+        "#30=IFCCLOTHOID(#905,100000.);\n\
+         #40=IFCCURVESEGMENT(.CONTINUOUS.,#905,IFCPARAMETERVALUE(0.),IFCPARAMETERVALUE(100000.),#30);\n\
+         #50=IFCCOMPOSITECURVE((#40),.F.);\n",
+    );
+    assert_ends_at(&spiral, DVec2::new(x, y));
+    let arc = wire_in(&LINE_AND_ARC.replace("100.", "100000.").replace(
+        "IFCLENGTHMEASURE(157.07963267948966),#24",
+        &format!("IFCPARAMETERVALUE({FRAC_PI_2:?}),#24"),
+    ));
+    assert_ends_at(&arc, DVec2::new(200.0, 100.0));
+    // A quarter turn, not round and round its circle.
+    close(bounds(&arc).1.y, 100.0, 0.01);
+}
+
+#[test]
+fn linear_placement_measures_along_an_arc_given_by_its_parameter() {
+    let along = 100.0 + 25.0 * PI;
+    let mesh = linear_placement(&line_and_arc_by_parameter(FRAC_PI_2), along, 0.0, 0.0, 0.0);
+    let expected = DVec3::new(100.0 + 100.0 * (PI / 4.0).sin(), 100.0 - 100.0 * (PI / 4.0).cos(), 0.0);
+    near(mesh.positions[0], expected, 1e-6);
+}
+
+#[test]
+fn a_profile_arc_given_by_its_parameter_keeps_its_length() {
+    // A sag of radius 1000, level at 10 m to start, for 0.05 rad: 50 m along its arc.
+    let curves = format!(
+        "{STRAIGHT_BASE}#30=IFCCARTESIANPOINT((0.,10.));\n#32=IFCAXIS2PLACEMENT2D(#30,$);\n\
+         #35=IFCCIRCLE(#905,1000.);\n\
+         #36=IFCCURVESEGMENT(.DISCONTINUOUS.,#32,IFCPARAMETERVALUE(4.71238898038469),IFCPARAMETERVALUE(0.05),#35);\n\
+         #50=IFCGRADIENTCURVE((#36),.F.,#49,$);\n"
+    );
+    let placed = linear_placement(&curves, 40.0, 0.0, 0.0, 0.0);
+    close(placed.positions[0].z, 1010.0 - (1000.0_f64 * 1000.0 - 1600.0).sqrt(), 1e-6);
 }
 
 /// A gradient over `#49`: 2% for 50 m from 10 m, then a crest to 100 m, as curve `#50`.
