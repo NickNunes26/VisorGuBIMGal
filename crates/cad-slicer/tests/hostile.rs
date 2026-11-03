@@ -145,7 +145,7 @@ fn a_hatch_with_no_usable_style_is_reported() {
         "Muro",
         cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)),
     );
-    item.hatch = Some(HatchStyle::new(f64::NAN, 0.2));
+    item.hatch = vec![HatchStyle::new(f64::NAN, 0.2)];
     let drawing = draw(&[item], &options(Cut::Plan { z: 0.5 }, false, true));
     assert!(codes(&drawing).contains(&"bad-hatch-style"), "{:?}", codes(&drawing));
 }
@@ -159,7 +159,7 @@ fn a_dense_hatch_stops_at_its_line_limit() {
         cuboid(v(0.0, 0.0, 0.0), v(100.0, 100.0, 1.0)),
     );
     // A hundred metres at five millimetres would be tens of thousands of lines.
-    item.hatch = Some(HatchStyle::new(45.0, 0.005));
+    item.hatch = vec![HatchStyle::new(45.0, 0.005)];
     let drawing = draw(&[item], &options(Cut::Plan { z: 0.5 }, false, true));
 
     let hatch = &layer(&drawing, "Terreno").hatch;

@@ -182,7 +182,13 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
   - `includeHiddenLines` exige `includeProjection`. Sin él, las ocultas se descartan antes de guardar el plano.
   - Las aristas siempre forman parte de la proyección y las líneas siempre se fusionan.
   - `units` escala las coordenadas exportadas a metros o milímetros.
-- **Tramas:** la trama procede de `IfcFillAreaStyleHatching` si existe, tomando su ángulo y separación. Si no, se aplica la regla del anexo A.
+- **Tramas:** la trama procede del material que da nombre a la capa, con la misma precedencia: la asignación del elemento antes que la de su tipo, y en un conjunto, su primer miembro. Se sigue `IfcMaterialDefinitionRepresentation` → `IfcStyledRepresentation` → `IfcStyledItem` → `IfcFillAreaStyle` (también a través de `IfcPresentationStyleAssignment`), y cada `IfcFillAreaStyleHatching` es una fila de líneas, de modo que dos filas se cruzan. Como máximo se leen 8 filas.
+  - El ángulo es `HatchLineAngle` en la unidad de ángulo del proyecto, antihorario desde el eje X de la hoja. La separación es `StartOfNextHatchLine` en la unidad de longitud del proyecto. Si es un vector (`IfcVector`, o `IfcOneDirectionRepeatFactor` en IFC2x3), cuenta su componente perpendicular a las líneas.
+  - Un `IfcFillAreaStyle` con `ModelOrDraughting` falso mide en papel, a una escala que la hoja no conoce, y no se usa.
+  - La línea de referencia pasa por `PatternStart`, o si no lo hay por `PointOfReferenceHatchLine`, en coordenadas de la hoja y en la unidad de longitud del proyecto. Sin ninguno pasa por el origen de la hoja, como en el anexo A.
+  - La hoja solo dibuja líneas continuas, así que una fila cuyo `HatchLineAppearance` tiene una fuente de trazos se omite: solo cuentan las que no tienen fuente o usan la predefinida `continuous`. Una fila idéntica a otra ya leída también se omite.
+  - Se ignoran `IfcExternallyDefinedHatchStyle`, `IfcFillAreaStyleTiles` y los estilos asignados a los ítems de geometría.
+  - Una fila sin ángulo finito, sin separación positiva o sin desplazamiento finito se omite con `bad-hatch-style`. Si no queda ninguna, o el material no tiene trama, se aplica la regla del anexo A.
 - **Capas:** cada elemento va a una capa, que también decide su trama. Es el nombre del material del elemento, con la asignación del elemento por delante de la de su tipo: el nombre del material, o del conjunto de capas, perfiles o constituyentes; si no tiene, el del material de su primer miembro. Sin material, es la clase IFC, como `IfcWall`. Un muro multicapa es una sola capa y un solo estilo de trama, porque el kernel no separa su geometría por capas de material. La trama se calcula por parte de la malla: un elemento de varias partes recibe la suya en cada una, y si se solapan, sus tramas también.
 - **Ciclo de vida:** un dibujo guarda sus propios datos 2D y sobrevive a `closeModel`. `discardDrawing` es idempotente. Exportar un dibujo descartado produce `drawing-not-found`.
 
@@ -308,7 +314,7 @@ Un Worker por plano, con su propia instancia WASM, además del de cada modelo. U
 
 1. El adaptador resuelve la lista de modelos y el CRS común (sección 5), y crea el Worker de plano con `Sheet::new`.
 2. Cada Worker de modelo evalúa sus elementos uno a uno y los pasa a coordenadas del marco en `f64`, aplicando su `localToMap` si el marco es `map`.
-3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, posiciones `f64` y triángulos. La trama de `IfcFillAreaStyleHatching` necesitará un campo más (sección 7). Cada elemento se evalúa entero, y antes de escribir el trozo se descarta cada parte de malla cuya profundidad, medida en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también las que no tocan el plano. Una parte fuera de esa zona no se ve ni oculta nada.
+3. `next_drawing_chunk` entrega trozos binarios con `expressId`, `parte`, capa, las filas de trama (ángulo, separación y desplazamiento en `f64`, como máximo 8), posiciones `f64` y triángulos. Cada elemento se evalúa entero, y antes de escribir el trozo se descarta cada parte de malla cuya profundidad, medida en coordenadas del marco, queda entera delante del plano sin tocarlo o más allá de `depth`, y sin proyección también las que no tocan el plano. Una parte fuera de esa zona no se ve ni oculta nada.
 4. El hilo principal transfiere cada trozo a `Sheet::add_chunk` sin leerlo ni guardarlo, y **solo pide el siguiente cuando `add_chunk` ha terminado**. Así los trozos nunca se acumulan en la cola de mensajes, y los de un modelo llegan en orden. `finish_drawing` devuelve los diagnósticos del modelo.
 5. Si un modelo se pierde a medias, el adaptador llama a `Sheet::drop_model` antes de seguir. Antes de generar repite la comprobación con los modelos que ya terminaron, porque pueden haberse cerrado mientras se atendía a otro.
 6. `Sheet::generate` ordena las mallas por `(model_index, expressId, parte)`, llama una vez a `cad_slicer::draw` con todas, libera las mallas y devuelve los diagnósticos, cuyo `model_index` el adaptador traduce a `ModelId`.
@@ -336,14 +342,13 @@ El código aún no cumple esta revisión en los puntos siguientes.
 
 | Contrato | Código actual |
 |---|---|
-| Trama desde `IfcFillAreaStyleHatching` | No se lee: todas las tramas salen del anexo A. Hace falta leerla y añadir su campo a los trozos |
 | `crsComment` | Solo llega al DXF. El SVG no admite comentarios en su lista blanca |
 
 ---
 
 ## Anexo A. Regla de tramas
 
-Se aplica a los elementos sin `IfcFillAreaStyleHatching`, de modo que otra implementación produzca la misma hoja. También se aplica si esa trama no tiene un ángulo finito y una separación positiva, con el diagnóstico `bad-hatch-style`.
+Se aplica a los elementos cuyo material no tiene `IfcFillAreaStyleHatching`, de modo que otra implementación produzca la misma hoja. También se aplica si ninguna de sus filas tiene un ángulo finito y una separación positiva, con el diagnóstico `bad-hatch-style`.
 
 1. El nombre de la capa se pasa a minúsculas y se busca cada clave de la tabla, en orden. Gana la primera.
 2. Sin coincidencia, se elige un patrón de reserva por FNV-1a de 64 bits de los bytes UTF-8 del nombre en minúsculas, módulo 4.
@@ -368,4 +373,4 @@ Se aplica a los elementos sin `IfcFillAreaStyleHatching`, de modo que otra imple
 - Los ángulos son antihorarios desde el eje X de la hoja.
 - Las líneas se anclan en el origen de la hoja, así que los elementos vecinos se traman de forma continua, también entre modelos.
 - Cada línea se recorta contra todos los lazos cerrados del elemento con la regla par-impar, de modo que el material se rellena y los huecos quedan vacíos. Una línea sobre el propio contorno se omite.
-- La separación se limita a 0,005–10 m, y cada parte de malla recibe como máximo 4096 líneas, con `hatch-truncated` si se alcanza.
+- La separación se limita a 0,005–10 m, también en las filas del archivo, y cada parte de malla recibe como máximo 4096 líneas entre todas sus filas, con `hatch-truncated` si se alcanza.

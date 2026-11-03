@@ -6,12 +6,12 @@
 use crate::encode::severity;
 use crate::json::{Object, ToJson, to_json};
 use cad_slicer::{
-    Axis, Cut, Drawing, DrawingMesh, DrawingOptions, DxfOptions, Frame, Look, SvgOptions, draw,
-    to_dxf_with, to_svg_with,
+    Axis, Cut, Drawing, DrawingMesh, DrawingOptions, DxfOptions, Frame, HatchStyle, Look,
+    SvgOptions, draw, to_dxf_with, to_svg_with,
 };
 use glam::{DMat4, DVec3};
 use ifc_geometry::{ElementGeometry, Mesh, ModelEvaluator};
-use spatial_tree::ModelData;
+use spatial_tree::{Hatching, MAX_HATCH_ROWS, ModelData};
 
 /// Words of a request before the optional transform.
 const REQUEST_WORDS: usize = 7;
@@ -57,11 +57,26 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn write_element(out: &mut Vec<u8>, express_id: u32, part: u32, layer: &str, mesh: &Mesh) {
+/// `[id, part, layer length, layer, hatch rows, (angle, spacing, offset) f64 per row, vertex
+/// count, triangle count, positions, triangles]`, little-endian.
+fn write_element(
+    out: &mut Vec<u8>,
+    express_id: u32,
+    part: u32,
+    layer: &str,
+    hatching: &[Hatching],
+    mesh: &Mesh,
+) {
     put_u32(out, express_id);
     put_u32(out, part);
     put_u32(out, layer.len() as u32);
     out.extend_from_slice(layer.as_bytes());
+    put_u32(out, hatching.len() as u32);
+    for row in hatching {
+        out.extend_from_slice(&row.angle_degrees.to_le_bytes());
+        out.extend_from_slice(&row.spacing.to_le_bytes());
+        out.extend_from_slice(&row.offset.to_le_bytes());
+    }
     put_u32(out, mesh.positions.len() as u32);
     put_u32(out, mesh.triangles.len() as u32);
     for position in &mesh.positions {
@@ -104,6 +119,15 @@ impl<'a> Reader<'a> {
         let part = self.u32()?;
         let layer_length = self.u32()? as usize;
         let layer = String::from_utf8_lossy(self.take(layer_length)?).into_owned();
+        let rows = self.u32()? as usize;
+        if rows > MAX_HATCH_ROWS {
+            return None;
+        }
+        let mut hatch = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let (angle, spacing, offset) = (self.f64()?, self.f64()?, self.f64()?);
+            hatch.push(HatchStyle::new(angle, spacing).shifted(offset));
+        }
         let vertices = self.u32()? as usize;
         let triangles = self.u32()? as usize;
         if vertices.checked_mul(24)?.checked_add(triangles.checked_mul(12)?)? > self.bytes.len() {
@@ -124,7 +148,8 @@ impl<'a> Reader<'a> {
             }
             mesh.triangles.push(triangle);
         }
-        let mesh = DrawingMesh::new(model_index, express_id, layer, mesh);
+        let mut mesh = DrawingMesh::new(model_index, express_id, layer, mesh);
+        mesh.hatch = hatch;
         Some(Item { part, mesh })
     }
 }
@@ -168,6 +193,7 @@ impl DrawingStream {
     fn write(&self, geometry: ElementGeometry, data: &ModelData<'_>, out: &mut Vec<u8>) -> usize {
         let Some(frame) = &self.frame else { return 0 };
         let layer = data.layer_name(geometry.express_id, &geometry.type_name);
+        let hatching = data.layer_hatching(geometry.express_id);
         let mut written = 0;
         for (part, element_mesh) in geometry.meshes.into_iter().enumerate() {
             let mut mesh = element_mesh.mesh;
@@ -178,7 +204,7 @@ impl DrawingStream {
             }
             if reaches_sheet(&mesh, frame, &self.request.options) {
                 written += mesh.triangles.len();
-                write_element(out, geometry.express_id, part as u32, &layer, &mesh);
+                write_element(out, geometry.express_id, part as u32, &layer, &hatching, &mesh);
             }
         }
         written

@@ -2,8 +2,9 @@
 //!
 //! # The rule
 //!
-//! A caller that has an `IfcFillAreaStyleHatching` passes its own [`HatchStyle`]. Without one
-//! the style comes from the layer or material name, in this order:
+//! A caller that has `IfcFillAreaStyleHatching` passes its own [`HatchStyle`]s, one per row of
+//! lines, so two rows cross. Without one the style comes from the layer or material name, in
+//! this order:
 //!
 //! 1. The name is lowercased and searched for one of the keywords below, in table order. The
 //!    first hit wins, so the result depends on the name alone, never on the element order.
@@ -18,7 +19,7 @@
 use crate::geom::{Loop, Segment};
 use glam::DVec2;
 
-/// Lines one element may receive before the hatch stops and says so.
+/// Lines one element may receive, all its rows together, before the hatch stops and says so.
 const MAX_HATCH_LINES: usize = 4096;
 /// Closest spacing a caller may ask for. Metres.
 const MIN_SPACING: f64 = 0.005;
@@ -31,6 +32,8 @@ pub struct HatchStyle {
     /// Counter-clockwise from the sheet's X axis.
     pub angle_degrees: f64,
     pub spacing: f64,
+    /// From the sheet's origin to a line, across the lines.
+    pub offset: f64,
 }
 
 impl HatchStyle {
@@ -38,7 +41,12 @@ impl HatchStyle {
         Self {
             angle_degrees,
             spacing,
+            offset: 0.0,
         }
+    }
+
+    pub fn shifted(self, offset: f64) -> Self {
+        Self { offset, ..self }
     }
 }
 
@@ -68,25 +76,8 @@ const KEYWORDS: [(&str, f64, f64); 22] = [
     ("terreno", 45.0, 0.30),
 ];
 
-/// Patterns for names the keyword table does not know.
-const FALLBACK: [HatchStyle; 4] = [
-    HatchStyle {
-        angle_degrees: 45.0,
-        spacing: 0.20,
-    },
-    HatchStyle {
-        angle_degrees: -45.0,
-        spacing: 0.20,
-    },
-    HatchStyle {
-        angle_degrees: 0.0,
-        spacing: 0.15,
-    },
-    HatchStyle {
-        angle_degrees: 90.0,
-        spacing: 0.15,
-    },
-];
+/// Patterns for names the keyword table does not know: angle in degrees and spacing in metres.
+const FALLBACK: [(f64, f64); 4] = [(45.0, 0.20), (-45.0, 0.20), (0.0, 0.15), (90.0, 0.15)];
 
 /// The deterministic style for a layer or material name.
 pub(crate) fn style_for(name: &str) -> HatchStyle {
@@ -96,7 +87,8 @@ pub(crate) fn style_for(name: &str) -> HatchStyle {
             return HatchStyle::new(angle, spacing);
         }
     }
-    FALLBACK[(fnv1a(lower.as_bytes()) % FALLBACK.len() as u64) as usize]
+    let (angle, spacing) = FALLBACK[(fnv1a(lower.as_bytes()) % FALLBACK.len() as u64) as usize];
+    HatchStyle::new(angle, spacing)
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -110,33 +102,49 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HatchReport {
-    /// The style was unusable and the name's rule took over.
+    /// A given style was unusable and was left out. If none was left, the name's rule took over.
     pub bad_style: bool,
     pub truncated: bool,
 }
 
-/// Fills the closed loops, keeping out of the holes.
+/// Fills the closed loops, keeping out of the holes: one row of lines per given style, or the
+/// name's rule when none is usable.
 pub(crate) fn hatch_loops(
     loops: &[Loop],
-    requested: Option<HatchStyle>,
+    requested: &[HatchStyle],
     name: &str,
     out: &mut Vec<Segment>,
 ) -> HatchReport {
     let mut report = HatchReport::default();
-    let style = match requested {
-        Some(style)
-            if style.angle_degrees.is_finite()
+    let mut styles: Vec<HatchStyle> = requested
+        .iter()
+        .copied()
+        .filter(|style| {
+            style.angle_degrees.is_finite()
                 && style.spacing.is_finite()
-                && style.spacing > 0.0 =>
-        {
-            style
-        }
-        Some(_) => {
-            report.bad_style = true;
-            style_for(name)
-        }
-        None => style_for(name),
-    };
+                && style.spacing > 0.0
+                && style.offset.is_finite()
+        })
+        .collect();
+    report.bad_style = styles.len() < requested.len();
+    if styles.is_empty() {
+        styles.push(style_for(name));
+    }
+    let mut budget = MAX_HATCH_LINES;
+    for style in styles {
+        budget -= hatch_row(loops, style, budget, out, &mut report);
+    }
+    report
+}
+
+/// One row of parallel lines, at most `budget` of them. Returns how many it drew.
+fn hatch_row(
+    loops: &[Loop],
+    style: HatchStyle,
+    budget: usize,
+    out: &mut Vec<Segment>,
+    report: &mut HatchReport,
+) -> usize {
     let spacing = style.spacing.clamp(MIN_SPACING, MAX_SPACING);
     let angle = style.angle_degrees.to_radians();
     let direction = DVec2::new(angle.cos(), angle.sin());
@@ -152,25 +160,29 @@ pub(crate) fn hatch_loops(
         }
     }
     if !(low.is_finite() && high.is_finite()) || high < low {
-        return report;
+        return 0;
     }
 
-    // Lines are anchored at the sheet's origin, so neighbouring elements on a layer hatch
-    // continuously. A line lying on the boundary itself is left out.
+    // Lines are anchored at the sheet's origin, shifted by the style's offset, so neighbouring
+    // elements on a layer hatch continuously. A line lying on the boundary itself is left out.
     let margin = 1e-9;
-    let first = ((low + margin) / spacing).ceil() as i64;
-    let mut last = ((high - margin) / spacing).floor() as i64;
+    let shift = style.offset.rem_euclid(spacing);
+    let first = ((low - shift + margin) / spacing).ceil() as i64;
+    let mut last = ((high - shift - margin) / spacing).floor() as i64;
     if last < first {
-        return report;
+        return 0;
     }
-    if (last - first) as usize >= MAX_HATCH_LINES {
-        last = first + MAX_HATCH_LINES as i64 - 1;
+    if last.abs_diff(first) >= budget as u64 {
         report.truncated = true;
+        if budget == 0 {
+            return 0;
+        }
+        last = first + budget as i64 - 1;
     }
 
     let mut cuts: Vec<f64> = Vec::new();
     for line in first..=last {
-        let offset = line as f64 * spacing;
+        let offset = shift + line as f64 * spacing;
         cuts.clear();
         for ring in loops.iter().filter(|ring| ring.closed && ring.points.len() >= 3) {
             for (from, to) in ring.segments() {
@@ -195,5 +207,5 @@ pub(crate) fn hatch_loops(
             ));
         }
     }
-    report
+    (last - first) as usize + 1
 }

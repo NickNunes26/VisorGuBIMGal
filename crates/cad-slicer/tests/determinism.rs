@@ -19,7 +19,7 @@ fn scene() -> Vec<DrawingMesh> {
         )
         .expect("simple difference"),
     );
-    concrete.hatch = Some(HatchStyle::new(45.0, 0.25));
+    concrete.hatch = vec![HatchStyle::new(45.0, 0.25)];
     vec![
         concrete,
         DrawingMesh::new(1, 11, "Steel", cylinder(0.4, 3.0, 16)),

@@ -8,8 +8,12 @@ use glam::DVec2;
 use ifc_geometry::subtract;
 
 fn hatching(mesh: ifc_geometry::Mesh, style: Option<HatchStyle>) -> cad_slicer::Drawing {
+    rows(mesh, style.into_iter().collect())
+}
+
+fn rows(mesh: ifc_geometry::Mesh, styles: Vec<HatchStyle>) -> cad_slicer::Drawing {
     let mut item = DrawingMesh::new(1, 1, "concrete", mesh);
-    item.hatch = style;
+    item.hatch = styles;
     let options = DrawingOptions {
         cut: Cut::Plan { z: 0.5 },
         depth: None,
@@ -152,6 +156,97 @@ fn a_spacing_below_the_floor_is_raised_and_a_wide_element_is_cut_off() {
     );
 }
 
+#[test]
+fn two_rows_of_lines_cross() {
+    let drawing = rows(
+        cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)),
+        vec![HatchStyle::new(0.0, 0.5), HatchStyle::new(90.0, 0.5)],
+    );
+    let hatch = &layer(&drawing, "concrete").hatch;
+    // Three lines each way, at 0.5, 1.0 and 1.5, each 2 m long.
+    let flat = hatch.iter().filter(|line| (line.a.y - line.b.y).abs() < 1e-9).count();
+    let upright = hatch.iter().filter(|line| (line.a.x - line.b.x).abs() < 1e-9).count();
+    assert_eq!((flat, upright, hatch.len()), (3, 3, 6), "{hatch:?}");
+    let length: f64 = hatch.iter().map(Segment::length).sum();
+    assert!((length - 12.0).abs() < 1e-9, "{length}");
+    assert!(drawing.diagnostics.is_empty(), "{:?}", drawing.diagnostics);
+}
+
+#[test]
+fn an_unusable_row_is_left_out_and_the_others_are_kept() {
+    let drawing = rows(
+        cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)),
+        vec![HatchStyle::new(f64::NAN, 0.5), HatchStyle::new(0.0, 0.5)],
+    );
+    let hatch = &layer(&drawing, "concrete").hatch;
+    // Only the level row: the name's rule would draw 45 degree lines.
+    assert_eq!(hatch.len(), 3, "{hatch:?}");
+    assert!(hatch.iter().all(|line| (line.a.y - line.b.y).abs() < 1e-9));
+    assert!(drawing.diagnostics.iter().any(|item| item.code == "bad-hatch-style"));
+}
+
+#[test]
+fn the_rows_share_one_line_limit() {
+    // 40 m at 1 cm is 3999 lines each way: the first row takes them, the second the 97 left.
+    let drawing = rows(
+        cuboid(v(0.0, 0.0, 0.0), v(40.0, 40.0, 1.0)),
+        vec![HatchStyle::new(0.0, 0.01), HatchStyle::new(90.0, 0.01)],
+    );
+    let hatch = &layer(&drawing, "concrete").hatch;
+    let upright = hatch.iter().filter(|line| (line.a.x - line.b.x).abs() < 1e-9).count();
+    assert_eq!((hatch.len(), upright), (4096, 97));
+    assert!(drawing.diagnostics.iter().any(|item| item.code == "hatch-truncated"));
+}
+
+#[test]
+fn an_offset_moves_the_lines_across() {
+    let heights = |offset: f64| {
+        let drawing = rows(
+            cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)),
+            vec![HatchStyle::new(0.0, 0.5).shifted(offset)],
+        );
+        let hatch = &layer(&drawing, "concrete").hatch;
+        let mut found: Vec<f64> = hatch.iter().map(|line| line.a.y).collect();
+        found.sort_by(f64::total_cmp);
+        found
+    };
+    // A quarter of the way between the unshifted lines at 0.5, 1.0 and 1.5.
+    let expected = [0.25, 0.75, 1.25, 1.75];
+    for offset in [0.25, -0.25, 1e6 + 0.25] {
+        let found = heights(offset);
+        assert_eq!(found.len(), 4, "{offset}: {found:?}");
+        assert!(found.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-9), "{offset}: {found:?}");
+    }
+    // Far past any line number, and a whole number of spacings: the unshifted lines.
+    assert_eq!(heights(1e300), [0.5, 1.0, 1.5]);
+    let drawing = rows(
+        cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)),
+        vec![HatchStyle::new(0.0, 0.5).shifted(f64::NAN)],
+    );
+    assert!(drawing.diagnostics.iter().any(|item| item.code == "bad-hatch-style"));
+}
+
+#[test]
+fn a_shifted_row_that_just_fits_the_limit_is_whole() {
+    // At 1 cm through 5 mm, 40.962 m holds lines 0.005 to 40.955 m: 4096, the limit exactly.
+    let drawing = rows(
+        cuboid(v(0.0, 0.0, 0.0), v(1.0, 40.962, 1.0)),
+        vec![HatchStyle::new(0.0, 0.01).shifted(0.005)],
+    );
+    assert_eq!(layer(&drawing, "concrete").hatch.len(), 4096);
+    assert!(drawing.diagnostics.is_empty(), "{:?}", drawing.diagnostics);
+}
+
+#[test]
+fn a_row_one_line_over_the_limit_loses_that_line() {
+    // 40.98 m at 1 cm: lines 1 to 4097.
+    let drawing = rows(
+        cuboid(v(0.0, 0.0, 0.0), v(40.98, 1.0, 1.0)),
+        vec![HatchStyle::new(90.0, 0.01)],
+    );
+    assert_eq!(layer(&drawing, "concrete").hatch.len(), 4096);
+    assert!(drawing.diagnostics.iter().any(|item| item.code == "hatch-truncated"));
+}
 
 #[test]
 fn spanish_and_galician_names_reach_their_patterns() {

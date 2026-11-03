@@ -201,7 +201,7 @@ fn two_names_that_collide_after_truncation_stay_distinct() {
 #[test]
 fn hatch_lines_are_written_as_entities() {
     let mut item = DrawingMesh::new(1, 1, "Concrete", cuboid(v(0.0, 0.0, 0.0), v(2.0, 2.0, 1.0)));
-    item.hatch = Some(HatchStyle::new(0.0, 0.5));
+    item.hatch = vec![HatchStyle::new(0.0, 0.5)];
     let options = DrawingOptions {
         cut: Cut::Plan { z: 0.5 },
         depth: None,

@@ -408,3 +408,150 @@ fn true_north_is_an_angle_from_project_y_and_never_moves_the_map() {
     assert_eq!(north("#9").true_north, None, "a zero vector has no direction");
     assert_eq!(north("#7").local_to_map, north("$").local_to_map);
 }
+
+/// `(angle in degrees, spacing and offset in metres)` of each row, rounded to a micrometre.
+fn hatching(path: &str, id: u32) -> Vec<(f64, f64, f64)> {
+    let bytes = read(path);
+    let file = index(&bytes).unwrap();
+    let data = ModelData::open(&file).unwrap();
+    let round = |value: f64| (value * 1e6).round() / 1e6;
+    data.layer_hatching(id)
+        .iter()
+        .map(|row| (round(row.angle_degrees), round(row.spacing), round(row.offset)))
+        .collect()
+}
+
+#[test]
+fn hatching_comes_from_the_material_that_names_the_layer() {
+    let file = "test/fixtures/hatching-materials.ifc";
+    // In millimetres and degrees. The level row starts 100 mm up; the upright row's vector is
+    // 707.1 mm at 45 degrees to it. The dashed row and the copy of the level one are left out.
+    let concrete = [(0.0, 0.25, 0.1), (90.0, 0.5, 0.0)];
+    assert_eq!(hatching(file, 100), concrete, "both rows, in their order");
+    assert_eq!(hatching(file, 110), [(45.0, 0.1, 0.0)], "a layer set: its first layer only");
+    assert_eq!(hatching(file, 120), [(30.0, 0.15, 0.0)], "from the type");
+    assert_eq!(hatching(file, 130), concrete, "its own before its type's");
+    assert!(hatching(file, 140).is_empty(), "measured on paper");
+    assert_eq!(hatching(file, 150), [(0.0, 0.0, 0.0)], "a vector along the lines spaces nothing");
+    assert!(hatching(file, 160).is_empty(), "a surface style is no hatch");
+    assert!(hatching(file, 100000).is_empty(), "no such element");
+}
+
+#[test]
+fn hatching_reads_ifc2x3_repeat_factors_in_radians() {
+    // 30 degrees, and a 0.3 m vector straight up: 0.3 cos 30 across the lines.
+    let rows = hatching("test/fixtures/hatching-materials-ifc2x3.ifc", 100);
+    assert_eq!(rows, [(30.0, 0.259808, 0.0)], "{rows:?}");
+}
+
+#[test]
+fn a_row_runs_through_its_start_point_and_only_solid_rows_are_drawn() {
+    // No units, so radians. #11 has only the older reference point, 3 m along X and 4 m along
+    // Y: at 90 degrees the lines run along Y, so it lies 3 m to their right, at -3 across. #12
+    // has both, and its pattern start, 1 m up, holds. #13 to #15 are drawn dashed: by a pattern
+    // that calls itself continuous, a predefined name and an external font. #16 says continuous
+    // in capitals.
+    let rest = "#10=IFCFILLAREASTYLE($,(#11,#12,#13,#14,#15,#16),$);\n\
+                #11=IFCFILLAREASTYLEHATCHING($,IFCPOSITIVELENGTHMEASURE(2.),#20,$,1.5707963267948966);\n\
+                #12=IFCFILLAREASTYLEHATCHING($,IFCPOSITIVELENGTHMEASURE(2.),#20,#21,0.);\n\
+                #13=IFCFILLAREASTYLEHATCHING(#30,IFCPOSITIVELENGTHMEASURE(3.),$,$,0.);\n\
+                #14=IFCFILLAREASTYLEHATCHING(#31,IFCPOSITIVELENGTHMEASURE(3.),$,$,0.);\n\
+                #15=IFCFILLAREASTYLEHATCHING(#32,IFCPOSITIVELENGTHMEASURE(3.),$,$,0.);\n\
+                #16=IFCFILLAREASTYLEHATCHING(#33,IFCPOSITIVELENGTHMEASURE(4.),$,$,0.);\n\
+                #20=IFCCARTESIANPOINT((3.,4.));\n\
+                #21=IFCCARTESIANPOINT((0.,1.));\n\
+                #30=IFCCURVESTYLE($,#40,$,$,$);\n\
+                #31=IFCCURVESTYLE($,#41,$,$,$);\n\
+                #32=IFCCURVESTYLE($,#42,$,$,$);\n\
+                #33=IFCCURVESTYLE($,#43,$,$,$);\n\
+                #40=IFCCURVESTYLEFONT('continuous',(#44));\n\
+                #41=IFCDRAUGHTINGPREDEFINEDCURVEFONT('dashed');\n\
+                #42=IFCEXTERNALLYDEFINEDCURVEFONT($,'dash',$);\n\
+                #43=IFCDRAUGHTINGPREDEFINEDCURVEFONT('CONTINUOUS');\n\
+                #44=IFCCURVESTYLEFONTPATTERN(1.,1.);\n";
+    let rows: Vec<(f64, f64, f64)> = hatching_in("IFC4", &styled_wall(1, "#10", rest), 1)
+        .iter()
+        .map(|row| (row.angle_degrees, row.spacing, row.offset))
+        .collect();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!((rows[0].0 - 90.0).abs() < 1e-12 && (rows[0].2 + 3.0).abs() < 1e-12, "{rows:?}");
+    assert_eq!(rows[1], (0.0, 2.0, 1.0));
+    assert_eq!(rows[2], (0.0, 4.0, 0.0));
+}
+
+/// Wall `#wall` with material `#wall + 1`, whose styled item has `styles`; `rest` adds entities.
+fn styled_wall(wall: u32, styles: &str, rest: &str) -> String {
+    let (material, relation, definition, representation, item) =
+        (wall + 1, wall + 2, wall + 3, wall + 4, wall + 5);
+    format!(
+        "#{wall}=IFCWALL('w',$,$,$,$,$,$,$,$);\n\
+         #{material}=IFCMATERIAL('m',$,$);\n\
+         #{relation}=IFCRELASSOCIATESMATERIAL('r',$,$,$,(#{wall}),#{material});\n\
+         #{definition}=IFCMATERIALDEFINITIONREPRESENTATION($,$,(#{representation}),#{material});\n\
+         #{representation}=IFCSTYLEDREPRESENTATION($,$,$,(#{item}));\n\
+         #{item}=IFCSTYLEDITEM($,({styles}),$);\n{rest}"
+    )
+}
+
+fn hatching_in(schema: &str, body: &str, id: u32) -> Vec<spatial_tree::Hatching> {
+    let text =
+        format!("ISO-10303-21;HEADER;FILE_SCHEMA(('{schema}'));ENDSEC;DATA;\n{body}ENDSEC;END-ISO-10303-21;");
+    let file = index(text.as_bytes()).unwrap();
+    ModelData::open(&file).unwrap().layer_hatching(id)
+}
+
+#[test]
+fn a_hatch_the_file_spoils_is_kept_as_nan_and_a_hostile_one_ends() {
+    // Wall 1: #20 lists itself and #21 beside it, which #6 also lists; #30 has no angle and #31
+    // a zero direction. Each row is read once.
+    let mut body = styled_wall(
+        1,
+        "#20,#21",
+        "#20=IFCPRESENTATIONSTYLEASSIGNMENT((#20,#21));\n\
+         #21=IFCFILLAREASTYLE($,(#30,#31,#32),$);\n\
+         #30=IFCFILLAREASTYLEHATCHING($,IFCPOSITIVELENGTHMEASURE(1.),$,$,$);\n\
+         #31=IFCFILLAREASTYLEHATCHING($,#50,$,$,0.);\n\
+         #32=IFCFILLAREASTYLEHATCHING($,IFCPOSITIVELENGTHMEASURE(2.),$,$,0.);\n\
+         #50=IFCVECTOR(#51,1.);\n\
+         #51=IFCDIRECTION((0.,0.));\n",
+    );
+    // Wall 100: eleven different rows, past the limit of eight.
+    let rows: Vec<String> = (200..211).map(|id| format!("#{id}")).collect();
+    body += &styled_wall(100, "#199", &format!("#199=IFCFILLAREASTYLE($,({}),$);\n", rows.join(",")));
+    for id in 200..211 {
+        let spacing = id - 199;
+        body += &format!(
+            "#{id}=IFCFILLAREASTYLEHATCHING($,IFCPOSITIVELENGTHMEASURE({spacing}.),$,$,0.);\n"
+        );
+    }
+    // Wall 300: a hundred style assignments, each inside the next, before the fill.
+    body += &styled_wall(300, "#400", "#500=IFCFILLAREASTYLE($,(#200),$);\n");
+    for id in 400..500 {
+        body += &format!("#{id}=IFCPRESENTATIONSTYLEASSIGNMENT((#{}));\n", id + 1);
+    }
+    // Wall 600: a layer set usage that is its own layer set.
+    body += "#600=IFCWALL('w',$,$,$,$,$,$,$,$);\n\
+             #601=IFCMATERIALLAYERSETUSAGE(#601,.AXIS2.,.POSITIVE.,0.,$);\n\
+             #602=IFCRELASSOCIATESMATERIAL('r',$,$,$,(#600),#601);\n";
+
+    let cycle = hatching_in("IFC4", &body, 1);
+    assert_eq!(cycle.len(), 3, "{cycle:?}");
+    assert!(cycle[0].angle_degrees.is_nan() && cycle[0].spacing == 1.0, "{:?}", cycle[0]);
+    assert!(cycle[1].angle_degrees == 0.0 && cycle[1].spacing.is_nan(), "{:?}", cycle[1]);
+    assert_eq!((cycle[2].angle_degrees, cycle[2].spacing), (0.0, 2.0));
+    assert_eq!(hatching_in("IFC4", &body, 100).len(), 8);
+    assert!(hatching_in("IFC4", &body, 300).is_empty(), "too deep to be a real style");
+    assert!(hatching_in("IFC4", &body, 600).is_empty());
+}
+
+#[test]
+fn the_paper_flag_holds_in_ifc4x3_too() {
+    let paper = |flag: &str| {
+        let rest = format!(
+            "#10=IFCFILLAREASTYLE($,(#11),{flag});\n\
+             #11=IFCFILLAREASTYLEHATCHING($,IFCPOSITIVELENGTHMEASURE(2.),$,$,0.);\n"
+        );
+        hatching_in("IFC4X3_ADD2", &styled_wall(1, "#10", &rest), 1).len()
+    };
+    assert_eq!((paper(".T."), paper("$"), paper(".F.")), (1, 1, 0));
+}

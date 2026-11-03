@@ -10,6 +10,8 @@ use step_parser::{Entity, StepIndex, Value};
 
 /// Bounds spatial nesting, which a hostile file could make arbitrarily deep.
 const MAX_DEPTH: usize = 64;
+/// Hatch rows one material may give. IFC discourages more than two.
+pub const MAX_HATCH_ROWS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
@@ -157,6 +159,18 @@ pub struct MaterialInfo {
     pub from_instance: bool,
 }
 
+/// One row of lines from an `IfcFillAreaStyleHatching`. A value the file does not give usably
+/// is NaN, and the drawing reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hatching {
+    /// Counter-clockwise from the sheet's X axis.
+    pub angle_degrees: f64,
+    /// Metres between lines.
+    pub spacing: f64,
+    /// Metres from the sheet's origin to a line, across the lines.
+    pub offset: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeObjectRef {
     pub express_id: u32,
@@ -187,6 +201,8 @@ struct Relations {
     property_sets: HashMap<u32, Vec<u32>>,
     types: HashMap<u32, u32>,
     materials: HashMap<u32, u32>,
+    /// Material to its `IfcStyledRepresentation`s, from `IfcMaterialDefinitionRepresentation`.
+    material_styles: HashMap<u32, Vec<u32>>,
 }
 
 pub struct ModelData<'a> {
@@ -425,6 +441,15 @@ impl<'a> ModelData<'a> {
                 for object in refs(attribute(entity, def, "RelatedObjects")) {
                     relations.materials.insert(object, material);
                 }
+            }
+        });
+        self.each("IFCMATERIALDEFINITIONREPRESENTATION", |entity, def| {
+            if let Some(material) = reference(attribute(entity, def, "RepresentedMaterial")) {
+                relations
+                    .material_styles
+                    .entry(material)
+                    .or_default()
+                    .extend(refs(attribute(entity, def, "Representations")));
             }
         });
         self.relations = relations;
@@ -982,6 +1007,152 @@ impl<'a> ModelData<'a> {
             })
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| type_name.to_string())
+    }
+
+    /// The hatch rows of the element's material, as the layer finds it: the element's assignment
+    /// before its type's, and a set's first member. Empty when it has none.
+    pub fn layer_hatching(&self, id: u32) -> Vec<Hatching> {
+        let assigned = self.relations.materials.get(&id).or_else(|| {
+            let type_id = self.relations.types.get(&id)?;
+            self.relations.materials.get(type_id)
+        });
+        let Some(material) = assigned.and_then(|material| self.first_material(*material, 0)) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        let mut visited = HashSet::new();
+        let representations = self.relations.material_styles.get(&material);
+        for representation in representations.into_iter().flatten() {
+            let Some((entity, def)) = self.lookup(*representation) else { continue };
+            for item in refs(attribute(&entity, &def, "Items")) {
+                let Some((styled, styled_def)) = self.lookup(item) else { continue };
+                for style in refs(attribute(&styled, &styled_def, "Styles")) {
+                    self.fill_hatching(style, 0, &mut visited, &mut rows);
+                }
+            }
+        }
+        rows
+    }
+
+    /// The `IfcMaterial` an assignment stands for: itself, or a set's first member.
+    fn first_material(&self, id: u32, depth: usize) -> Option<u32> {
+        if depth >= 4 {
+            return None;
+        }
+        let (entity, def) = self.lookup(id)?;
+        let usage = |field: &str| {
+            let set = reference(attribute(&entity, &def, field))?;
+            self.first_material(set, depth + 1)
+        };
+        let members = match def.name() {
+            "IfcMaterial" => return Some(id),
+            "IfcMaterialLayerSetUsage" => return usage("ForLayerSet"),
+            "IfcMaterialProfileSetUsage" | "IfcMaterialProfileSetUsageTapering" => {
+                return usage("ForProfileSet");
+            }
+            "IfcMaterialList" => {
+                return refs(attribute(&entity, &def, "Materials")).first().copied();
+            }
+            "IfcMaterialLayerSet" => "MaterialLayers",
+            "IfcMaterialProfileSet" => "MaterialProfiles",
+            "IfcMaterialConstituentSet" => "MaterialConstituents",
+            _ => return None,
+        };
+        let (member, member_def) = self.lookup(*refs(attribute(&entity, &def, members)).first()?)?;
+        reference(attribute(&member, &member_def, "Material"))
+    }
+
+    fn fill_hatching(
+        &self,
+        id: u32,
+        depth: usize,
+        visited: &mut HashSet<u32>,
+        rows: &mut Vec<Hatching>,
+    ) {
+        if depth >= 4 || rows.len() >= MAX_HATCH_ROWS || !visited.insert(id) {
+            return;
+        }
+        let Some((entity, def)) = self.lookup(id) else { return };
+        if def.name() == "IfcPresentationStyleAssignment" {
+            for style in refs(attribute(&entity, &def, "Styles")) {
+                self.fill_hatching(style, depth + 1, visited, rows);
+            }
+        } else if def.is_a("IfcFillAreaStyle") {
+            // Lengths on paper need a print scale the sheet does not have. Names match without
+            // case, so this also finds IFC4's ModelorDraughting.
+            let flag = attribute(&entity, &def, "ModelOrDraughting");
+            if matches!(flag, Some(Value::Enum(value)) if value == "F") {
+                return;
+            }
+            for fill in refs(attribute(&entity, &def, "FillStyles")) {
+                self.fill_hatching(fill, depth + 1, visited, rows);
+            }
+        } else if def.is_a("IfcFillAreaStyleHatching") {
+            // The sheet draws continuous lines only: a dashed row would draw as a solid one.
+            if !self.continuous(attribute(&entity, &def, "HatchLineAppearance")) {
+                return;
+            }
+            let angle = number(attribute(&entity, &def, "HatchLineAngle"))
+                .map_or(f64::NAN, |angle| angle * self.units.plane_angle);
+            let spacing = attribute(&entity, &def, "StartOfNextHatchLine")
+                .and_then(|distance| self.hatch_spacing(distance, angle))
+                .map_or(f64::NAN, |spacing| spacing * self.units.length);
+            // The reference line runs through the pattern's start, or the older reference point.
+            let start = attribute(&entity, &def, "PatternStart")
+                .or_else(|| attribute(&entity, &def, "PointOfReferenceHatchLine"));
+            let offset = match start {
+                None => 0.0,
+                Some(point) => self.across(point, angle).map_or(f64::NAN, |offset| {
+                    offset * self.units.length
+                }),
+            };
+            let row = Hatching { angle_degrees: angle.to_degrees(), spacing, offset };
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+    }
+
+    /// Whether a hatch row's curve style draws a solid line: no font, or the predefined
+    /// `continuous` one.
+    fn continuous(&self, style: Option<&Value>) -> bool {
+        let Some((style, style_def)) = reference(style).and_then(|id| self.lookup(id)) else {
+            return true;
+        };
+        let Some(font) = reference(attribute(&style, &style_def, "CurveFont")) else {
+            return true;
+        };
+        let Some((font, font_def)) = self.lookup(font) else { return false };
+        font_def.is_a("IfcDraughtingPreDefinedCurveFont")
+            && text(attribute(&font, &font_def, "Name"))
+                .is_some_and(|name| name.eq_ignore_ascii_case("continuous"))
+    }
+
+    /// File units from the origin to the line through `point` at `angle` radians, across it.
+    fn across(&self, point: &Value, angle: f64) -> Option<f64> {
+        let (point, point_def) = self.lookup(reference(Some(point))?)?;
+        let coordinates = list(attribute(&point, &point_def, "Coordinates"));
+        let (x, y) = (number(coordinates.first())?, number(coordinates.get(1))?);
+        let (sin, cos) = angle.sin_cos();
+        Some(cos * y - sin * x)
+    }
+
+    /// File units between lines at `angle` radians. A vector reaches the start of the next line,
+    /// so only its part across the lines counts.
+    fn hatch_spacing(&self, distance: &Value, angle: f64) -> Option<f64> {
+        let Value::Ref(id) = distance else { return number(Some(distance)) };
+        let (mut vector, mut vector_def) = self.lookup(*id)?;
+        if vector_def.is_a("IfcOneDirectionRepeatFactor") {
+            let factor = reference(attribute(&vector, &vector_def, "RepeatFactor"))?;
+            (vector, vector_def) = self.lookup(factor)?;
+        }
+        let magnitude = number(attribute(&vector, &vector_def, "Magnitude"))?;
+        let (direction, direction_def) =
+            self.lookup(reference(attribute(&vector, &vector_def, "Orientation"))?)?;
+        let ratios = list(attribute(&direction, &direction_def, "DirectionRatios"));
+        let (x, y) = (number(ratios.first())?, number(ratios.get(1))?);
+        let (sin, cos) = angle.sin_cos();
+        Some((magnitude * (cos * y - sin * x) / x.hypot(y)).abs())
     }
 
     pub fn element_details(&self, id: u32) -> Option<ElementDetails> {

@@ -94,6 +94,30 @@ fn a_cut_through_a_real_wall_has_the_perimeter_the_file_declares() {
 }
 
 #[test]
+fn material_hatching_crosses_the_chunks_onto_the_sheet() {
+    // Two 2 m blocks from 0.1 to 2.1 m, cut at half height. The concrete one, #100, has rows at
+    // 0 degrees every 0.25 m through 0.1 m, so 7 lines inside its edges, and at 90 degrees every
+    // 0.5 m, 4 lines, each 2 m. The glass one, #150, has no usable spacing, so its name gives
+    // 0 degrees every 0.25 m: 8 lines of 2 m.
+    let words = vec![0.0, 0.5, -1.0, NO_DEPTH, 0.0, 1.0, 1.0];
+    let mut sheet = SheetStore::new(request(&words));
+    for chunk in chunks(&mut model("test/fixtures/hatching-materials.ifc"), &words, 1) {
+        sheet.add_chunk(0, &chunk);
+    }
+    let report = sheet.generate();
+    assert_eq!(report.matches("bad-hatch-style").count(), 1, "{report}");
+    assert!(report.contains("\"expressId\":150"), "{report}");
+    let export = |show_hatching| {
+        let options =
+            ExportOptions { svg: false, scale: 1.0, show_hidden: true, show_hatching, comment: None };
+        line_length(&sheet.export(&options).unwrap())
+    };
+    let (outlines, hatch) = (export(false), export(true) - export(false));
+    assert!((outlines - 16.0).abs() < 1e-4, "{outlines}");
+    assert!((hatch - (22.0 + 16.0)).abs() < 1e-4, "{hatch}");
+}
+
+#[test]
 fn a_plane_past_the_model_sends_nothing() {
     let mut wall = model("public/samples/SimpleWall.ifc");
     // Above the wall, looking down, with no projection: nothing touches the plane.
@@ -203,15 +227,22 @@ fn damaged_chunks_are_reported_and_never_panic() {
         assert!(cut == 0 || report.contains("bad-drawing-chunk"), "{cut}: {report}");
     }
     // Counts claiming far more than the chunk holds must not reserve memory for them.
-    let mut lying = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut lying = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     lying.extend_from_slice(&u32::MAX.to_le_bytes());
     lying.extend_from_slice(&u32::MAX.to_le_bytes());
     let mut sheet = SheetStore::new(request(&words));
     sheet.add_chunk(0, &lying);
     assert!(sheet.generate().contains("bad-drawing-chunk"));
+    // The same for hatch rows.
+    let mut rows = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    rows.extend_from_slice(&u32::MAX.to_le_bytes());
+    let mut sheet = SheetStore::new(request(&words));
+    sheet.add_chunk(0, &rows);
+    assert!(sheet.generate().contains("bad-drawing-chunk"));
 
     // Triangles pointing outside the mesh are the slicer's to skip.
-    let mut wild = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+    let mut wild = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    wild.extend_from_slice(&[1u8, 0, 0, 0]);
     wild.extend_from_slice(&[0u8; 12]);
     let mut sheet = SheetStore::new(request(&words));
     sheet.add_chunk(0, &wild);
@@ -317,13 +348,15 @@ fn a_bad_depth_is_ignored_and_reported_without_losing_the_model() {
     }
 }
 
-/// One element's chunk: `express_id`, part 0, a layer, and the triangles of one small triangle.
+/// One element's chunk: `express_id`, part 0, a layer, no hatch rows, and the triangles of one
+/// small triangle.
 fn chunk_with(express_id: u32, triangle: [u32; 3]) -> Vec<u8> {
     let mut out = Vec::new();
     for word in [express_id, 0, 1] {
         out.extend_from_slice(&word.to_le_bytes());
     }
     out.push(b'w');
+    out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&3u32.to_le_bytes());
     out.extend_from_slice(&1u32.to_le_bytes());
     for value in [0.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {

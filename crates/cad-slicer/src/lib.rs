@@ -38,8 +38,9 @@ pub struct DrawingMesh {
     /// Layer or material name, straight from the file: untrusted text.
     pub layer: String,
     pub mesh: Mesh,
-    /// The caller's `IfcFillAreaStyleHatching`, when it has one.
-    pub hatch: Option<HatchStyle>,
+    /// The caller's `IfcFillAreaStyleHatching`, one style per row of lines. Empty: the layer
+    /// name's rule.
+    pub hatch: Vec<HatchStyle>,
 }
 
 impl DrawingMesh {
@@ -49,7 +50,7 @@ impl DrawingMesh {
             element_id,
             layer: layer.into(),
             mesh,
-            hatch: None,
+            hatch: Vec::new(),
         }
     }
 }
@@ -262,7 +263,7 @@ pub fn draw(meshes: &[DrawingMesh], options: &DrawingOptions) -> Drawing {
             );
         }
         if options.include_hatching {
-            let report = hatch::hatch_loops(&loops, item.hatch, &item.layer, &mut layer.hatch);
+            let report = hatch::hatch_loops(&loops, &item.hatch, &item.layer, &mut layer.hatch);
             if report.bad_style {
                 diagnostics.add(
                     item.model_id,
