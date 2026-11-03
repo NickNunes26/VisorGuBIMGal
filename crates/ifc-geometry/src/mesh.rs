@@ -117,9 +117,10 @@ impl Mesh {
         self.orient_shells(&[]);
     }
 
-    /// [`Mesh::orient_shell`] for the faces of several shells or face sets at once, each after
-    /// the first starting at a triangle index in `starts`, in order. Faces of different shells
-    /// still join across shared edges, but a part is only a cavity in a part of its own shell.
+    /// [`Mesh::orient_shell`] for the faces of several shells or face sets at once, each starting
+    /// at a triangle index in `starts`, in order; the first may be left out. Faces of different
+    /// shells still join across shared edges, but a part is only a cavity in a part of its own
+    /// shell.
     pub fn orient_shells(&mut self, starts: &[usize]) {
         // Adding zero turns -0.0 into 0.0, which has other bits.
         let key = |index: u32| (self.positions[index as usize] + DVec3::ZERO).to_array().map(f64::to_bits);
