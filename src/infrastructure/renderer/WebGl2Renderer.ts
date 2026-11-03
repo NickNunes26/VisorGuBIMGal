@@ -1138,6 +1138,11 @@ export class WebGl2Renderer implements RendererPort {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
+    // The transparent pass ends with depth writes off, and clearing obeys the depth mask,
+    // so turn writes back on first or the next frame keeps this one's depth and draws nothing.
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+
     gl.clearColor(0.06, 0.07, 0.09, 1.0);
     gl.clearDepth(0.0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -1157,9 +1162,6 @@ export class WebGl2Renderer implements RendererPort {
     const eye = this.camera.getEye();
 
     // Pass 1: Opaque geometry
-    gl.disable(gl.BLEND);
-    gl.depthMask(true);
-
     let hasTransparent = false;
 
     for (const model of this.models.values()) {
@@ -1270,13 +1272,14 @@ export class WebGl2Renderer implements RendererPort {
       gl.enable(gl.SCISSOR_TEST);
       gl.scissor(px, glPy, 1, 1);
 
+      // Clearing obeys the depth mask, which the transparent pass leaves off.
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
       gl.clearBufferuiv(gl.COLOR, 0, new Uint32Array([0, 0, 0, 0]));
       gl.clearBufferfv(gl.DEPTH, 0, new Float32Array([0.0]));
 
       gl.enable(gl.DEPTH_TEST);
       gl.depthFunc(gl.GREATER);
-      gl.depthMask(true);
-      gl.disable(gl.BLEND);
       gl.disable(gl.CULL_FACE);
 
       gl.useProgram(this.pickProgram);
