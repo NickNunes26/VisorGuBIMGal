@@ -6,6 +6,10 @@ use std::collections::HashMap;
 /// A triangle side that is open, or shared by three or more faces.
 const NO_NEIGHBOUR: u32 = u32::MAX;
 
+/// Shells with more closed parts than this have no cavities looked for, since every pair is
+/// compared: 11 ms natively for 2,000 parts, 0.5 s for 20,000. Real shells have at most 25.
+const MAX_NESTED_PARTS: usize = 2_000;
+
 /// Triangles wind counter-clockwise seen from outside the solid.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mesh {
@@ -105,10 +109,18 @@ impl Mesh {
     }
 
     /// Makes a shell agree with itself: faces across a shared edge wind the same way, a closed
-    /// part winds outward, and an open part keeps the way most of its area faces. Real files
-    /// write faces of one shell in both directions. An edge of three or more faces joins nothing.
-    /// Corners at one position count as one, because a face set need not share its indices.
+    /// part winds outward unless it is a cavity in another, and an open part keeps the way most
+    /// of its area faces. Real files write faces of one shell in both directions. An edge of
+    /// three or more faces joins nothing. Corners at one position count as one, because a face
+    /// set need not share its indices.
     pub fn orient_shell(&mut self) {
+        self.orient_shells(&[]);
+    }
+
+    /// [`Mesh::orient_shell`] for the faces of several shells or face sets at once, each after
+    /// the first starting at a triangle index in `starts`, in order. Faces of different shells
+    /// still join across shared edges, but a part is only a cavity in a part of its own shell.
+    pub fn orient_shells(&mut self, starts: &[usize]) {
         // Adding zero turns -0.0 into 0.0, which has other bits.
         let key = |index: u32| (self.positions[index as usize] + DVec3::ZERO).to_array().map(f64::to_bits);
         // Corners sorted by position share a label with the one before when equal. Any labels
@@ -143,6 +155,7 @@ impl Mesh {
         }
         let mut flip = vec![false; self.triangles.len()];
         let mut seen = vec![false; self.triangles.len()];
+        let mut closed_parts = Vec::new();
         for start in 0..self.triangles.len() {
             if seen[start] {
                 continue;
@@ -176,7 +189,11 @@ impl Mesh {
                 }
             }
             self.settle(&part, closed, &mut flip);
+            if closed {
+                closed_parts.push(part);
+            }
         }
+        self.hollow(&closed_parts, starts, &mut flip);
         for (triangle, flip) in self.triangles.iter_mut().zip(flip) {
             if flip {
                 triangle.swap(1, 2);
@@ -218,4 +235,97 @@ impl Mesh {
             }
         }
     }
+
+    /// Turns inward each closed part that lies inside an odd number of others of its shell: a
+    /// cavity, or an island in one. Tekla writes the cores of a hollow slab as closed parts of
+    /// the slab's one shell, sharing no edge with it, and each would otherwise wind outward and
+    /// add its volume. Revit writes a part buried in another as a face set of its own, which is
+    /// joined to the other, not cut from it.
+    fn hollow(&self, parts: &[Vec<usize>], starts: &[usize], flip: &mut [bool]) {
+        if !(2..=MAX_NESTED_PARTS).contains(&parts.len()) {
+            return;
+        }
+        // The shells each part has faces in, sorted.
+        let shells: Vec<Vec<usize>> = parts
+            .iter()
+            .map(|part| {
+                let mut shells: Vec<usize> =
+                    part.iter().map(|index| starts.partition_point(|start| start <= index)).collect();
+                shells.sort_unstable();
+                shells.dedup();
+                shells
+            })
+            .collect();
+        let share = |one: &[usize], two: &[usize]| one.iter().any(|shell| two.binary_search(shell).is_ok());
+        let bounds: Vec<(DVec3, DVec3)> = parts
+            .iter()
+            .map(|part| {
+                part.iter()
+                    .flat_map(|index| self.triangles[*index])
+                    .map(|id| self.positions[id as usize])
+                    .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(low, high), point| {
+                        (low.min(point), high.max(point))
+                    })
+            })
+            .collect();
+        let mut turned = vec![false; parts.len()];
+        for (inner, part) in parts.iter().enumerate() {
+            let (low, high) = bounds[inner];
+            // A point inside one of the part's own faces, clear of its edges.
+            let Some(probe) = part
+                .iter()
+                .map(|index| self.triangles[*index].map(|id| self.positions[id as usize]))
+                .max_by(|one, two| doubled_area(one).total_cmp(&doubled_area(two)))
+                .map(|[a, b, c]| (a + b + c) / 3.0)
+            else {
+                continue;
+            };
+            let depth = parts
+                .iter()
+                .enumerate()
+                .filter(|(outer, _)| {
+                    let (outer_low, outer_high) = bounds[*outer];
+                    // Strictly inside the box: a part that touches or coincides with another's
+                    // bounds is beside it, not in it.
+                    *outer != inner
+                        && outer_low.cmplt(low).all()
+                        && high.cmplt(outer_high).all()
+                        && share(&shells[inner], &shells[*outer])
+                })
+                .filter(|(_, outer)| self.winding(outer, flip, probe).abs() > 0.5)
+                .count();
+            turned[inner] = depth % 2 == 1;
+        }
+        for (part, turned) in parts.iter().zip(turned) {
+            if turned {
+                for index in part {
+                    flip[*index] = !flip[*index];
+                }
+            }
+        }
+    }
+
+    /// How many times the triangles of `part`, as flipped so far, wind around `point`: ±1 inside
+    /// a closed part and 0 outside, whichever way the part faces. Each triangle's solid angle,
+    /// summed.
+    fn winding(&self, part: &[usize], flip: &[bool], point: DVec3) -> f64 {
+        let solid_angle: f64 = part
+            .iter()
+            .map(|index| {
+                let [a, mut b, mut c] = self.triangles[*index].map(|id| self.positions[id as usize] - point);
+                if flip[*index] {
+                    std::mem::swap(&mut b, &mut c);
+                }
+                let (la, lb, lc) = (a.length(), b.length(), c.length());
+                let numerator = a.dot(b.cross(c));
+                let denominator = la * lb * lc + a.dot(b) * lc + a.dot(c) * lb + b.dot(c) * la;
+                2.0 * numerator.atan2(denominator)
+            })
+            .sum();
+        solid_angle / (4.0 * std::f64::consts::PI)
+    }
+}
+
+fn doubled_area([a, b, c]: &[DVec3; 3]) -> f64 {
+    (*b - *a).cross(*c - *a).length()
 }

@@ -2404,15 +2404,17 @@ impl<'a> ModelEvaluator<'a> {
     /// Faces from closed shells, open shells or connected face sets.
     fn shell(&mut self, shells: &[u32]) -> Option<Mesh> {
         let mut builder = FaceBuilder::default();
+        let mut starts = Vec::new();
         for shell in shells {
             let (entity, def) = self.lookup(*shell)?;
+            starts.push(builder.mesh.triangles.len());
             for face in list(attribute(&entity, &def, "CfsFaces")) {
                 if let Some(face) = reference(face) {
                     self.face(face, &mut builder);
                 }
             }
         }
-        builder.mesh.orient_shell();
+        builder.mesh.orient_shells(&starts);
         (!builder.mesh.is_empty()).then_some(builder.mesh)
     }
 

@@ -119,6 +119,204 @@ fn separate_solids_in_one_mesh_are_each_turned_outward() {
     close(mesh.volume(), 1.0 + 8.0);
 }
 
+/// Boxes from the corners given, in one mesh with no shared corners, each wound inward when
+/// its flag says so.
+fn boxes(parts: &[(f64, f64, bool)]) -> Mesh {
+    let mut mesh = Mesh::default();
+    for (low, high, inward) in parts {
+        let part = Mesh::cuboid(DVec3::splat(*low), DVec3::splat(*high));
+        let first = mesh.positions.len() as u32;
+        mesh.positions.extend(part.positions);
+        mesh.triangles.extend(part.triangles.iter().map(|[a, b, c]| {
+            if *inward { [a + first, c + first, b + first] } else { [a + first, b + first, c + first] }
+        }));
+    }
+    mesh
+}
+
+#[test]
+fn a_closed_part_inside_another_is_a_cavity_whichever_way_it_was_written() {
+    // A 6 m cube with a 2 m cavity, as Tekla writes the cores of a hollow slab: one shell of two
+    // parts that share no edge.
+    for (outer, inner) in [(false, true), (false, false), (true, true), (true, false)] {
+        let mut mesh = boxes(&[(0.0, 6.0, outer), (2.0, 4.0, inner)]);
+        mesh.orient_shell();
+        close(mesh.volume(), 216.0 - 8.0);
+    }
+}
+
+#[test]
+fn a_cavity_is_found_in_a_part_written_partly_backwards() {
+    // Two of the outer cube's faces wound inward: taken as written, it would wind around the
+    // cavity a third of a turn, not once.
+    let mut mesh = flipped(boxes(&[(0.0, 6.0, false), (2.0, 4.0, false)]), &[0, 1, 2, 3]);
+    mesh.orient_shell();
+    close(mesh.volume(), 216.0 - 8.0);
+}
+
+#[test]
+fn an_island_in_a_cavity_is_solid_again() {
+    let mut mesh = boxes(&[(3.0, 4.0, true), (0.0, 7.0, false), (1.0, 6.0, false)]);
+    mesh.orient_shell();
+    close(mesh.volume(), 343.0 - 125.0 + 1.0);
+    // And a cavity in that island, three deep.
+    let mut mesh = boxes(&[(0.0, 9.0, false), (1.0, 8.0, true), (2.0, 7.0, false), (3.0, 6.0, false)]);
+    mesh.orient_shell();
+    close(mesh.volume(), 729.0 - 343.0 + 125.0 - 27.0);
+}
+
+/// The volume of the triangles from `first` on, which are one part of `mesh`.
+fn volume_from(mesh: &Mesh, first: usize) -> f64 {
+    mesh.triangles[first..]
+        .iter()
+        .map(|triangle| triangle.map(|id| mesh.positions[id as usize]))
+        .map(|[a, b, c]| a.dot(b.cross(c)) / 6.0)
+        .sum()
+}
+
+#[test]
+fn an_open_part_holds_no_cavity_and_is_none() {
+    // A 6 m box with no top around a 2 m cube: the open part winds most of the way round the
+    // cube, but only a closed part has an inside.
+    let mut mesh = unit_box();
+    mesh.positions.iter_mut().for_each(|point| *point *= 6.0);
+    mesh.triangles.drain(2..4);
+    let first = mesh.triangles.len();
+    let cube = Mesh::cuboid(DVec3::splat(2.0), DVec3::splat(4.0));
+    let offset = mesh.positions.len() as u32;
+    mesh.positions.extend(cube.positions);
+    mesh.triangles.extend(cube.triangles.iter().map(|[a, b, c]| [a + offset, b + offset, c + offset]));
+    let open = mesh.triangles[..first].to_vec();
+    mesh.orient_shell();
+    close(volume_from(&mesh, first), 8.0);
+    assert_eq!(mesh.triangles[..first], open[..], "the open part keeps its facing");
+}
+
+#[test]
+fn a_part_in_the_bounds_of_a_concave_one_but_not_in_it_is_not_its_cavity() {
+    // One closed L-shaped prism, 10 m high, and cubes in the corner the L leaves empty: one
+    // well clear of it, one a hand's width from both its inner walls.
+    let outline = [(0.0, 0.0), (10.0, 0.0), (10.0, 2.0), (2.0, 2.0), (2.0, 10.0), (0.0, 10.0)];
+    let mut mesh = Mesh::default();
+    for z in [0.0, 10.0] {
+        mesh.positions.extend(outline.iter().map(|(x, y)| DVec3::new(*x, *y, z)));
+    }
+    for [a, b, c] in [[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 5]] {
+        mesh.triangles.push([a, c, b]);
+        mesh.triangles.push([a + 6, b + 6, c + 6]);
+    }
+    for side in 0..6u32 {
+        let next = (side + 1) % 6;
+        mesh.triangles.push([side, next, next + 6]);
+        mesh.triangles.push([side, next + 6, side + 6]);
+    }
+    close(mesh.volume(), 360.0);
+    let first = mesh.triangles.len();
+    for (low, high) in [(DVec3::splat(5.0), DVec3::splat(6.0)), (DVec3::new(2.1, 2.1, 5.0), DVec3::new(2.6, 2.6, 5.5))] {
+        let cube = Mesh::cuboid(low, high);
+        let offset = mesh.positions.len() as u32;
+        mesh.positions.extend(cube.positions);
+        mesh.triangles.extend(cube.triangles.iter().map(|[a, b, c]| [a + offset, b + offset, c + offset]));
+    }
+    mesh.orient_shell();
+    close(volume_from(&mesh, first), 1.0 + 0.125);
+    close(mesh.volume(), 361.125);
+}
+
+#[test]
+fn parts_that_only_overlap_stay_solid() {
+    // None holds another, so none is a cavity, however each was written.
+    let mut mesh = boxes(&[(0.0, 2.0, false), (0.5, 2.5, true), (1.0, 3.0, false)]);
+    mesh.orient_shell();
+    close(mesh.volume(), 8.0 + 8.0 + 8.0);
+}
+
+#[test]
+fn cavities_are_looked_for_in_shells_of_up_to_2000_closed_parts() {
+    // Every pair of parts is compared, so a shell of very many is left as it was before.
+    for (count, cavity) in [(2_000, -8.0), (2_001, 8.0)] {
+        let mut parts = vec![(0.0, 6.0, false), (2.0, 4.0, false)];
+        parts.extend((0..count - 2).map(|index| (10.0 + 2.0 * index as f64, 11.0 + 2.0 * index as f64, false)));
+        let mut mesh = boxes(&parts);
+        mesh.orient_shell();
+        close(mesh.volume(), 216.0 + cavity + (count - 2) as f64);
+    }
+}
+
+#[test]
+fn a_part_beside_a_hollow_one_is_not_its_cavity() {
+    // An L of two boxes would hold this one in its bounding box, but not in its material.
+    let mut mesh = boxes(&[(5.0, 6.0, false)]);
+    let l = [
+        Mesh::cuboid(DVec3::ZERO, DVec3::new(10.0, 2.0, 10.0)),
+        Mesh::cuboid(DVec3::new(0.0, 2.0, 0.0), DVec3::new(2.0, 10.0, 10.0)),
+    ];
+    for part in l {
+        let first = mesh.positions.len() as u32;
+        mesh.positions.extend(part.positions);
+        mesh.triangles.extend(part.triangles.iter().map(|[a, b, c]| [a + first, b + first, c + first]));
+    }
+    mesh.orient_shell();
+    close(mesh.volume(), 1.0 + 200.0 + 160.0);
+}
+
+/// A 6 m cube with a 2 m cube inside, both written as faces of one closed shell, with the
+/// inner cube's faces as the file has them.
+fn hollow_brep(inner_inward: bool) -> String {
+    let outer = Mesh::cuboid(DVec3::ZERO, DVec3::splat(6.0));
+    let inner = Mesh::cuboid(DVec3::splat(2.0), DVec3::splat(4.0));
+    let mut text = String::new();
+    let mut faces = Vec::new();
+    let mut id = 100;
+    for (mesh, inward) in [(outer, false), (inner, inner_inward)] {
+        let first = id;
+        for point in &mesh.positions {
+            text += &format!("#{id}=IFCCARTESIANPOINT(({:.1},{:.1},{:.1}));\n", point.x, point.y, point.z);
+            id += 1;
+        }
+        for [a, b, c] in &mesh.triangles {
+            let (b, c) = if inward { (c, b) } else { (b, c) };
+            text += &format!(
+                "#{id}=IFCPOLYLOOP((#{},#{},#{}));\n#{}=IFCFACEOUTERBOUND(#{id},.T.);\n#{}=IFCFACE((#{}));\n",
+                first + a,
+                first + b,
+                first + c,
+                id + 1,
+                id + 2,
+                id + 1
+            );
+            faces.push(format!("#{}", id + 2));
+            id += 3;
+        }
+    }
+    text + &format!("#41=IFCCLOSEDSHELL(({}));\n#5=IFCFACETEDBREP(#41);\n", faces.join(","))
+}
+
+#[test]
+fn a_brep_whose_shell_holds_a_cavity_keeps_it_hollow() {
+    for inner_inward in [true, false] {
+        let mesh = evaluate(&hollow_brep(inner_inward));
+        assert_eq!(mesh.triangles.len(), 24);
+        close(mesh.volume(), 216.0 - 8.0);
+    }
+}
+
+#[test]
+fn a_solid_in_another_face_set_is_not_a_cavity() {
+    // Revit writes each solid of a family as a face set of its own, and a part buried in another
+    // is joined to it, not cut from it. The same two cubes as above, one per face set.
+    let text = hollow_brep(false).replace(
+        "#5=IFCFACETEDBREP(#41);",
+        "#42=IFCCONNECTEDFACESET((#OUTER));\n#43=IFCCONNECTEDFACESET((#INNER));\n#5=IFCFACEBASEDSURFACEMODEL((#42,#43));",
+    );
+    let faces = text.split("IFCCLOSEDSHELL((").nth(1).unwrap().split("))").next().unwrap().to_string();
+    let (outer, inner) = faces.split_at(faces.match_indices(',').nth(11).unwrap().0);
+    let text = text.replace("#OUTER", outer).replace("#INNER", &inner[1..]);
+    let mesh = evaluate(&text);
+    assert_eq!(mesh.triangles.len(), 24);
+    close(mesh.volume(), 216.0 + 8.0);
+}
+
 #[test]
 fn an_open_surface_keeps_the_way_most_of_it_faces() {
     // A box with no top: 10 triangles, one flipped. There is no inside, so the rest decide.
