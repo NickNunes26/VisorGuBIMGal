@@ -174,6 +174,82 @@ fn a_boolean_cuts_with_a_shell_whose_faces_nearly_meet() {
     }
 }
 
+/// The 1 by 2 by 3 box as an IFC4 face set whose top is a `cells` by `cells` grid, so each
+/// side's top edge meets the grid's corners at T-junctions; with the opening of [`OPENING`].
+fn gridded_box(cells: usize) -> String {
+    let mut points = vec!["(0.,0.,0.)".to_string(), "(1.,0.,0.)".into(), "(1.,2.,0.)".into(), "(0.,2.,0.)".into()];
+    for i in 0..=cells {
+        for j in 0..=cells {
+            points.push(format!("({},{},3.)", i as f64 / cells as f64, 2.0 * j as f64 / cells as f64));
+        }
+    }
+    let g = |i: usize, j: usize| 5 + i * (cells + 1) + j;
+    let (b0, b1, b2, b3) = (1, 2, 3, 4);
+    let (t0, t1, t2, t3) = (g(0, 0), g(cells, 0), g(cells, cells), g(0, cells));
+    let mut triangles = vec![
+        [b0, b2, b1],
+        [b0, b3, b2],
+        [b0, b1, t1],
+        [b0, t1, t0],
+        [b1, b2, t2],
+        [b1, t2, t1],
+        [b2, b3, t3],
+        [b2, t3, t2],
+        [b3, b0, t0],
+        [b3, t0, t3],
+    ];
+    for i in 0..cells {
+        for j in 0..cells {
+            triangles.push([g(i, j), g(i + 1, j), g(i + 1, j + 1)]);
+            triangles.push([g(i, j), g(i + 1, j + 1), g(i, j + 1)]);
+        }
+    }
+    let triangles: Vec<String> = triangles.iter().map(|[a, b, c]| format!("({a},{b},{c})")).collect();
+    format!(
+        "#1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+         #2=IFCWALL('w',$,$,$,$,$,#3,$,$);\n\
+         #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+         #4=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#5));\n\
+         #5=IFCTRIANGULATEDFACESET(#6,$,$,({}),$);\n\
+         #6=IFCCARTESIANPOINTLIST3D(({}));\n\
+         #60=IFCOPENINGELEMENT('o',$,$,$,$,$,#61,$,$);\n\
+         #61=IFCPRODUCTDEFINITIONSHAPE($,$,(#62));\n\
+         #62=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#63));\n\
+         #63=IFCEXTRUDEDAREASOLID(#64,#66,#67,5.);\n\
+         #64=IFCRECTANGLEPROFILEDEF(.AREA.,$,#65,0.4,0.4);\n\
+         #65=IFCAXIS2PLACEMENT2D(#68,$);\n\
+         #66=IFCAXIS2PLACEMENT3D(#69,$,$);\n\
+         #67=IFCDIRECTION((0.,0.,1.));\n\
+         #68=IFCCARTESIANPOINT((0.5,1.));\n\
+         #69=IFCCARTESIANPOINT((0.,0.,-1.));\n\
+         #70=IFCRELVOIDSELEMENT('v',$,$,$,#2,#60);\n",
+        triangles.join(","),
+        points.join(",")
+    )
+}
+
+#[test]
+fn only_meshes_small_enough_to_seal_quickly_are_sealed() {
+    // Sealing scans each edge against the vertices beside it, which grows with the square of
+    // a flat mesh. 2 * 70 * 70 + 10 triangles are under the limit of 10,000; 71 cells a side
+    // are over it.
+    let evaluate4 = |body: String| {
+        let text = format!("ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{body}ENDSEC;END-ISO-10303-21;");
+        let file = index(text.as_bytes()).unwrap();
+        let mut evaluator = ModelEvaluator::new(&file).unwrap();
+        let element = evaluator.evaluate(2).expect("the element evaluates");
+        let mesh = element.meshes.into_iter().next().expect("a mesh").mesh;
+        (mesh, evaluator.diagnostics().iter().map(|item| item.code.to_string()).collect::<Vec<_>>())
+    };
+    for cells in [2, 70] {
+        let (mesh, codes) = evaluate4(gridded_box(cells));
+        assert!(codes.is_empty(), "{cells}: {codes:?}");
+        assert_solid(&mesh, 6.0 - 0.4 * 0.4 * 3.0);
+    }
+    let (_, codes) = evaluate4(gridded_box(71));
+    assert_eq!(codes, ["void-on-open-mesh"]);
+}
+
 #[test]
 fn a_shell_with_a_face_missing_is_still_left_uncut() {
     let (mesh, codes) = evaluate(&brep("", OPENING));

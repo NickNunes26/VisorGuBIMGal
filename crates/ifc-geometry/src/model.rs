@@ -28,6 +28,10 @@ const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 /// A target reaching less than this into a half space loses nothing to it. Metres: the
 /// boolean welds vertices this close anyway.
 const CLEAR_OF_HALF_SPACE: f64 = 1e-6;
+/// Open meshes larger than this stay open. Sealing scans each edge against the vertices
+/// beside it, which on a flat mesh grows with the square of its size: about 0.4 s natively
+/// here, and 26 s at 80,000 triangles. Shells that nearly close in real files have hundreds.
+const MAX_SEALED_TRIANGLES: usize = 10_000;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 /// Triangles kept for repeated instances, so a model of unique shapes cannot fill memory twice.
 const MAX_INSTANCE_TRIANGLES: usize = 1_000_000;
@@ -607,6 +611,9 @@ fn is_closed(mesh: &Mesh) -> bool {
 fn closed_shape(mesh: &Mesh) -> Option<Cow<'_, Mesh>> {
     if is_closed(mesh) {
         return Some(Cow::Borrowed(mesh));
+    }
+    if mesh.triangles.len() > MAX_SEALED_TRIANGLES {
+        return None;
     }
     let sealed = seal(mesh);
     is_closed(&sealed).then_some(Cow::Owned(sealed))
