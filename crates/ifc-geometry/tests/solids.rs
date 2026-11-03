@@ -138,6 +138,67 @@ fn polygonal_bound_limits_the_clip_to_its_outline() {
     assert_eq!(mesh.open_edges(), 0);
 }
 
+/// The block of `TWO_HIGH_BLOCK` with a half space `#14` whose material lies above its top,
+/// as Revit clips walls at their own height, under `operator`.
+fn clear_of_the_top(half_space: &str, operator: &str) -> String {
+    format!(
+        "#10=IFCBLOCK(#903,1.,1.,2.);\n\
+         #11=IFCCARTESIANPOINT((0.,0.,2.));\n\
+         #12=IFCAXIS2PLACEMENT3D(#11,$,$);\n\
+         #13=IFCPLANE(#12);\n\
+         #20=IFCCARTESIANPOINT((-1.,-1.));\n\
+         #21=IFCCARTESIANPOINT((0.5,-1.));\n\
+         #22=IFCCARTESIANPOINT((2.,-1.));\n\
+         #23=IFCCARTESIANPOINT((2.,2.));\n\
+         #24=IFCCARTESIANPOINT((-1.,2.));\n\
+         {half_space}\n\
+         #6=IFCBOOLEANRESULT(.{operator}.,#10,#14);\n\
+         #5=IFCCSGSOLID(#6);\n"
+    )
+}
+
+/// Half spaces above the block: unbounded; bounded by three points on one line; and bounded
+/// by a ring that crosses itself. However it is bounded, none reaches the block.
+const CLEAR_HALF_SPACES: [&str; 3] = [
+    "#14=IFCHALFSPACESOLID(#13,.F.);",
+    "#25=IFCPOLYLINE((#20,#21,#22,#20));\n#14=IFCPOLYGONALBOUNDEDHALFSPACE(#13,.F.,#903,#25);",
+    "#25=IFCPOLYLINE((#20,#23,#22,#24,#20));\n#14=IFCPOLYGONALBOUNDEDHALFSPACE(#13,.F.,#903,#25);",
+];
+
+#[test]
+fn a_half_space_clear_of_the_solid_leaves_it_whole_however_it_is_bounded() {
+    // Also when the solid reaches half a micrometre into it, as rounding leaves a wall's top.
+    for top in ["(0.,0.,2.)", "(0.,0.,1.9999995)"] {
+        for half_space in CLEAR_HALF_SPACES {
+            let mesh = evaluate(&clear_of_the_top(half_space, "DIFFERENCE").replace("(0.,0.,2.)", top));
+            close(mesh.volume(), 2.0, 1e-12);
+            assert_eq!(mesh.triangles.len(), 12, "{top} {half_space}: the block's own triangles");
+        }
+    }
+}
+
+#[test]
+fn a_half_space_clear_of_the_solid_has_nothing_in_common_with_it() {
+    for half_space in CLEAR_HALF_SPACES {
+        let text = format!(
+            "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}{}ENDSEC;END-ISO-10303-21;",
+            clear_of_the_top(half_space, "INTERSECTION")
+        );
+        let file = index(text.as_bytes()).unwrap();
+        let mut evaluator = ModelEvaluator::new(&file).unwrap();
+        let element = evaluator.evaluate(2).expect("the element evaluates");
+        assert!(element.meshes.iter().all(|item| item.mesh.is_empty()), "{half_space}");
+        assert!(evaluator.diagnostics().is_empty(), "{half_space}: {:?}", evaluator.diagnostics());
+    }
+}
+
+#[test]
+fn a_half_space_reaching_a_hair_into_the_solid_still_cuts() {
+    // Material from 1 mm below the block's top: a 1 mm slice comes off.
+    let mesh = evaluate(&clear_of_the_top(CLEAR_HALF_SPACES[0], "DIFFERENCE").replace("(0.,0.,2.)", "(0.,0.,1.999)"));
+    close(mesh.volume(), 1.999, 1e-9);
+}
+
 #[test]
 fn clipping_a_rotated_plane_cuts_on_the_diagonal() {
     let mesh = evaluate(

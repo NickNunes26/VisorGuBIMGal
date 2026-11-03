@@ -8,6 +8,6 @@ pub mod model;
 mod nurbs;
 mod solids;
 
-pub use csg::{CsgError, intersect, subtract, subtract_all, union};
+pub use csg::{CsgError, intersect, seal, subtract, subtract_all, union};
 pub use mesh::Mesh;
 pub use model::{Diagnostic, ElementGeometry, ElementMesh, ModelEvaluator, UnsupportedSchema};

@@ -3,7 +3,7 @@
 //! Every failure is local to its element (R8): what cannot be evaluated becomes a
 //! [`Diagnostic`], and the rest of the model carries on.
 
-use crate::csg::{intersect, subtract, subtract_all, union};
+use crate::csg::{intersect, seal, subtract, subtract_all, union};
 use crate::curves::{self, Heading, Parent, Stationed};
 use crate::hash::KeyedMap;
 use crate::mesh::Mesh;
@@ -13,6 +13,7 @@ use earcut::Earcut;
 use glam::{DMat4, DVec2, DVec3, DVec4};
 use ifc_schema::units::{ProjectUnits, project_units};
 use ifc_schema::{EntityDef, Schema, SchemaId, schema};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use step_parser::{Entity, StepIndex, Value};
@@ -24,6 +25,9 @@ const MAX_DEPTH: usize = 64;
 const MAX_ITEMS_PER_ELEMENT: usize = 100_000;
 /// Booleans one element may evaluate. Each costs far more than a plain item.
 const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
+/// A target reaching less than this into a half space loses nothing to it. Metres: the
+/// boolean welds vertices this close anyway.
+const CLEAR_OF_HALF_SPACE: f64 = 1e-6;
 const DEFAULT_RGBA: u32 = 0xB8B8_B8FF;
 /// Triangles kept for repeated instances, so a model of unique shapes cannot fill memory twice.
 const MAX_INSTANCE_TRIANGLES: usize = 1_000_000;
@@ -598,6 +602,16 @@ fn is_closed(mesh: &Mesh) -> bool {
     !merged.is_empty() && merged.open_edges() == 0
 }
 
+/// The mesh a boolean can use: as it is when closed, else sealed when that closes it. Only
+/// open meshes are sealed, so closed ones keep their exact triangles.
+fn closed_shape(mesh: &Mesh) -> Option<Cow<'_, Mesh>> {
+    if is_closed(mesh) {
+        return Some(Cow::Borrowed(mesh));
+    }
+    let sealed = seal(mesh);
+    is_closed(&sealed).then_some(Cow::Owned(sealed))
+}
+
 impl<'a> ModelEvaluator<'a> {
     pub fn new(file: &'a StepIndex<'a>) -> Result<Self, UnsupportedSchema> {
         let id = SchemaId::from_identifiers(file.schema_identifiers()).ok_or(UnsupportedSchema)?;
@@ -748,11 +762,11 @@ impl<'a> ModelEvaluator<'a> {
                 .collect();
             if !cuts.is_empty() {
                 for element in &mut meshes {
-                    if !is_closed(&element.mesh) {
+                    let Some(shape) = closed_shape(&element.mesh) else {
                         self.warn("void-on-open-mesh", "void not cut: mesh is not closed".into());
                         continue;
-                    }
-                    match subtract_all(&element.mesh, &cuts) {
+                    };
+                    match subtract_all(&shape, &cuts) {
                         Ok(result) => element.mesh = result,
                         Err(error) => self.warn("void-failed", error.to_string()),
                     }
@@ -979,19 +993,23 @@ impl<'a> ModelEvaluator<'a> {
             self.warn("boolean-failed", "second operand cannot be evaluated".into());
             return Some(first);
         };
-        if !is_closed(&first) || !is_closed(&second) {
-            self.warn("boolean-on-open-mesh", "boolean skipped: an operand is not closed".into());
-            return Some(first);
-        }
-
         let operator = match attribute(entity, def, "Operator") {
             Some(Value::Enum(operator)) => operator.as_str(),
             _ => "DIFFERENCE",
         };
+        // Nothing to remove, add, or have in common, as with a half space clear of `first`.
+        if second.is_empty() {
+            return (operator != "INTERSECTION").then_some(first);
+        }
+        let (Some(one), Some(two)) = (closed_shape(&first), closed_shape(&second)) else {
+            self.warn("boolean-on-open-mesh", "boolean skipped: an operand is not closed".into());
+            return Some(first);
+        };
+
         let result = match operator {
-            "UNION" => union(&first, &second),
-            "INTERSECTION" => intersect(&first, &second),
-            _ => subtract(&first, &second),
+            "UNION" => union(&one, &two),
+            "INTERSECTION" => intersect(&one, &two),
+            _ => subtract(&one, &two),
         };
         match result {
             Ok(mesh) => (!mesh.is_empty()).then_some(mesh),
@@ -1018,6 +1036,11 @@ impl<'a> ModelEvaluator<'a> {
         // AgreementFlag is true when the normal points away from the material.
         let agrees = matches!(attribute(entity, def, "AgreementFlag"), Some(Value::Enum(flag)) if flag == "T");
         let into = if agrees { -normal } else { normal };
+        // A target wholly outside the half space shares nothing with it, however it is bounded.
+        // Revit clips walls at their own top this way, and some of its boundaries are broken.
+        if target.positions.iter().all(|point| (*point - origin).dot(into) <= CLEAR_OF_HALF_SPACE) {
+            return Some(Mesh::default());
+        }
         if let Some(notch) = self.enclosed_notch(entity, def, frame, into) {
             return Some(notch);
         }

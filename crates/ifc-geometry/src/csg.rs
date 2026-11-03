@@ -140,6 +140,14 @@ pub fn union(a: &Mesh, b: &Mesh) -> Result<Mesh, CsgError> {
     Ok(a_tree.into_mesh())
 }
 
+/// `mesh` with vertices closer than [`WELD_TOLERANCE`] merged and every edge split at the
+/// vertices on it, as [`assemble`] does to fragments. Exporters write closed shells whose
+/// faces meet at a corner on a neighbour's edge, or at one corner written twice a rounding
+/// apart; those then share their edges and close. Zero-area triangles are dropped.
+pub fn seal(mesh: &Mesh) -> Mesh {
+    assemble(&polygons_of(mesh))
+}
+
 fn polygons_of(mesh: &Mesh) -> Vec<Polygon> {
     mesh.triangle_corners()
         .filter_map(|[a, b, c]| {
