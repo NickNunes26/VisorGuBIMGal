@@ -28,6 +28,10 @@ const MAX_BOOLEANS_PER_ELEMENT: usize = 4096;
 /// A target reaching less than this into a half space loses nothing to it. Metres: the
 /// boolean welds vertices this close anyway.
 const CLEAR_OF_HALF_SPACE: f64 = 1e-6;
+/// Segments of a half space's boundary that end further apart than this leave it unusable,
+/// and the clip is skipped. In the local files they meet within a micrometre, except where
+/// Revit centred the arcs kilometres away and the ends lie 311 m to 15 km apart. Metres.
+const BOUNDARY_GAP: f64 = 0.01;
 /// Open meshes larger than this stay open. Sealing scans each edge against the vertices
 /// beside it, which on a flat mesh grows with the square of its size: about 0.4 s natively
 /// here, and 26 s at 80,000 triangles. Shells that nearly close in real files have hundreds.
@@ -1069,7 +1073,26 @@ impl<'a> ModelEvaluator<'a> {
             .and_then(reference)
             .map_or(DMat4::IDENTITY, |id| self.placement_matrix(id));
         let boundary = attribute(entity, def, "PolygonalBoundary").and_then(reference)?;
-        let outer = clean_ring(self.curve_points(boundary)?);
+        let (curve, curve_def) = self.lookup(boundary)?;
+        let ring = if curve_def.is_a("IfcCompositeCurve") && !self.is_segmented(&curve, &curve_def) {
+            let parts = self.composite_parts(&curve, &curve_def, 0)?;
+            let widest = parts
+                .windows(2)
+                .filter_map(|pair| Some(pair[0].last()?.distance(*pair[1].first()?)))
+                .fold(0.0, f64::max);
+            if widest > BOUNDARY_GAP {
+                self.warn("broken-boundary", format!("#{boundary}: segments end {widest:.3} m apart"));
+                return None;
+            }
+            let mut path = Vec::new();
+            for part in parts {
+                join(&mut path, part);
+            }
+            path.into_iter().map(DVec3::truncate).collect()
+        } else {
+            self.curve_points(boundary)?
+        };
+        let outer = clean_ring(ring);
         if outer.len() < 3 {
             return None;
         }
@@ -1555,13 +1578,7 @@ impl<'a> ModelEvaluator<'a> {
             self.indexed_curve(&entity, &def)
         } else if def.is_a("IfcCompositeCurve") {
             let mut path = Vec::new();
-            for segment in list(attribute(&entity, &def, "Segments")).iter().filter_map(reference) {
-                let (segment, segment_def) = self.lookup(segment)?;
-                let parent = attribute(&segment, &segment_def, "ParentCurve").and_then(reference)?;
-                let mut part = self.curve_path(parent, depth + 1)?;
-                if flag(attribute(&segment, &segment_def, "SameSense")) == Some(false) {
-                    part.reverse();
-                }
+            for part in self.composite_parts(&entity, &def, depth)? {
                 join(&mut path, part);
             }
             Some(path)
@@ -1579,6 +1596,21 @@ impl<'a> ModelEvaluator<'a> {
             self.warn("unsupported-curve", format!("#{id} {}", def.name()));
             None
         }
+    }
+
+    /// Each segment of a composite curve as a polyline, running the way the curve does.
+    fn composite_parts(&mut self, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Vec<Vec<DVec3>>> {
+        let mut parts = Vec::new();
+        for segment in list(attribute(entity, def, "Segments")).iter().filter_map(reference) {
+            let (segment, segment_def) = self.lookup(segment)?;
+            let parent = attribute(&segment, &segment_def, "ParentCurve").and_then(reference)?;
+            let mut part = self.curve_path(parent, depth + 1)?;
+            if flag(attribute(&segment, &segment_def, "SameSense")) == Some(false) {
+                part.reverse();
+            }
+            parts.push(part);
+        }
+        Some(parts)
     }
 
     /// Whether a curve is made of `IfcCurveSegment`s, as alignment curves are.

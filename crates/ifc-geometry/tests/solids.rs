@@ -138,6 +138,39 @@ fn polygonal_bound_limits_the_clip_to_its_outline() {
     assert_eq!(mesh.open_edges(), 0);
 }
 
+#[test]
+fn a_bounded_half_space_whose_segments_do_not_meet_is_not_used() {
+    // The outline above as two segments, the second starting `gap` metres further along Y than
+    // the first ends. Revit writes some boundaries with arcs centred kilometres away, whose
+    // ends then lie that far apart; joined up, the outline covers what it should not.
+    for (gap, volume, broken) in [(0.0, 1.5, false), (0.009, 1.5, false), (0.011, 2.0, true), (1000.0, 2.0, true)] {
+        let body = format!(
+            "{TWO_HIGH_BLOCK}#20=IFCCARTESIANPOINT((-1.,-1.));\n\
+             #21=IFCCARTESIANPOINT((0.5,-1.));\n\
+             #22=IFCCARTESIANPOINT((0.5,2.));\n\
+             #23=IFCCARTESIANPOINT((-1.,2.));\n\
+             #26=IFCCARTESIANPOINT((0.5,{}));\n\
+             #24=IFCPOLYLINE((#20,#21,#22));\n\
+             #25=IFCPOLYLINE((#26,#23,#20));\n\
+             #27=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#24);\n\
+             #28=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#25);\n\
+             #29=IFCCOMPOSITECURVE((#27,#28),.F.);\n\
+             #14=IFCPOLYGONALBOUNDEDHALFSPACE(#13,.F.,#903,#29);\n\
+             #5=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#10,#14);\n",
+            2.0 + gap
+        );
+        let text = format!("ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n{COMMON}{body}ENDSEC;END-ISO-10303-21;");
+        let file = index(text.as_bytes()).unwrap();
+        let mut evaluator = ModelEvaluator::new(&file).unwrap();
+        let mesh = evaluator.evaluate(2).expect("the element evaluates").meshes.remove(0).mesh;
+        let codes: Vec<&str> = evaluator.diagnostics().iter().map(|item| item.code).collect();
+        close(mesh.volume(), volume, 1e-9);
+        assert_eq!(mesh.open_edges(), 0, "{gap}");
+        assert_eq!(codes.contains(&"broken-boundary"), broken, "{gap}: {codes:?}");
+        assert_eq!(codes.is_empty(), !broken, "{gap}: {codes:?}");
+    }
+}
+
 /// The block of `TWO_HIGH_BLOCK` with a half space `#14` whose material lies above its top,
 /// as Revit clips walls at their own height, under `operator`.
 fn clear_of_the_top(half_space: &str, operator: &str) -> String {
