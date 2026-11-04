@@ -16,8 +16,9 @@
   "tolerance_note": "Every numeric quantity carries its own tolerance; lengths are in metres in the IFC project coordinate system (no georeferencing). Coordinate tolerances are 1 mm (1e-3 m). The independent integration itself is good to about 1e-9 m.",
   "computation": {
     "alignment": "Copy of the road-alignment design; x(s) and y(s) are cos/sin(heading) integrated with composite 8-point Gauss-Legendre on intervals <= 10 m. heading(s) is closed form from the line/clothoid/arc parameters. Independent of IfcOpenShell geometry.",
-    "placement": "IfcLinearPlacement with an IfcAxis2PlacementLinear whose Location is an IfcPointByDistanceExpression on the horizontal IfcCompositeCurve (FootPrint) of the alignment. OffsetLateral is positive to the left; the local X axis is the curve tangent and local Z is up. The 1 x 1 x 1 box solid is centred on the local origin, so the world box centre is the placement origin: (x(s)-o*sin h, y(s)+o*cos h, v).",
+    "placement": "IfcLinearPlacement with an IfcAxis2PlacementLinear whose Location is an IfcPointByDistanceExpression on the horizontal IfcCompositeCurve (FootPrint) of the alignment. Axis and RefDirection are left unset, so per IFC 4.3 they default to the curve frame: local X along the curve tangent at Location and local Z up. OffsetLateral is positive to the left. The 1 x 1 x 1 box solid is centred on the local origin, so the world box centre is the placement origin: (x(s)-o*sin h, y(s)+o*cos h, v).",
     "bbox": "For a unit cube yawed by h about Z, the axis-aligned horizontal extent is |cos h|+|sin h| in both X and Y.",
+    "tolerances": "Volume and bounding-box sizes use 1e-4 m3 and 1e-3 m: a viewer moves vertex positions as 32-bit floats, so the closed forms cannot be reproduced to 1e-12.",
     "counts": "Counts of the entities written below."
   },
   "counts": {
@@ -171,26 +172,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 49.50000000000001,
@@ -283,26 +284,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 149.50000000000003,
@@ -395,26 +396,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.0074718048195335,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.0074718048195335,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 229.48109548865432,
@@ -507,26 +508,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.0518861678435691,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.0518861678435691,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 279.53126643640996,
@@ -619,26 +620,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.1628732662139456,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.1628732662139456,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 348.3674728767936,
@@ -731,26 +732,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.2374110868748847,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.2374110868748847,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 397.5303302558855,
@@ -843,26 +844,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.348774098320767,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.348774098320767,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 491.80263935324234,
@@ -955,26 +956,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.4031090834707989,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.4031090834707989,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 565.2149661102742,
@@ -1067,26 +1068,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.4140959278678904,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.4140959278678904,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 612.3515442576978,
@@ -1179,26 +1180,26 @@
       "volume": {
         "value": 1.0,
         "unit": "m3",
-        "tolerance": 1e-12,
-        "note": "1 x 1 x 1 m box, closed form"
+        "tolerance": 0.0001,
+        "note": "1 x 1 x 1 m box, closed form; the 1e-4 m3 tolerance allows for 32-bit float vertex positions in the viewer"
       },
       "bbox_size_x": {
         "value": 1.4121059458121674,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_y": {
         "value": 1.4121059458121674,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box"
+        "tolerance": 0.001,
+        "note": "(|cos h| + |sin h|) * 1 m for a yawed unit box; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_size_z": {
         "value": 1.0,
         "unit": "m",
-        "tolerance": 1e-12,
-        "note": "box height"
+        "tolerance": 0.001,
+        "note": "box height; 1e-3 m allows for 32-bit float vertex positions"
       },
       "bbox_min_x": {
         "value": 764.0915729892155,

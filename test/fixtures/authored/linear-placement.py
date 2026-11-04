@@ -7,10 +7,13 @@ Design (all lengths in metres, project length unit metre):
   is the same but is not used by the placements.
 
   Ten 1 x 1 x 1 m IfcBuildingElementProxy boxes are placed with
-  IfcLinearPlacement on the horizontal basis curve of that alignment. Each
-  box is centred on its placement origin in local coordinates, so its world
-  centre is the location of the IfcPointByDistanceExpression. Some stations
-  are on the entry and exit clothoids.
+  IfcLinearPlacement on the horizontal basis curve of that alignment. The
+  IfcAxis2PlacementLinear of each box leaves Axis and RefDirection unset, so
+  per IFC 4.3 both default to the curve frame: local X along the curve
+  tangent at Location and local Z up. Each box is centred on its placement
+  origin in local coordinates, so its world centre is the location of the
+  IfcPointByDistanceExpression. Some stations are on the entry and exit
+  clothoids.
 
   OffsetLateral is positive to the left of the curve as seen in the positive
   parametrisation direction (IFC 4.3, IfcPointByDistanceExpression). With the
@@ -233,22 +236,18 @@ def create_box(model, name, body, basis, station, lateral, vertical):
     product = ifcopenshell.api.root.create_entity(
         model, ifc_class="IfcBuildingElementProxy", name=name)
 
-    x, y, z = placed_centre(station, lateral, vertical)
-    h = heading(station)
     location = model.create_entity(
         "IfcPointByDistanceExpression",
         DistanceAlong=model.create_entity("IfcLengthMeasure", float(station)),
         OffsetLateral=float(lateral),
         OffsetVertical=float(vertical),
         BasisCurve=basis)
-    axes = model.create_entity(
-        "IfcAxis2PlacementLinear",
-        Location=location,
-        Axis=model.create_entity("IfcDirection",
-                                 DirectionRatios=(0.0, 0.0, 1.0)),
-        RefDirection=model.create_entity(
-            "IfcDirection",
-            DirectionRatios=(math.cos(h), math.sin(h), 0.0)))
+    # Axis and RefDirection are left unset: per IFC 4.3 they are relative to
+    # the curve, and when omitted they default to the curve frame (local X
+    # along the tangent at Location, local Z up). Writing world coordinates
+    # here would turn the box by a further heading, because the viewer applies
+    # them in that frame.
+    axes = model.create_entity("IfcAxis2PlacementLinear", Location=location)
     product.ObjectPlacement = model.create_entity(
         "IfcLinearPlacement", RelativePlacement=axes)
 
@@ -352,13 +351,21 @@ def expected(model):
                              "closed form from the clothoid/arc/line design parameters"),
             "yaw_degrees": value(math.degrees(h), "deg", 1e-10,
                                  "heading converted to degrees"),
-            "volume": value(BOX ** 3, "m3", 1e-12,
-                            "1 x 1 x 1 m box, closed form"),
-            "bbox_size_x": value(BOX * (c + s), "m", 1e-12,
-                                 "(|cos h| + |sin h|) * 1 m for a yawed unit box"),
-            "bbox_size_y": value(BOX * (c + s), "m", 1e-12,
-                                 "(|cos h| + |sin h|) * 1 m for a yawed unit box"),
-            "bbox_size_z": value(BOX, "m", 1e-12, "box height"),
+            "volume": value(BOX ** 3, "m3", 1e-4,
+                            "1 x 1 x 1 m box, closed form; the 1e-4 m3 "
+                            "tolerance allows for 32-bit float vertex "
+                            "positions in the viewer"),
+            "bbox_size_x": value(BOX * (c + s), "m", 1e-3,
+                                 "(|cos h| + |sin h|) * 1 m for a yawed unit "
+                                 "box; 1e-3 m allows for 32-bit float vertex "
+                                 "positions"),
+            "bbox_size_y": value(BOX * (c + s), "m", 1e-3,
+                                 "(|cos h| + |sin h|) * 1 m for a yawed unit "
+                                 "box; 1e-3 m allows for 32-bit float vertex "
+                                 "positions"),
+            "bbox_size_z": value(BOX, "m", 1e-3,
+                                 "box height; 1e-3 m allows for 32-bit float "
+                                 "vertex positions"),
             "bbox_min_x": value(x - 0.5 * BOX * (c + s), "m", 1e-3,
                                 "centre_x minus half the yawed extent"),
             "bbox_max_x": value(x + 0.5 * BOX * (c + s), "m", 1e-3,
@@ -397,13 +404,19 @@ def expected(model):
             "placement": "IfcLinearPlacement with an IfcAxis2PlacementLinear "
                          "whose Location is an IfcPointByDistanceExpression on "
                          "the horizontal IfcCompositeCurve (FootPrint) of the "
-                         "alignment. OffsetLateral is positive to the left; the "
-                         "local X axis is the curve tangent and local Z is up. "
-                         "The 1 x 1 x 1 box solid is centred on the local "
-                         "origin, so the world box centre is the placement "
-                         "origin: (x(s)-o*sin h, y(s)+o*cos h, v).",
+                         "alignment. Axis and RefDirection are left unset, so "
+                         "per IFC 4.3 they default to the curve frame: local X "
+                         "along the curve tangent at Location and local Z up. "
+                         "OffsetLateral is positive to the left. The 1 x 1 x 1 "
+                         "box solid is centred on the local origin, so the "
+                         "world box centre is the placement origin: "
+                         "(x(s)-o*sin h, y(s)+o*cos h, v).",
             "bbox": "For a unit cube yawed by h about Z, the axis-aligned "
                     "horizontal extent is |cos h|+|sin h| in both X and Y.",
+            "tolerances": "Volume and bounding-box sizes use 1e-4 m3 and "
+                          "1e-3 m: a viewer moves vertex positions as 32-bit "
+                          "floats, so the closed forms cannot be reproduced to "
+                          "1e-12.",
             "counts": "Counts of the entities written below.",
         },
         "counts": {
