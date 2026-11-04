@@ -83,7 +83,12 @@ export class Camera {
   }
 
   zoom(deltaY: number): void {
-    const factor = deltaY > 0 ? 1.12 : 1 / 1.12;
+    this.zoomBy(deltaY > 0 ? 1.12 : 1 / 1.12);
+  }
+
+  /** Multiplies the distance to the target: below 1 moves closer. */
+  zoomBy(factor: number): void {
+    if (!Number.isFinite(factor) || factor <= 0) return;
     this.distance = Math.max(0.05, Math.min(500000, this.distance * factor));
   }
 

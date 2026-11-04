@@ -13,6 +13,7 @@ import type {
   ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { Camera } from './Camera';
+import { attachCanvasInput } from './canvasInput';
 import { waitForSync } from './glSync';
 import {
   FLAG_SELECTED,
@@ -526,83 +527,19 @@ export class WebGl2Renderer implements RendererPort {
       }
     }
 
-    let isDragging = false;
-    let isPanning = false;
-    let startX = 0;
-    let startY = 0;
-    let hasMoved = false;
-
-    const onMouseDown = (e: MouseEvent) => {
-      isDragging = true;
-      hasMoved = false;
-      isPanning = e.button === 1 || e.button === 2 || e.shiftKey;
-      startX = e.clientX;
-      startY = e.clientY;
-      canvas.style.cursor = isPanning ? 'move' : 'grabbing';
-    };
-
-    const onMouseMove = (e: MouseEvent) => {
-      if (!isDragging) return;
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-        hasMoved = true;
-      }
-
-      startX = e.clientX;
-      startY = e.clientY;
-
-      if (isPanning) {
-        this.camera.pan(dx, dy);
-      } else {
-        this.camera.orbit(dx, dy);
-      }
-      this.requestRender();
-    };
-
-    const onMouseUp = (e: MouseEvent) => {
-      if (!isDragging) return;
-      const wasLeftClick = !hasMoved && e.button === 0;
-      isDragging = false;
-      isPanning = false;
-      canvas.style.cursor = 'grab';
-
-      if (wasLeftClick) {
-        const rect = canvas.getBoundingClientRect();
-        const cssX = e.clientX - rect.left;
-        const cssY = e.clientY - rect.top;
+    const stopInput = attachCanvasInput(canvas, this.camera, {
+      onViewChange: () => this.requestRender(),
+      onClick: (cssX, cssY) => {
         void this.pick(cssX, cssY).then((hit) => {
           this.setSelection(hit);
           this.handlers.onSelect?.(hit);
         });
       }
-    };
-
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      this.camera.zoom(e.deltaY);
-      this.requestRender();
-    };
-
-    const onContextMenu = (e: MouseEvent) => {
-      e.preventDefault();
-    };
-
-    canvas.addEventListener('mousedown', onMouseDown);
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    canvas.addEventListener('contextmenu', onContextMenu);
-    canvas.style.cursor = 'grab';
+    });
 
     this.cleanupListeners = () => {
       window.removeEventListener('resize', onResize);
-      canvas.removeEventListener('mousedown', onMouseDown);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-      canvas.removeEventListener('wheel', onWheel);
-      canvas.removeEventListener('contextmenu', onContextMenu);
+      stopInput();
     };
   }
 
