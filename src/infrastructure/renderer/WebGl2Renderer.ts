@@ -262,6 +262,11 @@ export class WebGl2Renderer implements RendererPort {
   private recordTexHeight = 0;
   private recordCpuWords = new Uint32Array(RECORD_TEX_WIDTH * 1 * 4);
   private recordLayoutDirty = true;
+  /** Records in the record texture, and the first of them not uploaded yet. */
+  private recordTotal = 0;
+  private recordAppendFrom = 0;
+  /** The table's last model: its new records go on the end without moving any other model. */
+  private recordTail: ModelEntry | null = null;
 
   private pickFramebuffer: WebGLFramebuffer | null = null;
   private pickColorTexture: WebGLTexture | null = null;
@@ -796,7 +801,16 @@ export class WebGl2Renderer implements RendererPort {
       gpuBytes
     });
 
-    this.recordLayoutDirty = true;
+    // Records of the table's last model are appended; anything else moves models, so rebuild.
+    if (
+      !this.recordLayoutDirty &&
+      model === this.recordTail &&
+      model.recordBaseOffset + recordOffsetInModel === this.recordTotal
+    ) {
+      this.recordTotal += recordCount;
+    } else {
+      this.recordLayoutDirty = true;
+    }
   }
 
   finishModel(modelId: ModelId, bounds: ModelBounds | undefined): void {
@@ -1038,12 +1052,44 @@ export class WebGl2Renderer implements RendererPort {
   private updateGpuSceneTables(): number {
     if (!this.gl) return 0;
 
-    // 1. Rebuild record texture if layout dirty
+    // 1. Upload records appended to the last model, or rebuild the texture if models moved
+    if (!this.recordLayoutDirty && this.recordAppendFrom < this.recordTotal) {
+      const tail = this.recordTail;
+      if (!tail || !this.recordTexture || this.recordTotal > RECORD_TEX_WIDTH * this.recordTexHeight) {
+        this.recordLayoutDirty = true;
+      } else {
+        const from = this.recordAppendFrom;
+        const words = tail.recordWords;
+        const dstStart = tail.recordBaseOffset * 4;
+        for (let i = (from - tail.recordBaseOffset) * 4; i < words.length; i++) {
+          this.recordCpuWords[dstStart + i] = words[i];
+        }
+        // Whole rows from the one holding the first new record.
+        const firstRow = Math.floor(from / RECORD_TEX_WIDTH);
+        const rows = Math.ceil(this.recordTotal / RECORD_TEX_WIDTH) - firstRow;
+        this.gl.bindTexture(this.gl.TEXTURE_2D, this.recordTexture);
+        this.gl.texSubImage2D(
+          this.gl.TEXTURE_2D,
+          0,
+          0,
+          firstRow,
+          RECORD_TEX_WIDTH,
+          rows,
+          this.gl.RGBA_INTEGER,
+          this.gl.UNSIGNED_INT,
+          this.recordCpuWords.subarray(firstRow * RECORD_TEX_WIDTH * 4, (firstRow + rows) * RECORD_TEX_WIDTH * 4)
+        );
+        this.recordAppendFrom = this.recordTotal;
+      }
+    }
+
     if (this.recordLayoutDirty) {
       let totalRecords = 0;
+      let tail: ModelEntry | null = null;
       for (const model of this.models.values()) {
         model.recordBaseOffset = totalRecords;
         totalRecords += model.recordWords.length / 4;
+        tail = model;
       }
 
       const requiredHeight = Math.max(1, Math.ceil(totalRecords / RECORD_TEX_WIDTH));
@@ -1058,21 +1104,23 @@ export class WebGl2Renderer implements RendererPort {
         this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
         this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
 
-        this.recordTexHeight = requiredHeight;
-        this.recordCpuWords = new Uint32Array(RECORD_TEX_WIDTH * requiredHeight * 4);
+        // Doubled, so a streaming model appends for most batches instead of rebuilding.
+        const maxHeight = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) as number;
+        this.recordTexHeight = Math.max(requiredHeight, Math.min(this.recordTexHeight * 2, maxHeight));
+        this.recordCpuWords = new Uint32Array(RECORD_TEX_WIDTH * this.recordTexHeight * 4);
         this.gl.texImage2D(
           this.gl.TEXTURE_2D,
           0,
           this.gl.RGBA32UI,
           RECORD_TEX_WIDTH,
-          requiredHeight,
+          this.recordTexHeight,
           0,
           this.gl.RGBA_INTEGER,
           this.gl.UNSIGNED_INT,
           null
         );
-      } else if (this.recordCpuWords.length < RECORD_TEX_WIDTH * requiredHeight * 4) {
-        this.recordCpuWords = new Uint32Array(RECORD_TEX_WIDTH * requiredHeight * 4);
+      } else if (this.recordCpuWords.length < RECORD_TEX_WIDTH * this.recordTexHeight * 4) {
+        this.recordCpuWords = new Uint32Array(RECORD_TEX_WIDTH * this.recordTexHeight * 4);
       }
 
       for (const model of this.models.values()) {
@@ -1097,6 +1145,9 @@ export class WebGl2Renderer implements RendererPort {
           this.recordCpuWords.subarray(0, RECORD_TEX_WIDTH * requiredHeight * 4)
         );
       }
+      this.recordTotal = totalRecords;
+      this.recordAppendFrom = totalRecords;
+      this.recordTail = tail;
       this.recordLayoutDirty = false;
     }
 
