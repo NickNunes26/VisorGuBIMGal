@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import type { KernelDiagnostic } from '../../domain/kernel/KernelPort';
 import type { ElementRef, ModelId } from '../../domain/models/ModelRecord';
@@ -55,21 +55,30 @@ function groupDiagnostics(diagnostics: readonly KernelDiagnostic[]): Group[] {
 /** Load diagnostics of one model: a count by severity that opens a list grouped by code. */
 export const ModelDiagnostics: React.FC<ModelDiagnosticsProps> = ({ modelId, diagnostics, onSelectElement }) => {
   const [open, setOpen] = useState(false);
+  // A large model has thousands: count and group them once per list, not on every render.
+  const counts = useMemo(
+    () =>
+      SEVERITIES.map((severity) => ({
+        severity,
+        count: diagnostics.filter((item) => item.severity === severity).length
+      })).filter(({ count }) => count > 0),
+    [diagnostics]
+  );
+  const groups = useMemo(() => (open ? groupDiagnostics(diagnostics) : []), [open, diagnostics]);
   if (diagnostics.length === 0) return null;
 
-  const counts = SEVERITIES.map((severity) => ({
-    severity,
-    count: diagnostics.filter((item) => item.severity === severity).length
-  })).filter(({ count }) => count > 0);
-  const worst = counts[0].severity;
-  const summary = counts
-    .map(({ severity, count }) => `${count} ${NOUNS[severity][count === 1 ? 0 : 1]}`)
-    .join(' · ');
+  // Severity comes from the Worker as data: a value outside the three still shows, uncounted.
+  const worst = counts[0]?.severity ?? 'info';
+  const summary =
+    counts.map(({ severity, count }) => `${count} ${NOUNS[severity][count === 1 ? 0 : 1]}`).join(' · ') ||
+    `${diagnostics.length} diagnósticos`;
 
   return (
     <div className="model-diagnostics">
       <button
+        type="button"
         className="model-diagnostics-toggle"
+        aria-expanded={open}
         onClick={() => setOpen((prev) => !prev)}
         title={open ? 'Ocultar diagnósticos de carga' : 'Ver diagnósticos de carga'}
       >
@@ -79,7 +88,7 @@ export const ModelDiagnostics: React.FC<ModelDiagnosticsProps> = ({ modelId, dia
       </button>
 
       {open &&
-        groupDiagnostics(diagnostics).map((group) => (
+        groups.map((group) => (
           <div key={`${group.severity}:${group.code}`} className="model-diagnostics-group">
             <div className="model-diagnostics-code" style={{ color: COLORS[group.severity] }}>
               <code>{group.code}</code>
@@ -89,6 +98,7 @@ export const ModelDiagnostics: React.FC<ModelDiagnosticsProps> = ({ modelId, dia
               <div key={index} className="model-diagnostics-item">
                 {item.expressId !== undefined && (
                   <button
+                    type="button"
                     className="model-diagnostics-element"
                     onClick={() => onSelectElement({ modelId, expressId: item.expressId! })}
                     title="Seleccionar el elemento"
