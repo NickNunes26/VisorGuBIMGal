@@ -51,7 +51,7 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 
 | ID | Mejora | Evidencia en el código | Tam. | Origen | Comprobado |
 |---|---|---|---|---|---|
-| C1 | Panel de diagnósticos del modelo: los avisos de carga nunca llegan a la interfaz; solo el panel de planos muestra los suyos | Solo `SectionDxfPanel.tsx` lee `diagnostics` en `src/ui` | S | C+G | Sí |
+| C1 | Panel de diagnósticos del modelo: los avisos de carga nunca llegan a la interfaz; solo el panel de planos muestra los suyos | Solo `SectionDxfPanel.tsx` lee `diagnostics` en `src/ui` | S | C+G | Sí. **Hecho en T-107** (2026-11-04): cada modelo guarda los diagnósticos de la apertura y del flujo, y su tarjeta muestra un recuento por gravedad que se despliega en grupos por gravedad y código, con hasta 20 entradas por código. Una entrada con elemento lo selecciona. Códigos y mensajes se muestran tal como los da el kernel |
 | C2 | Planos de corte y caja de sección en 3D, por descarte en el shader | `shaders.ts` sin plano de corte; solo hay cortes 2D | M | C+G | Sí |
 | C3 | Aislar, ocultar y modo fantasma o rayos X por selección, clase IFC o planta | Solo visibilidad binaria por elemento | S | C+G | Sí |
 | C4 | Búsqueda y filtro por nombre, clase, GlobalId y valor de propiedad | Nada en `src/ui` | M | C+G | Sí |
