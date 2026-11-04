@@ -28,6 +28,7 @@ struct RecordGpuData {
 // bit 2 (4u): HiddenByDefault
 // bit 3 (8u): CurrentlyVisible
 // bit 4 (16u): CurrentlySelected
+// bit 5 (32u): Ghost, drawn faint by vs_ghost only and never picked
 
 struct ColorVaryings {
   @builtin(position) clipPos: vec4<f32>,
@@ -36,19 +37,22 @@ struct ColorVaryings {
   @location(2) worldUpZ: f32,
 };
 
-@vertex
-fn vs_main(
-  @location(0) pos: vec3<f32>,
-  @location(1) normal: vec3<f32>,
-  @location(2) localRecordIdx: u32,
-  @builtin(instance_index) batchIdx: u32
+const GHOST_COLOR = vec4<f32>(0.70, 0.76, 0.84, 0.12);
+
+fn shade(
+  pos: vec3<f32>,
+  normal: vec3<f32>,
+  localRecordIdx: u32,
+  batchIdx: u32,
+  ghostPass: bool
 ) -> ColorVaryings {
   var out: ColorVaryings;
   let batch = batches[batchIdx];
   let modelVisible = (batch.packedMeta & 0x80000000u) != 0u;
   let recordBase = batch.packedMeta & 0x7fffffffu;
   let rec = records[recordBase + localRecordIdx];
-  let isVisible = modelVisible && ((rec.stateFlags & 8u) != 0u);
+  let isGhost = (rec.stateFlags & 32u) != 0u;
+  let isVisible = modelVisible && ((rec.stateFlags & 8u) != 0u) && (isGhost == ghostPass);
 
   if (!isVisible) {
     out.clipPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -65,7 +69,9 @@ fn vs_main(
   out.worldUpZ = normal.z;
 
   let isSelected = (rec.stateFlags & 16u) != 0u;
-  if (isSelected) {
+  if (ghostPass) {
+    out.color = GHOST_COLOR;
+  } else if (isSelected) {
     out.color = vec4<f32>(0.22, 0.58, 0.96, 1.0);
   } else {
     let r = f32((rec.rgba >> 24u) & 0xffu) / 255.0;
@@ -75,6 +81,26 @@ fn vs_main(
     out.color = vec4<f32>(r, g, b, a);
   }
   return out;
+}
+
+@vertex
+fn vs_main(
+  @location(0) pos: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+  @location(2) localRecordIdx: u32,
+  @builtin(instance_index) batchIdx: u32
+) -> ColorVaryings {
+  return shade(pos, normal, localRecordIdx, batchIdx, false);
+}
+
+@vertex
+fn vs_ghost(
+  @location(0) pos: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+  @location(2) localRecordIdx: u32,
+  @builtin(instance_index) batchIdx: u32
+) -> ColorVaryings {
+  return shade(pos, normal, localRecordIdx, batchIdx, true);
 }
 
 @fragment
@@ -111,7 +137,7 @@ fn vs_pick(
   let modelVisible = (batch.packedMeta & 0x80000000u) != 0u;
   let recordBase = batch.packedMeta & 0x7fffffffu;
   let rec = records[recordBase + localRecordIdx];
-  let isVisible = modelVisible && ((rec.stateFlags & 8u) != 0u);
+  let isVisible = modelVisible && ((rec.stateFlags & 8u) != 0u) && ((rec.stateFlags & 32u) == 0u);
 
   if (!isVisible) {
     out.clipPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);

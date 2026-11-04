@@ -1,6 +1,7 @@
 import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/ModelRecord';
 import { findBatchError, type GeometryBatch } from '../../domain/kernel/GeometryBatch';
 import type {
+  ElementDisplay,
   RendererEventHandlers,
   RendererPort,
   ViewPreset
@@ -180,6 +181,18 @@ export class AutoRenderer implements RendererPort {
       this.activeRenderer.setElementVisibility(refs, visible);
     } else {
       this.preInitQueue.push((r) => r.setElementVisibility(refs, visible));
+    }
+  }
+
+  setElementDisplay(
+    modelId: ModelId,
+    others: ElementDisplay,
+    entries: ReadonlyMap<number, ElementDisplay>
+  ): void {
+    if (this.activeRenderer) {
+      this.activeRenderer.setElementDisplay(modelId, others, entries);
+    } else {
+      this.preInitQueue.push((r) => r.setElementDisplay(modelId, others, entries));
     }
   }
 

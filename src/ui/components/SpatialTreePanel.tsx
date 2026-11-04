@@ -1,20 +1,25 @@
 import React, { useState } from 'react';
-import { ChevronRight, ChevronDown, Folder, Building, Layers, Box } from 'lucide-react';
+import { ChevronRight, ChevronDown, Folder, Building, Layers, Box, Focus, EyeOff } from 'lucide-react';
 import type { ElementRef, ModelId, ModelRecord } from '../../domain/models/ModelRecord';
 import type { SpatialElement, SpatialNode, SpatialTree } from '../../domain/kernel/KernelPort';
+import type { DisplayTarget } from '../viewer/displayRule';
 
 interface SpatialTreePanelProps {
   models: ModelRecord[];
   spatialTrees: Record<ModelId, SpatialTree>;
   onSelectElement: (ref: ElementRef) => void;
   selectedRef: ElementRef | null;
+  onIsolate: (target: DisplayTarget) => void;
+  onHide: (target: DisplayTarget) => void;
 }
 
 export const SpatialTreePanel: React.FC<SpatialTreePanelProps> = ({
   models,
   spatialTrees,
   onSelectElement,
-  selectedRef
+  selectedRef,
+  onIsolate,
+  onHide
 }) => {
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({ root: true });
 
@@ -53,10 +58,12 @@ export const SpatialTreePanel: React.FC<SpatialTreePanelProps> = ({
     const nodeKey = `${modelId}-node-${node.expressId}`;
     const isExpanded = !!expandedNodes[nodeKey];
     const label = node.name || `Planta #${node.expressId}`;
+    const target: DisplayTarget = { by: 'spatial', modelId, expressId: node.expressId, name: label };
 
     return (
       <div key={nodeKey} style={{ marginTop: '4px' }}>
         <div
+          className="tree-spatial-row"
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -68,9 +75,31 @@ export const SpatialTreePanel: React.FC<SpatialTreePanelProps> = ({
         >
           {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           <Layers size={13} color="#10b981" />
-          <span>
+          <span className="tree-spatial-label">
             {label} ({node.elements.length} elem.)
           </span>
+          <button
+            type="button"
+            className="tree-spatial-action tree-isolate"
+            onClick={(event) => {
+              event.stopPropagation();
+              onIsolate(target);
+            }}
+            title="Aislar"
+          >
+            <Focus size={12} />
+          </button>
+          <button
+            type="button"
+            className="tree-spatial-action tree-hide"
+            onClick={(event) => {
+              event.stopPropagation();
+              onHide(target);
+            }}
+            title="Ocultar"
+          >
+            <EyeOff size={12} />
+          </button>
         </div>
 
         {isExpanded && (

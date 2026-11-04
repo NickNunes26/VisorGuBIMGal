@@ -7,16 +7,22 @@ import {
   type GeometryBatch
 } from '../../domain/kernel/GeometryBatch';
 import type {
+  ElementDisplay,
   RendererEventHandlers,
   RendererPort,
   ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { Camera } from './Camera';
 import { waitForSync } from './glSync';
+import {
+  FLAG_SELECTED,
+  displayFlags,
+  refreshDisplayFlags,
+  setDisplay,
+  type DisplayState
+} from './recordDisplay';
 import type { RendererDebugStats } from './WebGpuRenderer';
 
-const FLAG_VISIBLE = 8;
-const FLAG_SELECTED = 16;
 const RECORD_TEX_WIDTH = 2048;
 /** Geometry uploaded per frame; a batch is never split, so one always goes. */
 const UPLOAD_BYTES_PER_FRAME = 2 * 1024 * 1024;
@@ -35,17 +41,13 @@ interface GlBatchEntry {
   gpuBytes: number;
 }
 
-interface ModelEntry {
+interface ModelEntry extends DisplayState {
   modelId: ModelId;
   numericId: number;
   visible: boolean;
   batches: GlBatchEntry[];
-  /** 4 u32 words per record: [expressId, modelNumericId, rgba, stateFlags]. */
-  recordWords: number[];
   /** Maps expressId -> list of record indices (0..recordCount-1) within this model. */
   expressIdToRecords: Map<number, number[]>;
-  /** Visibility overrides set via setElementVisibility. */
-  visibilityOverrides: Map<number, boolean>;
   /** Starting record index in the global GPU record buffer. */
   recordBaseOffset: number;
   /** The kernel's 'complete' bounds, set by finishModel; not valid while the model streams. */
@@ -72,6 +74,8 @@ interface ProgramUniforms {
   u_recordBase: WebGLUniformLocation | null;
   u_modelVisible: WebGLUniformLocation | null;
   u_recordTexture: WebGLUniformLocation | null;
+  /** Main program only. */
+  u_ghostPass: WebGLUniformLocation | null;
 }
 
 const VS_MAIN = `#version 300 es
@@ -89,6 +93,8 @@ uniform vec3 u_batchOffset;
 uniform uint u_recordBase;
 uniform bool u_modelVisible;
 uniform usampler2D u_recordTexture;
+// The ghost pass draws only ghosts (bit 32u), faint; the other passes draw everything else.
+uniform bool u_ghostPass;
 
 out vec4 v_color;
 out vec3 v_viewNormal;
@@ -100,7 +106,8 @@ void main() {
   uvec4 rec = texelFetch(u_recordTexture, texCoord, 0);
 
   uint stateFlags = rec.w;
-  bool isVisible = u_modelVisible && ((stateFlags & 8u) != 0u);
+  bool isGhost = (stateFlags & 32u) != 0u;
+  bool isVisible = u_modelVisible && ((stateFlags & 8u) != 0u) && (isGhost == u_ghostPass);
 
   if (!isVisible) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -120,7 +127,9 @@ void main() {
   v_worldUpZ = a_normal.z;
 
   bool isSelected = (stateFlags & 16u) != 0u;
-  if (isSelected) {
+  if (u_ghostPass) {
+    v_color = vec4(0.70, 0.76, 0.84, 0.12);
+  } else if (isSelected) {
     v_color = vec4(0.22, 0.58, 0.96, 1.0);
   } else {
     uint rgba = rec.z;
@@ -183,7 +192,7 @@ void main() {
   uvec4 rec = texelFetch(u_recordTexture, texCoord, 0);
 
   uint stateFlags = rec.w;
-  bool isVisible = u_modelVisible && ((stateFlags & 8u) != 0u);
+  bool isVisible = u_modelVisible && ((stateFlags & 8u) != 0u) && ((stateFlags & 32u) == 0u);
 
   if (!isVisible) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -397,7 +406,8 @@ export class WebGl2Renderer implements RendererPort {
       u_batchOffset: gl.getUniformLocation(this.mainProgram, 'u_batchOffset'),
       u_recordBase: gl.getUniformLocation(this.mainProgram, 'u_recordBase'),
       u_modelVisible: gl.getUniformLocation(this.mainProgram, 'u_modelVisible'),
-      u_recordTexture: gl.getUniformLocation(this.mainProgram, 'u_recordTexture')
+      u_recordTexture: gl.getUniformLocation(this.mainProgram, 'u_recordTexture'),
+      u_ghostPass: gl.getUniformLocation(this.mainProgram, 'u_ghostPass')
     };
 
     this.pickProgram = createProgram(gl, VS_PICK, FS_PICK);
@@ -407,7 +417,8 @@ export class WebGl2Renderer implements RendererPort {
       u_batchOffset: gl.getUniformLocation(this.pickProgram, 'u_batchOffset'),
       u_recordBase: gl.getUniformLocation(this.pickProgram, 'u_recordBase'),
       u_modelVisible: gl.getUniformLocation(this.pickProgram, 'u_modelVisible'),
-      u_recordTexture: gl.getUniformLocation(this.pickProgram, 'u_recordTexture')
+      u_recordTexture: gl.getUniformLocation(this.pickProgram, 'u_recordTexture'),
+      u_ghostPass: null
     };
 
     this.recordTexHeight = 1;
@@ -621,7 +632,9 @@ export class WebGl2Renderer implements RendererPort {
         batches: [],
         recordWords: [],
         expressIdToRecords: new Map(),
-        visibilityOverrides: new Map(),
+        displayEntries: new Map(),
+        displayOthers: 'default',
+        displayMayGhost: false,
         recordBaseOffset: 0,
         bounds: {
           minX: Infinity,
@@ -703,9 +716,6 @@ export class WebGl2Renderer implements RendererPort {
         opaqueIndexCount += iCount;
       }
 
-      const hiddenByDefault = (rawFlags & MeshFlag.HiddenByDefault) !== 0;
-      const visOverride = model.visibilityOverrides.get(expressId);
-      const isCurrentlyVisible = visOverride !== undefined ? visOverride : !hiddenByDefault;
       const isSelected =
         this.selectedRef !== null &&
         this.selectedRef.modelId === model.modelId &&
@@ -713,7 +723,7 @@ export class WebGl2Renderer implements RendererPort {
 
       const stateFlags =
         ((rawFlags & 0x7) |
-          (isCurrentlyVisible ? FLAG_VISIBLE : 0) |
+          displayFlags(model, expressId, rawFlags) |
           (isSelected ? FLAG_SELECTED : 0)) >>>
         0;
 
@@ -902,18 +912,12 @@ export class WebGl2Renderer implements RendererPort {
     for (const ref of refs) {
       const model = this.models.get(ref.modelId);
       if (!model) continue;
-      model.visibilityOverrides.set(ref.expressId, visible);
+      model.displayEntries.set(ref.expressId, visible ? 'visible' : 'hidden');
       const recIndices = model.expressIdToRecords.get(ref.expressId);
       if (!recIndices || recIndices.length === 0) continue;
 
       for (const rIdx of recIndices) {
-        const wordIdx = rIdx * 4 + 3;
-        const prevFlags = model.recordWords[wordIdx];
-        const nextFlags = visible
-          ? ((prevFlags | FLAG_VISIBLE) >>> 0)
-          : ((prevFlags & ~FLAG_VISIBLE) >>> 0);
-        if (prevFlags !== nextFlags) {
-          model.recordWords[wordIdx] = nextFlags;
+        if (refreshDisplayFlags(model, rIdx)) {
           this.writeSingleRecordStateToGpu(model.recordBaseOffset + rIdx, model, rIdx);
           anyChanged = true;
         }
@@ -923,6 +927,35 @@ export class WebGl2Renderer implements RendererPort {
     if (anyChanged) {
       this.requestRender();
     }
+  }
+
+  setElementDisplay(
+    modelId: ModelId,
+    others: ElementDisplay,
+    entries: ReadonlyMap<number, ElementDisplay>
+  ): void {
+    const model = this.models.get(modelId);
+    if (!model) return;
+    setDisplay(model, others, entries);
+
+    let anyChanged = false;
+    const recordCount = model.recordWords.length / 4;
+    for (let rIdx = 0; rIdx < recordCount; rIdx++) {
+      if (refreshDisplayFlags(model, rIdx)) anyChanged = true;
+    }
+    // One upload of the whole table next frame, not one write per record.
+    if (anyChanged) {
+      this.recordLayoutDirty = true;
+      this.requestRender();
+    }
+  }
+
+  /** Whether any record may be a ghost, so the ghost pass has something to draw. */
+  private mayHaveGhosts(): boolean {
+    for (const model of this.models.values()) {
+      if (model.visible && model.displayMayGhost) return true;
+    }
+    return false;
   }
 
   setSelection(ref: ElementRef | null): void {
@@ -1210,6 +1243,7 @@ export class WebGl2Renderer implements RendererPort {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.recordTexture);
     gl.uniform1i(this.mainUniforms.u_recordTexture, 0);
+    gl.uniform1i(this.mainUniforms.u_ghostPass, 0);
 
     const eye = this.camera.getEye();
 
@@ -1288,6 +1322,51 @@ export class WebGl2Renderer implements RendererPort {
           }
         }
       }
+    }
+
+    // Pass 3: Ghosts, faint over everything else, whether their element is opaque or not
+    if (this.mayHaveGhosts()) {
+      gl.enable(gl.BLEND);
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(false);
+      gl.uniform1i(this.mainUniforms.u_ghostPass, 1);
+
+      for (const model of this.models.values()) {
+        if (!model.visible) continue;
+        gl.uniform1i(this.mainUniforms.u_modelVisible, 1);
+
+        for (const batch of model.batches) {
+          gl.uniform3f(
+            this.mainUniforms.u_batchOffset,
+            batch.origin[0] - eye[0],
+            batch.origin[1] - eye[1],
+            batch.origin[2] - eye[2]
+          );
+          gl.uniform1ui(
+            this.mainUniforms.u_recordBase,
+            model.recordBaseOffset + batch.recordOffsetInModel
+          );
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, batch.positionBuffer);
+          gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, batch.normalBuffer);
+          gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, batch.recordIndexBuffer);
+          gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 0, 0);
+
+          if (batch.opaqueIndexCount > 0 && batch.opaqueIndexBuffer) {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.opaqueIndexBuffer);
+            gl.drawElements(gl.TRIANGLES, batch.opaqueIndexCount, gl.UNSIGNED_INT, 0);
+          }
+          if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.transparentIndexBuffer);
+            gl.drawElements(gl.TRIANGLES, batch.transparentIndexCount, gl.UNSIGNED_INT, 0);
+          }
+        }
+      }
+      gl.uniform1i(this.mainUniforms.u_ghostPass, 0);
     }
 
     this.renderCount++;

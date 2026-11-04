@@ -1,11 +1,21 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { Header } from './ui/components/Header';
 import { ModelsPanel } from './ui/components/ModelsPanel';
 import { SpatialTreePanel } from './ui/components/SpatialTreePanel';
 import { PropertiesPanel } from './ui/components/PropertiesPanel';
 import { SectionDxfPanel } from './ui/components/SectionDxfPanel';
 import { GisMapPanel } from './ui/components/GisMapPanel';
+import { DisplayBar } from './ui/components/DisplayBar';
 import { BimViewer } from './ui/viewer/BimViewer';
+import {
+  SHOW_ALL,
+  classCounts,
+  modelDisplay,
+  sameTarget,
+  withoutModel,
+  type DisplayRule,
+  type DisplayTarget
+} from './ui/viewer/displayRule';
 
 import type {
   ElementRef,
@@ -30,6 +40,29 @@ export default function App() {
   const [isWorking, setIsWorking] = useState<boolean>(false);
   const [, setRendererError] = useState<string | null>(null);
   const [activeBackend, setActiveBackend] = useState<'webgpu' | 'webgl2' | null>(null);
+  const [displayRule, setDisplayRule] = useState<DisplayRule>(SHOW_ALL);
+
+  // Every model follows the display rule, including one loaded after the rule was set
+  useEffect(() => {
+    for (const model of models) {
+      const { others, entries } = modelDisplay(displayRule, model.id, spatialTrees[model.id]);
+      renderer.setElementDisplay(model.id, others, entries);
+    }
+  }, [displayRule, models, spatialTrees]);
+
+  const ifcClasses = useMemo(() => classCounts(Object.values(spatialTrees)), [spatialTrees]);
+
+  const handleIsolate = useCallback((target: DisplayTarget) => {
+    setDisplayRule((prev) => ({ ...prev, isolate: target }));
+  }, []);
+
+  const handleHide = useCallback((target: DisplayTarget) => {
+    setDisplayRule((prev) =>
+      prev.hidden.some((hidden) => sameTarget(hidden, target))
+        ? prev
+        : { ...prev, hidden: [...prev.hidden, target] }
+    );
+  }, []);
 
   // Subscribe to renderer backend changes
   useEffect(() => {
@@ -205,6 +238,7 @@ export default function App() {
       return prev;
     });
     setSelectedElement((prev) => (prev?.modelId === id ? null : prev));
+    setDisplayRule((prev) => withoutModel(prev, id));
   }, []);
 
   // Locate model on GIS map
@@ -267,6 +301,8 @@ export default function App() {
                 spatialTrees={spatialTrees}
                 onSelectElement={(ref) => void handleSelectElement(ref)}
                 selectedRef={selectedRef}
+                onIsolate={handleIsolate}
+                onHide={handleHide}
               />
             )}
           </div>
@@ -283,6 +319,18 @@ export default function App() {
             statusText={statusText}
             isWorking={isWorking}
           />
+
+          {models.length > 0 && (
+            <DisplayBar
+              classes={ifcClasses}
+              rule={displayRule}
+              selectedRef={selectedRef}
+              onIsolate={handleIsolate}
+              onHide={handleHide}
+              onToggleGhost={() => setDisplayRule((prev) => ({ ...prev, ghost: !prev.ghost }))}
+              onShowAll={() => setDisplayRule((prev) => ({ ...SHOW_ALL, ghost: prev.ghost }))}
+            />
+          )}
 
           {/* GIS Split Panel (Bottom) */}
           {isGisExpanded && (

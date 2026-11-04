@@ -3,6 +3,13 @@ import type { GeometryBatch } from './GeometryBatch';
 
 export type ViewPreset = 'iso' | 'top' | 'front' | 'side';
 
+/**
+ * How an element is drawn. 'default' is its own state: hidden if HiddenByDefault, else visible.
+ * A ghost is drawn faint and cannot be picked; a HiddenByDefault element is never a ghost and
+ * stays hidden instead.
+ */
+export type ElementDisplay = 'default' | 'visible' | 'ghost' | 'hidden';
+
 export interface RendererEventHandlers {
   onSelect?: (ref: ElementRef | null) => void;
   onHover?: (ref: ElementRef | null) => void;
@@ -26,6 +33,15 @@ export interface RendererPort {
 
   setModelVisibility(modelId: ModelId, visible: boolean): void;
   setElementVisibility(refs: readonly ElementRef[], visible: boolean): void;
+  /**
+   * Replaces how every element of the model is drawn, including batches still to come: the
+   * elements in `entries`, by expressId, take their entry and the rest take `others`.
+   */
+  setElementDisplay(
+    modelId: ModelId,
+    others: ElementDisplay,
+    entries: ReadonlyMap<number, ElementDisplay>
+  ): void;
   setSelection(ref: ElementRef | null): void;
 
   setViewPreset(preset: ViewPreset): void;

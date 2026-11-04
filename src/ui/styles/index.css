@@ -309,6 +309,88 @@ canvas.bim-viewport {
   z-index: 10;
 }
 
+/* Isolate, hide and ghost controls, top left of the viewport */
+.display-bar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  max-width: 250px;
+  background-color: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 4px;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 10;
+}
+
+.display-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.display-bar-row .select {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.display-bar-label {
+  flex: 1;
+  padding: 0 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.display-bar-separator {
+  width: 1px;
+  height: 16px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.display-bar .btn.active {
+  color: var(--accent-color);
+  background-color: rgba(56, 189, 248, 0.15);
+}
+
+.display-bar-status {
+  padding: 2px 6px 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.tree-spatial-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-spatial-action {
+  display: inline-flex;
+  padding: 2px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.tree-spatial-row:hover .tree-spatial-action,
+.tree-spatial-action:focus-visible {
+  opacity: 1;
+}
+
+.tree-spatial-action:hover {
+  color: var(--text-main);
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
 /* GIS Split Panel */
 .gis-drawer {
   flex: none;

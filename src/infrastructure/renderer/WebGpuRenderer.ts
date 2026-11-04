@@ -7,15 +7,20 @@ import {
   type GeometryBatch
 } from '../../domain/kernel/GeometryBatch';
 import type {
+  ElementDisplay,
   RendererEventHandlers,
   RendererPort,
   ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { Camera } from './Camera';
 import { RENDERER_WGSL } from './shaders';
-
-const FLAG_VISIBLE = 8;
-const FLAG_SELECTED = 16;
+import {
+  FLAG_SELECTED,
+  displayFlags,
+  refreshDisplayFlags,
+  setDisplay,
+  type DisplayState
+} from './recordDisplay';
 /** Geometry uploaded per frame; a batch is never split, so one always goes. */
 const UPLOAD_BYTES_PER_FRAME = 2 * 1024 * 1024;
 
@@ -33,17 +38,13 @@ interface GpuBatchEntry {
   gpuBytes: number;
 }
 
-interface ModelEntry {
+interface ModelEntry extends DisplayState {
   modelId: ModelId;
   numericId: number;
   visible: boolean;
   batches: GpuBatchEntry[];
-  /** 4 u32 words per record: [expressId, modelNumericId, rgba, stateFlags]. */
-  recordWords: number[];
   /** Maps expressId -> list of record indices (0..recordCount-1) within this model. */
   expressIdToRecords: Map<number, number[]>;
-  /** Visibility overrides set via setElementVisibility. */
-  visibilityOverrides: Map<number, boolean>;
   /** Starting record index in the global GPU record buffer. */
   recordBaseOffset: number;
   /** The kernel's 'complete' bounds, set by finishModel; not valid while the model streams. */
@@ -83,6 +84,7 @@ export class WebGpuRenderer implements RendererPort {
   private sceneBindGroup: GPUBindGroup | null = null;
   private opaquePipeline: GPURenderPipeline | null = null;
   private transparentPipeline: GPURenderPipeline | null = null;
+  private ghostPipeline: GPURenderPipeline | null = null;
   private pickPipeline: GPURenderPipeline | null = null;
 
   private sceneUniformBuffer: GPUBuffer | null = null;
@@ -308,45 +310,49 @@ export class WebGpuRenderer implements RendererPort {
       }
     });
 
-    this.transparentPipeline = device.createRenderPipeline({
-      label: 'gubim-transparent-pipeline',
-      layout: pipelineLayout,
-      vertex: {
-        module: shaderModule,
-        entryPoint: 'vs_main',
-        buffers: vertexBuffers
-      },
-      fragment: {
-        module: shaderModule,
-        entryPoint: 'fs_main',
-        targets: [
-          {
-            format: this.canvasFormat,
-            blend: {
-              color: {
-                srcFactor: 'src-alpha',
-                dstFactor: 'one-minus-src-alpha',
-                operation: 'add'
-              },
-              alpha: {
-                srcFactor: 'one',
-                dstFactor: 'one-minus-src-alpha',
-                operation: 'add'
+    // Transparent elements and ghosts blend over the opaque pass without writing depth.
+    const blendedPipeline = (label: string, vertexEntryPoint: string): GPURenderPipeline =>
+      device.createRenderPipeline({
+        label,
+        layout: pipelineLayout,
+        vertex: {
+          module: shaderModule,
+          entryPoint: vertexEntryPoint,
+          buffers: vertexBuffers
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fs_main',
+          targets: [
+            {
+              format: this.canvasFormat,
+              blend: {
+                color: {
+                  srcFactor: 'src-alpha',
+                  dstFactor: 'one-minus-src-alpha',
+                  operation: 'add'
+                },
+                alpha: {
+                  srcFactor: 'one',
+                  dstFactor: 'one-minus-src-alpha',
+                  operation: 'add'
+                }
               }
             }
-          }
-        ]
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'none'
-      },
-      depthStencil: {
-        format: 'depth32float',
-        depthWriteEnabled: false,
-        depthCompare: 'greater'
-      }
-    });
+          ]
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode: 'none'
+        },
+        depthStencil: {
+          format: 'depth32float',
+          depthWriteEnabled: false,
+          depthCompare: 'greater'
+        }
+      });
+    this.transparentPipeline = blendedPipeline('gubim-transparent-pipeline', 'vs_main');
+    this.ghostPipeline = blendedPipeline('gubim-ghost-pipeline', 'vs_ghost');
 
     this.pickPipeline = device.createRenderPipeline({
       label: 'gubim-pick-pipeline',
@@ -589,7 +595,9 @@ export class WebGpuRenderer implements RendererPort {
         batches: [],
         recordWords: [],
         expressIdToRecords: new Map(),
-        visibilityOverrides: new Map(),
+        displayEntries: new Map(),
+        displayOthers: 'default',
+        displayMayGhost: false,
         recordBaseOffset: 0,
         bounds: {
           minX: Infinity,
@@ -671,9 +679,6 @@ export class WebGpuRenderer implements RendererPort {
         opaqueIndexCount += iCount;
       }
 
-      const hiddenByDefault = (rawFlags & MeshFlag.HiddenByDefault) !== 0;
-      const visOverride = model.visibilityOverrides.get(expressId);
-      const isCurrentlyVisible = visOverride !== undefined ? visOverride : !hiddenByDefault;
       const isSelected =
         this.selectedRef !== null &&
         this.selectedRef.modelId === model.modelId &&
@@ -681,7 +686,7 @@ export class WebGpuRenderer implements RendererPort {
 
       const stateFlags =
         ((rawFlags & 0x7) |
-          (isCurrentlyVisible ? FLAG_VISIBLE : 0) |
+          displayFlags(model, expressId, rawFlags) |
           (isSelected ? FLAG_SELECTED : 0)) >>>
         0;
 
@@ -945,18 +950,12 @@ export class WebGpuRenderer implements RendererPort {
     for (const ref of refs) {
       const model = this.models.get(ref.modelId);
       if (!model) continue;
-      model.visibilityOverrides.set(ref.expressId, visible);
+      model.displayEntries.set(ref.expressId, visible ? 'visible' : 'hidden');
       const recIndices = model.expressIdToRecords.get(ref.expressId);
       if (!recIndices || recIndices.length === 0) continue;
 
       for (const rIdx of recIndices) {
-        const wordIdx = rIdx * 4 + 3;
-        const prevFlags = model.recordWords[wordIdx];
-        const nextFlags = visible
-          ? ((prevFlags | FLAG_VISIBLE) >>> 0)
-          : ((prevFlags & ~FLAG_VISIBLE) >>> 0);
-        if (prevFlags !== nextFlags) {
-          model.recordWords[wordIdx] = nextFlags;
+        if (refreshDisplayFlags(model, rIdx)) {
           this.writeSingleRecordStateToGpu(model.recordBaseOffset + rIdx, model, rIdx);
           anyChanged = true;
         }
@@ -966,6 +965,35 @@ export class WebGpuRenderer implements RendererPort {
     if (anyChanged) {
       this.requestRender();
     }
+  }
+
+  setElementDisplay(
+    modelId: ModelId,
+    others: ElementDisplay,
+    entries: ReadonlyMap<number, ElementDisplay>
+  ): void {
+    const model = this.models.get(modelId);
+    if (!model) return;
+    setDisplay(model, others, entries);
+
+    let anyChanged = false;
+    const recordCount = model.recordWords.length / 4;
+    for (let rIdx = 0; rIdx < recordCount; rIdx++) {
+      if (refreshDisplayFlags(model, rIdx)) anyChanged = true;
+    }
+    // One upload of the whole table next frame, not one write per record.
+    if (anyChanged) {
+      this.recordLayoutDirty = true;
+      this.requestRender();
+    }
+  }
+
+  /** Whether any record may be a ghost, so the ghost pass has something to draw. */
+  private mayHaveGhosts(): boolean {
+    for (const model of this.models.values()) {
+      if (model.visible && model.displayMayGhost) return true;
+    }
+    return false;
   }
 
   setSelection(ref: ElementRef | null): void {
@@ -1320,6 +1348,32 @@ export class WebGpuRenderer implements RendererPort {
       }
     }
 
+    // Pass 3: Ghosts, faint over everything else, whether their element is opaque or not
+    if (this.ghostPipeline && this.mayHaveGhosts()) {
+      pass.setPipeline(this.ghostPipeline);
+      batchIdx = 0;
+      for (const model of this.models.values()) {
+        if (!model.visible) {
+          batchIdx += model.batches.length;
+          continue;
+        }
+        for (const batch of model.batches) {
+          pass.setVertexBuffer(0, batch.positionBuffer);
+          pass.setVertexBuffer(1, batch.normalBuffer);
+          pass.setVertexBuffer(2, batch.recordIndexBuffer);
+          if (batch.opaqueIndexCount > 0 && batch.opaqueIndexBuffer) {
+            pass.setIndexBuffer(batch.opaqueIndexBuffer, 'uint32');
+            pass.drawIndexed(batch.opaqueIndexCount, 1, 0, 0, batchIdx);
+          }
+          if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+            pass.setIndexBuffer(batch.transparentIndexBuffer, 'uint32');
+            pass.drawIndexed(batch.transparentIndexCount, 1, 0, 0, batchIdx);
+          }
+          batchIdx++;
+        }
+      }
+    }
+
     pass.end();
     this.device.queue.submit([encoder.finish()]);
 
@@ -1565,6 +1619,7 @@ export class WebGpuRenderer implements RendererPort {
     this.sceneBindGroup = null;
     this.opaquePipeline = null;
     this.transparentPipeline = null;
+    this.ghostPipeline = null;
     this.pickPipeline = null;
   }
 
