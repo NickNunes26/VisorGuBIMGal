@@ -10,6 +10,18 @@ export type ViewPreset = 'iso' | 'top' | 'front' | 'side';
  */
 export type ElementDisplay = 'default' | 'visible' | 'ghost' | 'hidden';
 
+/**
+ * One half-space of a section, in absolute model coordinates (metres, IFC Z-up): it keeps the
+ * points p with dot(normal, p) <= offset and cuts away the side the normal points to.
+ */
+export interface SectionPlane {
+  normal: readonly [number, number, number];
+  offset: number;
+}
+
+/** A section box takes six planes; no more are drawn. */
+export const MAX_SECTION_PLANES = 6;
+
 export interface RendererEventHandlers {
   onSelect?: (ref: ElementRef | null) => void;
   onHover?: (ref: ElementRef | null) => void;
@@ -43,6 +55,11 @@ export interface RendererPort {
     entries: ReadonlyMap<number, ElementDisplay>
   ): void;
   setSelection(ref: ElementRef | null): void;
+  /**
+   * Cuts every model: only points that all planes keep are drawn or picked, ghosts included.
+   * An empty list removes the section. Planes past MAX_SECTION_PLANES are ignored.
+   */
+  setSectionPlanes(planes: readonly SectionPlane[]): void;
 
   setViewPreset(preset: ViewPreset): void;
   fitToView(): void;

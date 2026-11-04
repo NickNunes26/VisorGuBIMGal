@@ -6,15 +6,18 @@ import {
   findBatchError,
   type GeometryBatch
 } from '../../domain/kernel/GeometryBatch';
-import type {
-  ElementDisplay,
-  RendererEventHandlers,
-  RendererPort,
-  ViewPreset
+import {
+  MAX_SECTION_PLANES,
+  type ElementDisplay,
+  type RendererEventHandlers,
+  type RendererPort,
+  type SectionPlane,
+  type ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { waitForSync } from './glSync';
+import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
   FLAG_SELECTED,
   displayFlags,
@@ -77,7 +80,18 @@ interface ProgramUniforms {
   u_recordTexture: WebGLUniformLocation | null;
   /** Main program only. */
   u_ghostPass: WebGLUniformLocation | null;
+  u_sections: WebGLUniformLocation | null;
 }
+
+// Section planes relative to the eye: a point p is kept when dot(xyz, p) <= w.
+const SECTION_GLSL = `uniform vec4 u_sections[${MAX_SECTION_PLANES}];
+
+bool sectioned(vec3 relPos) {
+  for (int i = 0; i < ${MAX_SECTION_PLANES}; i++) {
+    if (dot(u_sections[i].xyz, relPos) > u_sections[i].w) return true;
+  }
+  return false;
+}`;
 
 const VS_MAIN = `#version 300 es
 precision highp float;
@@ -100,6 +114,7 @@ uniform bool u_ghostPass;
 out vec4 v_color;
 out vec3 v_viewNormal;
 out float v_worldUpZ;
+out vec3 v_relPos;
 
 void main() {
   int recIdx = int(u_recordBase + a_recordIdx);
@@ -115,6 +130,7 @@ void main() {
     v_color = vec4(0.0);
     v_viewNormal = vec3(0.0, 0.0, 1.0);
     v_worldUpZ = 0.0;
+    v_relPos = vec3(0.0);
     return;
   }
 
@@ -123,6 +139,7 @@ void main() {
   vec4 clipPos = u_proj * viewPos;
   clipPos.z = clipPos.z * 2.0 - clipPos.w;
   gl_Position = clipPos;
+  v_relPos = relPos;
 
   v_viewNormal = (u_view * vec4(a_normal, 0.0)).xyz;
   v_worldUpZ = a_normal.z;
@@ -149,10 +166,14 @@ precision highp float;
 in vec4 v_color;
 in vec3 v_viewNormal;
 in float v_worldUpZ;
+in vec3 v_relPos;
+
+${SECTION_GLSL}
 
 out vec4 fragColor;
 
 void main() {
+  if (sectioned(v_relPos)) discard;
   float nLen = length(v_viewNormal);
   vec3 vNorm = (nLen > 1e-5) ? (v_viewNormal / nLen) : vec3(0.0, 0.0, 1.0);
 
@@ -186,6 +207,7 @@ uniform bool u_modelVisible;
 uniform usampler2D u_recordTexture;
 
 flat out uvec2 v_pickId;
+out vec3 v_relPos;
 
 void main() {
   int recIdx = int(u_recordBase + a_recordIdx);
@@ -198,6 +220,7 @@ void main() {
   if (!isVisible) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     v_pickId = uvec2(0u, 0u);
+    v_relPos = vec3(0.0);
     return;
   }
 
@@ -206,6 +229,7 @@ void main() {
   vec4 clipPos = u_proj * viewPos;
   clipPos.z = clipPos.z * 2.0 - clipPos.w;
   gl_Position = clipPos;
+  v_relPos = relPos;
 
   // rec.y is modelNumericId, rec.x is expressId
   v_pickId = uvec2(rec.y, rec.x);
@@ -217,10 +241,14 @@ precision highp float;
 precision highp int;
 
 flat in uvec2 v_pickId;
+in vec3 v_relPos;
+
+${SECTION_GLSL}
 
 out uvec4 fragPick;
 
 void main() {
+  if (sectioned(v_relPos)) discard;
   fragPick = uvec4(v_pickId.x, v_pickId.y, 0u, 1u);
 }
 `;
@@ -285,7 +313,9 @@ export class WebGl2Renderer implements RendererPort {
   private pickDepthRenderbuffer: WebGLRenderbuffer | null = null;
 
   private readonly camera = new Camera();
-  private readonly sceneUniformData = new Float32Array(32);
+  /** Projection, view, then the section planes relative to the eye. */
+  private readonly sceneUniformData = new Float32Array(32 + SECTION_FLOATS);
+  private sectionPlanes: SectionPlane[] = [];
 
   private models: Map<ModelId, ModelEntry> = new Map();
   private numToModelId: Map<number, ModelId> = new Map();
@@ -408,7 +438,8 @@ export class WebGl2Renderer implements RendererPort {
       u_recordBase: gl.getUniformLocation(this.mainProgram, 'u_recordBase'),
       u_modelVisible: gl.getUniformLocation(this.mainProgram, 'u_modelVisible'),
       u_recordTexture: gl.getUniformLocation(this.mainProgram, 'u_recordTexture'),
-      u_ghostPass: gl.getUniformLocation(this.mainProgram, 'u_ghostPass')
+      u_ghostPass: gl.getUniformLocation(this.mainProgram, 'u_ghostPass'),
+      u_sections: gl.getUniformLocation(this.mainProgram, 'u_sections')
     };
 
     this.pickProgram = createProgram(gl, VS_PICK, FS_PICK);
@@ -419,7 +450,8 @@ export class WebGl2Renderer implements RendererPort {
       u_recordBase: gl.getUniformLocation(this.pickProgram, 'u_recordBase'),
       u_modelVisible: gl.getUniformLocation(this.pickProgram, 'u_modelVisible'),
       u_recordTexture: gl.getUniformLocation(this.pickProgram, 'u_recordTexture'),
-      u_ghostPass: null
+      u_ghostPass: null,
+      u_sections: gl.getUniformLocation(this.pickProgram, 'u_sections')
     };
 
     this.recordTexHeight = 1;
@@ -887,6 +919,11 @@ export class WebGl2Renderer implements RendererPort {
     }
   }
 
+  setSectionPlanes(planes: readonly SectionPlane[]): void {
+    this.sectionPlanes = keptSectionPlanes(planes);
+    this.requestRender();
+  }
+
   /** Whether any record may be a ghost, so the ghost pass has something to draw. */
   private mayHaveGhosts(): boolean {
     for (const model of this.models.values()) {
@@ -1137,8 +1174,9 @@ export class WebGl2Renderer implements RendererPort {
       this.recordLayoutDirty = false;
     }
 
-    // 2. Write camera projection + rotation-only view matrix
+    // 2. Write camera projection + rotation-only view matrix, and the sections for this eye
     this.camera.writeUniforms(this.sceneUniformData);
+    writeSectionPlanes(this.sectionPlanes, this.camera.getEye(), this.sceneUniformData, 32);
 
     let totalBatches = 0;
     for (const model of this.models.values()) {
@@ -1176,6 +1214,7 @@ export class WebGl2Renderer implements RendererPort {
     gl.useProgram(this.mainProgram);
     gl.uniformMatrix4fv(this.mainUniforms.u_proj, false, this.sceneUniformData.subarray(0, 16));
     gl.uniformMatrix4fv(this.mainUniforms.u_view, false, this.sceneUniformData.subarray(16, 32));
+    gl.uniform4fv(this.mainUniforms.u_sections, this.sceneUniformData.subarray(32));
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.recordTexture);
@@ -1353,6 +1392,7 @@ export class WebGl2Renderer implements RendererPort {
       gl.useProgram(this.pickProgram);
       gl.uniformMatrix4fv(this.pickUniforms.u_proj, false, this.sceneUniformData.subarray(0, 16));
       gl.uniformMatrix4fv(this.pickUniforms.u_view, false, this.sceneUniformData.subarray(16, 32));
+      gl.uniform4fv(this.pickUniforms.u_sections, this.sceneUniformData.subarray(32));
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.recordTexture);

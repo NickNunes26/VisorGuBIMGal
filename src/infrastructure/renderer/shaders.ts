@@ -2,6 +2,8 @@ export const RENDERER_WGSL = /* wgsl */ `
 struct SceneUniforms {
   proj: mat4x4<f32>,
   view: mat4x4<f32>,
+  // Section planes relative to the eye: a point p is kept when dot(xyz, p) <= w.
+  sections: array<vec4<f32>, 6>,
 };
 
 struct BatchGpuData {
@@ -35,7 +37,18 @@ struct ColorVaryings {
   @location(0) color: vec4<f32>,
   @location(1) viewNormal: vec3<f32>,
   @location(2) worldUpZ: f32,
+  @location(3) relPos: vec3<f32>,
 };
+
+fn sectioned(relPos: vec3<f32>) -> bool {
+  for (var i = 0u; i < 6u; i++) {
+    let plane = scene.sections[i];
+    if (dot(plane.xyz, relPos) > plane.w) {
+      return true;
+    }
+  }
+  return false;
+}
 
 const GHOST_COLOR = vec4<f32>(0.70, 0.76, 0.84, 0.12);
 
@@ -59,6 +72,7 @@ fn shade(
     out.color = vec4<f32>(0.0);
     out.viewNormal = vec3<f32>(0.0, 0.0, 1.0);
     out.worldUpZ = 0.0;
+    out.relPos = vec3<f32>(0.0);
     return out;
   }
 
@@ -67,6 +81,7 @@ fn shade(
   out.clipPos = scene.proj * viewPos;
   out.viewNormal = (scene.view * vec4<f32>(normal, 0.0)).xyz;
   out.worldUpZ = normal.z;
+  out.relPos = relPos;
 
   let isSelected = (rec.stateFlags & 16u) != 0u;
   if (ghostPass) {
@@ -105,6 +120,9 @@ fn vs_ghost(
 
 @fragment
 fn fs_main(in: ColorVaryings) -> @location(0) vec4<f32> {
+  if (sectioned(in.relPos)) {
+    discard;
+  }
   let nLen = length(in.viewNormal);
   let vNorm = select(vec3<f32>(0.0, 0.0, 1.0), in.viewNormal / nLen, nLen > 1e-5);
 
@@ -123,6 +141,7 @@ fn fs_main(in: ColorVaryings) -> @location(0) vec4<f32> {
 struct PickVaryings {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) @interpolate(flat) pickId: vec2<u32>,
+  @location(1) relPos: vec3<f32>,
 };
 
 @vertex
@@ -142,6 +161,7 @@ fn vs_pick(
   if (!isVisible) {
     out.clipPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     out.pickId = vec2<u32>(0u, 0u);
+    out.relPos = vec3<f32>(0.0);
     return out;
   }
 
@@ -149,11 +169,15 @@ fn vs_pick(
   let viewPos = scene.view * vec4<f32>(relPos, 1.0);
   out.clipPos = scene.proj * viewPos;
   out.pickId = vec2<u32>(rec.modelNumericId, rec.expressId);
+  out.relPos = relPos;
   return out;
 }
 
 @fragment
 fn fs_pick(in: PickVaryings) -> @location(0) vec2<u32> {
+  if (sectioned(in.relPos)) {
+    discard;
+  }
   return in.pickId;
 }
 `;

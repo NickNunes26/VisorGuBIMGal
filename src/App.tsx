@@ -6,6 +6,8 @@ import { PropertiesPanel } from './ui/components/PropertiesPanel';
 import { SectionDxfPanel } from './ui/components/SectionDxfPanel';
 import { GisMapPanel } from './ui/components/GisMapPanel';
 import { DisplayBar } from './ui/components/DisplayBar';
+import { SectionBar } from './ui/components/SectionBar';
+import { NO_SECTION, sceneBounds, sectionPlanes, type SectionState } from './ui/viewer/section';
 import { BimViewer } from './ui/viewer/BimViewer';
 import {
   SHOW_ALL,
@@ -51,6 +53,12 @@ export default function App() {
   }, [displayRule, models, spatialTrees]);
 
   const ifcClasses = useMemo(() => classCounts(Object.values(spatialTrees)), [spatialTrees]);
+
+  const [section, setSection] = useState<SectionState>(NO_SECTION);
+  const bounds = useMemo(() => sceneBounds(models), [models]);
+  useEffect(() => {
+    renderer.setSectionPlanes(sectionPlanes(section, bounds));
+  }, [section, bounds]);
 
   const handleIsolate = useCallback((target: DisplayTarget) => {
     setDisplayRule((prev) => ({ ...prev, isolate: target }));
@@ -321,15 +329,18 @@ export default function App() {
           />
 
           {models.length > 0 && (
-            <DisplayBar
-              classes={ifcClasses}
-              rule={displayRule}
-              selectedRef={selectedRef}
-              onIsolate={handleIsolate}
-              onHide={handleHide}
-              onToggleGhost={() => setDisplayRule((prev) => ({ ...prev, ghost: !prev.ghost }))}
-              onShowAll={() => setDisplayRule((prev) => ({ ...SHOW_ALL, ghost: prev.ghost }))}
-            />
+            <div className="viewport-tools">
+              <DisplayBar
+                classes={ifcClasses}
+                rule={displayRule}
+                selectedRef={selectedRef}
+                onIsolate={handleIsolate}
+                onHide={handleHide}
+                onToggleGhost={() => setDisplayRule((prev) => ({ ...prev, ghost: !prev.ghost }))}
+                onShowAll={() => setDisplayRule((prev) => ({ ...SHOW_ALL, ghost: prev.ghost }))}
+              />
+              <SectionBar section={section} bounds={bounds} onChange={setSection} />
+            </div>
           )}
 
           {/* GIS Split Panel (Bottom) */}

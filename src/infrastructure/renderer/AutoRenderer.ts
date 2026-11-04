@@ -4,6 +4,7 @@ import type {
   ElementDisplay,
   RendererEventHandlers,
   RendererPort,
+  SectionPlane,
   ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { WebGpuRenderer, type RendererDebugStats } from './WebGpuRenderer';
@@ -201,6 +202,14 @@ export class AutoRenderer implements RendererPort {
       this.activeRenderer.setSelection(ref);
     } else {
       this.preInitQueue.push((r) => r.setSelection(ref));
+    }
+  }
+
+  setSectionPlanes(planes: readonly SectionPlane[]): void {
+    if (this.activeRenderer) {
+      this.activeRenderer.setSectionPlanes(planes);
+    } else {
+      this.preInitQueue.push((r) => r.setSectionPlanes(planes));
     }
   }
 

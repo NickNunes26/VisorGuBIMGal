@@ -10,11 +10,13 @@ import type {
   ElementDisplay,
   RendererEventHandlers,
   RendererPort,
+  SectionPlane,
   ViewPreset
 } from '../../domain/kernel/RendererPort';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { RENDERER_WGSL } from './shaders';
+import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
   FLAG_SELECTED,
   displayFlags,
@@ -101,7 +103,9 @@ export class WebGpuRenderer implements RendererPort {
   private idTextureView: GPUTextureView | null = null;
 
   private readonly camera = new Camera();
-  private readonly sceneUniformData = new Float32Array(32);
+  /** Projection, view, then the section planes relative to the eye. */
+  private readonly sceneUniformData = new Float32Array(32 + SECTION_FLOATS);
+  private sectionPlanes: SectionPlane[] = [];
 
   private batchCpuBuffer = new ArrayBuffer(64 * 16);
   private batchF32 = new Float32Array(this.batchCpuBuffer);
@@ -381,7 +385,7 @@ export class WebGpuRenderer implements RendererPort {
 
     this.sceneUniformBuffer = device.createBuffer({
       label: 'gubim-scene-uniforms',
-      size: 128,
+      size: this.sceneUniformData.byteLength,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
@@ -925,6 +929,11 @@ export class WebGpuRenderer implements RendererPort {
     }
   }
 
+  setSectionPlanes(planes: readonly SectionPlane[]): void {
+    this.sectionPlanes = keptSectionPlanes(planes);
+    this.requestRender();
+  }
+
   /** Whether any record may be a ghost, so the ghost pass has something to draw. */
   private mayHaveGhosts(): boolean {
     for (const model of this.models.values()) {
@@ -1137,14 +1146,16 @@ export class WebGpuRenderer implements RendererPort {
       this.recordLayoutDirty = false;
     }
 
-    // 2. Write camera projection + rotation-only view matrix
+    // 2. Write camera projection + rotation-only view matrix, and the sections for this eye
+    const eye = this.camera.getEye();
     this.camera.writeUniforms(this.sceneUniformData);
+    writeSectionPlanes(this.sectionPlanes, eye, this.sceneUniformData, 32);
     this.device.queue.writeBuffer(
       this.sceneUniformBuffer,
       0,
       this.sceneUniformData.buffer,
       0,
-      128
+      this.sceneUniformData.byteLength
     );
 
     // 3. Compute (batch.origin - camera.eye) in f64 on CPU, convert to f32, and write in ONE writeBuffer
@@ -1171,7 +1182,6 @@ export class WebGpuRenderer implements RendererPort {
       this.recreateBindGroup();
     }
 
-    const eye = this.camera.getEye();
     const eyeX = eye[0];
     const eyeY = eye[1];
     const eyeZ = eye[2];

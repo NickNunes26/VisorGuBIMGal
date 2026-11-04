@@ -309,12 +309,20 @@ canvas.bim-viewport {
   z-index: 10;
 }
 
-/* Isolate, hide and ghost controls, top left of the viewport */
-.display-bar {
+/* Isolate, hide and ghost controls, then the 3D section, top left of the viewport */
+.viewport-tools {
   position: absolute;
   top: 12px;
   left: 12px;
-  max-width: 250px;
+  width: 250px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 10;
+}
+
+.display-bar,
+.section-bar {
   background-color: rgba(15, 23, 42, 0.85);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -324,7 +332,32 @@ canvas.bim-viewport {
   flex-direction: column;
   gap: 2px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-  z-index: 10;
+}
+
+.section-slider {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent-color);
+}
+
+.section-value {
+  width: 64px;
+  font-size: 11px;
+  text-align: right;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.section-axis-label {
+  width: 14px;
+  padding-left: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.section-bar .btn.active {
+  color: var(--accent-color);
+  background-color: rgba(56, 189, 248, 0.15);
 }
 
 .display-bar-row {
