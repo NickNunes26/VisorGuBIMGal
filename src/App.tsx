@@ -14,7 +14,7 @@ import type {
   ModelRecord,
   SelectedElementDetails
 } from './domain/models/ModelRecord';
-import type { SpatialTree } from './domain/kernel/KernelPort';
+import type { KernelDiagnostic, SpatialTree } from './domain/kernel/KernelPort';
 import { kernel, renderer } from './infrastructure/composition';
 import { leafletService } from './infrastructure/gis/LeafletService';
 
@@ -65,6 +65,7 @@ export default function App() {
 
         let meshCount = 0;
         let bounds: ModelBounds | undefined;
+        let streamDiagnostics: KernelDiagnostic[] = [];
         let completed = false;
 
         for await (const event of kernel.streamGeometry(modelId)) {
@@ -76,6 +77,7 @@ export default function App() {
             completed = true;
             meshCount = event.meshCount;
             bounds = event.bounds;
+            streamDiagnostics = event.diagnostics;
           }
         }
 
@@ -104,7 +106,8 @@ export default function App() {
           elementCount: summary.elementCount,
           meshCount,
           coordinateReference: summary.coordinateReference,
-          bounds
+          bounds,
+          diagnostics: [...summary.diagnostics, ...streamDiagnostics]
         };
 
         setModels((prev) => [...prev, newModel]);
@@ -256,6 +259,7 @@ export default function App() {
                 onToggleVisibility={handleToggleVisibility}
                 onRemoveModel={handleRemoveModel}
                 onLocateOnGis={handleLocateOnGis}
+                onSelectElement={(ref) => void handleSelectElement(ref)}
               />
             ) : (
               <SpatialTreePanel

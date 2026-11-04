@@ -1,12 +1,14 @@
 import React from 'react';
 import { Eye, EyeOff, Trash2, Globe, Layers, AlertCircle } from 'lucide-react';
-import type { ModelRecord, ModelId } from '../../domain/models/ModelRecord';
+import type { ElementRef, ModelRecord, ModelId } from '../../domain/models/ModelRecord';
+import { ModelDiagnostics } from './ModelDiagnostics';
 
 interface ModelsPanelProps {
   models: ModelRecord[];
   onToggleVisibility: (id: ModelId) => void;
   onRemoveModel: (id: ModelId) => void;
   onLocateOnGis: (model: ModelRecord) => void;
+  onSelectElement: (ref: ElementRef) => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -21,7 +23,8 @@ export const ModelsPanel: React.FC<ModelsPanelProps> = ({
   models,
   onToggleVisibility,
   onRemoveModel,
-  onLocateOnGis
+  onLocateOnGis,
+  onSelectElement
 }) => {
   if (models.length === 0) {
     return (
@@ -97,6 +100,14 @@ export const ModelsPanel: React.FC<ModelsPanelProps> = ({
               <AlertCircle size={12} />
               <span>{model.errorMessage}</span>
             </div>
+          )}
+
+          {model.diagnostics && (
+            <ModelDiagnostics
+              modelId={model.id}
+              diagnostics={model.diagnostics}
+              onSelectElement={onSelectElement}
+            />
           )}
         </div>
       ))}

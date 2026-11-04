@@ -378,6 +378,70 @@ canvas.bim-viewport {
   font-family: var(--font-mono);
 }
 
+/* Load diagnostics in a model card */
+.model-diagnostics {
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.model-diagnostics-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.model-diagnostics-toggle:hover {
+  color: var(--text-main);
+}
+
+.model-diagnostics-group {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-color);
+}
+
+.model-diagnostics-code {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  margin-bottom: 2px;
+}
+
+.model-diagnostics-item {
+  display: flex;
+  gap: 6px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.model-diagnostics-element {
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent-color);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.model-diagnostics-element:hover {
+  text-decoration: underline;
+}
+
+.model-diagnostics-more {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* Property Set Card */
 .pset-card {
   background-color: rgba(15, 23, 42, 0.4);

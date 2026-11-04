@@ -1,3 +1,5 @@
+import type { KernelDiagnostic } from '../kernel/KernelPort';
+
 export type ModelId = string;
 
 export interface CoordinateReference {
@@ -34,6 +36,8 @@ export interface ModelRecord {
   coordinateReference?: CoordinateReference;
   errorMessage?: string;
   bounds?: ModelBounds;
+  /** From opening the model and from its geometry stream, in that order. */
+  diagnostics?: KernelDiagnostic[];
 }
 
 export interface ElementRef {
