@@ -16,6 +16,8 @@ import { RENDERER_WGSL } from './shaders';
 
 const FLAG_VISIBLE = 8;
 const FLAG_SELECTED = 16;
+/** Geometry uploaded per frame; a batch is never split, so one always goes. */
+const UPLOAD_BYTES_PER_FRAME = 2 * 1024 * 1024;
 
 interface GpuBatchEntry {
   origin: readonly [number, number, number];
@@ -115,6 +117,8 @@ export class WebGpuRenderer implements RendererPort {
   private nextModelNumericId = 1;
 
   private preInitQueue: PreInitOp[] = [];
+  /** Batches waiting for a frame: uploading each as it arrives can hold the GPU process up. */
+  private uploadQueue: GeometryBatch[] = [];
   private pendingFinishBounds: Map<ModelId, ModelBounds | undefined> = new Map();
 
   private selectedRef: ElementRef | null = null;
@@ -613,8 +617,19 @@ export class WebGpuRenderer implements RendererPort {
       this.preInitQueue.push({ kind: 'batch', batch });
       return;
     }
-    this.uploadBatchInternal(batch);
+    this.uploadQueue.push(batch);
     this.requestRender();
+  }
+
+  /** Uploads queued batches up to the frame's budget, and asks for another frame if some are left. */
+  private uploadQueuedBatches(): void {
+    let bytes = 0;
+    while (this.uploadQueue.length > 0 && bytes < UPLOAD_BYTES_PER_FRAME) {
+      const batch = this.uploadQueue.shift()!;
+      this.uploadBatchInternal(batch);
+      bytes += batch.positions.byteLength + batch.normals.byteLength + batch.indices.byteLength;
+    }
+    if (this.uploadQueue.length > 0) this.requestRender();
   }
 
   private uploadBatchInternal(batch: GeometryBatch): void {
@@ -851,6 +866,7 @@ export class WebGpuRenderer implements RendererPort {
     this.preInitQueue = this.preInitQueue.filter(
       (op) => !(op.kind === 'batch' && op.batch.modelId === modelId)
     );
+    this.uploadQueue = this.uploadQueue.filter((batch) => batch.modelId !== modelId);
     this.pendingFinishBounds.delete(modelId);
 
     const model = this.models.get(modelId);
@@ -1231,6 +1247,7 @@ export class WebGpuRenderer implements RendererPort {
     }
 
     const t0 = performance.now();
+    this.uploadQueuedBatches();
     this.updateGpuSceneTables();
 
     const colorView = this.context.getCurrentTexture().createView();
@@ -1555,6 +1572,7 @@ export class WebGpuRenderer implements RendererPort {
     this.isDestroyed = true;
     this.initGeneration++;
     this.preInitQueue.length = 0;
+    this.uploadQueue.length = 0;
     this.pendingFinishBounds.clear();
     this.hasFramedInitialModel = false;
     this.releaseGpuDeviceAndListeners();
