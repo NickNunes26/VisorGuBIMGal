@@ -24,7 +24,13 @@ export const MeshFlag = {
   /** Kernel could not evaluate it fully (a void was not cut, say). The 'complete' event names it. */
   Degraded: 1 << 1,
   /** Pickable, but starts hidden. Only IfcSpace today. Left out of 'complete' bounds. */
-  HiddenByDefault: 1 << 2
+  HiddenByDefault: 1 << 2,
+  /**
+   * The mesh is closed and winds outward: every side is shared by two of its triangles running
+   * opposite ways, and every connected part encloses a positive volume. Seen from outside, its
+   * back faces never show, so renderers may cull them. Pieces of a split mesh keep it.
+   */
+  Closed: 1 << 3
 } as const;
 
 /** Largest vertex distance from a batch origin, in metres. f32 keeps about 0.5 mm here. */

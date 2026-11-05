@@ -2,7 +2,6 @@ import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/Model
 import {
   MESH_RECORD_WORDS,
   MeshField,
-  MeshFlag,
   findBatchError,
   type GeometryBatch
 } from '../../domain/kernel/GeometryBatch';
@@ -22,6 +21,7 @@ import { canvasPoint, canvasRay } from './canvasView';
 import { boxMayShow, markBatchesInView, pixelWindow } from './frustum';
 import { chooseDepthMode, withDepthMode, type DepthMode } from './glDepth';
 import { waitForSync } from './glSync';
+import { groupIndices } from './indexGroups';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
   FLAG_SELECTED,
@@ -46,6 +46,8 @@ interface GlBatchEntry {
   recordOffsetInModel: number;
   recordCount: number;
   opaqueIndexCount: number;
+  /** The first of the opaque indices, which belong to closed meshes: see `groupIndices`. */
+  closedIndexCount: number;
   transparentIndexCount: number;
   positionBuffer: WebGLBuffer;
   normalBuffer: WebGLBuffer;
@@ -749,9 +751,6 @@ export class WebGl2Renderer implements RendererPort {
     const recordOffsetInModel = model.recordWords.length / 4;
     const localRecordIndexArray = new Uint32Array(vertexCount);
 
-    let opaqueIndexCount = 0;
-    let transparentIndexCount = 0;
-
     const ox = origin[0];
     const oy = origin[1];
     const oz = origin[2];
@@ -761,18 +760,10 @@ export class WebGl2Renderer implements RendererPort {
       const expressId = meshTable[base + MeshField.expressId] >>> 0;
       const firstVertex = meshTable[base + MeshField.firstVertex] >>> 0;
       const vCount = meshTable[base + MeshField.vertexCount] >>> 0;
-      const iCount = meshTable[base + MeshField.indexCount] >>> 0;
       const rgba = meshTable[base + MeshField.rgba] >>> 0;
       const rawFlags = meshTable[base + MeshField.flags] >>> 0;
 
       localRecordIndexArray.fill(r, firstVertex, firstVertex + vCount);
-
-      const isTransparent = (rawFlags & MeshFlag.Transparent) !== 0 || (rgba & 0xff) < 255;
-      if (isTransparent) {
-        transparentIndexCount += iCount;
-      } else {
-        opaqueIndexCount += iCount;
-      }
 
       const isSelected =
         this.selectedRef !== null &&
@@ -816,57 +807,18 @@ export class WebGl2Renderer implements RendererPort {
     gl.bindBuffer(gl.ARRAY_BUFFER, recordIndexBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, localRecordIndexArray, gl.STATIC_DRAW);
 
-    let opaqueIndexBuffer: WebGLBuffer | null = null;
-    let transparentIndexBuffer: WebGLBuffer | null = null;
-    let indexGpuBytes = 0;
-
-    if (transparentIndexCount === 0) {
-      opaqueIndexBuffer = gl.createBuffer();
-      if (!opaqueIndexBuffer) throw new Error('Error al crear buffer de índices opacos WebGL2');
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, opaqueIndexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-      indexGpuBytes += indices.byteLength;
-    } else if (opaqueIndexCount === 0) {
-      transparentIndexBuffer = gl.createBuffer();
-      if (!transparentIndexBuffer) throw new Error('Error al crear buffer de índices transparentes WebGL2');
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, transparentIndexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-      indexGpuBytes += indices.byteLength;
-    } else {
-      const opaqueIndices = new Uint32Array(opaqueIndexCount);
-      const transparentIndices = new Uint32Array(transparentIndexCount);
-      let opCursor = 0;
-      let trCursor = 0;
-
-      for (let r = 0; r < recordCount; r++) {
-        const base = r * MESH_RECORD_WORDS;
-        const firstIndex = meshTable[base + MeshField.firstIndex] >>> 0;
-        const iCount = meshTable[base + MeshField.indexCount] >>> 0;
-        const rgba = meshTable[base + MeshField.rgba] >>> 0;
-        const rawFlags = meshTable[base + MeshField.flags] >>> 0;
-        const isTransparent = (rawFlags & MeshFlag.Transparent) !== 0 || (rgba & 0xff) < 255;
-
-        if (isTransparent) {
-          transparentIndices.set(indices.subarray(firstIndex, firstIndex + iCount), trCursor);
-          trCursor += iCount;
-        } else {
-          opaqueIndices.set(indices.subarray(firstIndex, firstIndex + iCount), opCursor);
-          opCursor += iCount;
-        }
-      }
-
-      opaqueIndexBuffer = gl.createBuffer();
-      if (!opaqueIndexBuffer) throw new Error('Error al crear buffer de índices opacos WebGL2');
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, opaqueIndexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, opaqueIndices, gl.STATIC_DRAW);
-      indexGpuBytes += opaqueIndices.byteLength;
-
-      transparentIndexBuffer = gl.createBuffer();
-      if (!transparentIndexBuffer) throw new Error('Error al crear buffer de índices transparentes WebGL2');
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, transparentIndexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, transparentIndices, gl.STATIC_DRAW);
-      indexGpuBytes += transparentIndices.byteLength;
-    }
+    const groups = groupIndices(indices, meshTable);
+    const indexBuffer = (values: Uint32Array, what: string): WebGLBuffer | null => {
+      if (values.length === 0) return null;
+      const buffer = gl.createBuffer();
+      if (!buffer) throw new Error(`Error al crear buffer de índices ${what} WebGL2`);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, values, gl.STATIC_DRAW);
+      return buffer;
+    };
+    const opaqueIndexBuffer = indexBuffer(groups.opaque, 'opacos');
+    const transparentIndexBuffer = indexBuffer(groups.transparent, 'transparentes');
+    const indexGpuBytes = groups.opaque.byteLength + groups.transparent.byteLength;
 
     const gpuBytes = posByteLen + normByteLen + recIdxByteLen + indexGpuBytes;
 
@@ -878,8 +830,9 @@ export class WebGl2Renderer implements RendererPort {
       inView: true,
       recordOffsetInModel,
       recordCount,
-      opaqueIndexCount,
-      transparentIndexCount,
+      opaqueIndexCount: groups.opaque.length,
+      closedIndexCount: groups.closedCount,
+      transparentIndexCount: groups.transparent.length,
       positionBuffer,
       normalBuffer,
       recordIndexBuffer,
@@ -1353,8 +1306,7 @@ export class WebGl2Renderer implements RendererPort {
           gl.bindBuffer(gl.ARRAY_BUFFER, batch.recordIndexBuffer);
           gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 0, 0);
 
-          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.opaqueIndexBuffer);
-          gl.drawElements(gl.TRIANGLES, batch.opaqueIndexCount, gl.UNSIGNED_INT, 0);
+          this.drawOpaque(gl, batch);
         }
       }
     }
@@ -1478,6 +1430,26 @@ export class WebGl2Renderer implements RendererPort {
     return this.canvas && this.gl ? canvasPoint(this.camera, this.canvas, point) : null;
   }
 
+  /**
+   * Draws a batch's opaque indices, its vertex attributes already set: those of closed meshes
+   * without their back faces, which never show from outside them, and the rest whole. A section
+   * plane may open a closed mesh up, so while one is set every index is drawn whole. Leaves face
+   * culling off.
+   */
+  private drawOpaque(gl: WebGL2RenderingContext, batch: GlBatchEntry): void {
+    if (batch.opaqueIndexCount === 0 || !batch.opaqueIndexBuffer) return;
+    const culled = this.sectionPlanes.length === 0 ? batch.closedIndexCount : 0;
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.opaqueIndexBuffer);
+    if (culled > 0) {
+      gl.enable(gl.CULL_FACE);
+      gl.drawElements(gl.TRIANGLES, culled, gl.UNSIGNED_INT, 0);
+      gl.disable(gl.CULL_FACE);
+    }
+    if (batch.opaqueIndexCount > culled) {
+      gl.drawElements(gl.TRIANGLES, batch.opaqueIndexCount - culled, gl.UNSIGNED_INT, culled * 4);
+    }
+  }
+
   private async pickOnce(cssX: number, cssY: number): Promise<ElementRef | null> {
     if (
       this.isDestroyed ||
@@ -1559,10 +1531,8 @@ export class WebGl2Renderer implements RendererPort {
           gl.bindBuffer(gl.ARRAY_BUFFER, batch.recordIndexBuffer);
           gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 0, 0);
 
-          if (batch.opaqueIndexCount > 0 && batch.opaqueIndexBuffer) {
-            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.opaqueIndexBuffer);
-            gl.drawElements(gl.TRIANGLES, batch.opaqueIndexCount, gl.UNSIGNED_INT, 0);
-          }
+          // Picking culls what drawing culls, so a click finds what shows.
+          this.drawOpaque(gl, batch);
           if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.transparentIndexBuffer);
             gl.drawElements(gl.TRIANGLES, batch.transparentIndexCount, gl.UNSIGNED_INT, 0);

@@ -2,7 +2,6 @@ import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/Model
 import {
   MESH_RECORD_WORDS,
   MeshField,
-  MeshFlag,
   findBatchError,
   type GeometryBatch
 } from '../../domain/kernel/GeometryBatch';
@@ -19,6 +18,7 @@ import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { canvasPoint, canvasRay } from './canvasView';
 import { boxMayShow, markBatchesInView, pixelWindow } from './frustum';
+import { groupIndices } from './indexGroups';
 import { RENDERER_WGSL } from './shaders';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
@@ -41,6 +41,8 @@ interface GpuBatchEntry {
   recordOffsetInModel: number;
   recordCount: number;
   opaqueIndexCount: number;
+  /** The first of the opaque indices, which belong to closed meshes: see `groupIndices`. */
+  closedIndexCount: number;
   transparentIndexCount: number;
   positionBuffer: GPUBuffer;
   normalBuffer: GPUBuffer;
@@ -102,6 +104,8 @@ export class WebGpuRenderer implements RendererPort {
   private transparentPipeline: GPURenderPipeline | null = null;
   private ghostPipeline: GPURenderPipeline | null = null;
   private pickPipeline: GPURenderPipeline | null = null;
+  private closedPipeline: GPURenderPipeline | null = null;
+  private closedPickPipeline: GPURenderPipeline | null = null;
 
   private sceneUniformBuffer: GPUBuffer | null = null;
   private batchGpuBuffer: GPUBuffer | null = null;
@@ -308,29 +312,33 @@ export class WebGpuRenderer implements RendererPort {
       }
     ];
 
-    this.opaquePipeline = device.createRenderPipeline({
-      label: 'gubim-opaque-pipeline',
-      layout: pipelineLayout,
-      vertex: {
-        module: shaderModule,
-        entryPoint: 'vs_main',
-        buffers: vertexBuffers
-      },
-      fragment: {
-        module: shaderModule,
-        entryPoint: 'fs_main',
-        targets: [{ format: this.canvasFormat }]
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'none'
-      },
-      depthStencil: {
-        format: 'depth32float',
-        depthWriteEnabled: true,
-        depthCompare: 'greater'
-      }
-    });
+    // Closed meshes draw without their back faces, which never show from outside them.
+    const opaquePipeline = (label: string, cullMode: 'none' | 'back'): GPURenderPipeline =>
+      device.createRenderPipeline({
+        label,
+        layout: pipelineLayout,
+        vertex: {
+          module: shaderModule,
+          entryPoint: 'vs_main',
+          buffers: vertexBuffers
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fs_main',
+          targets: [{ format: this.canvasFormat }]
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode
+        },
+        depthStencil: {
+          format: 'depth32float',
+          depthWriteEnabled: true,
+          depthCompare: 'greater'
+        }
+      });
+    this.opaquePipeline = opaquePipeline('gubim-opaque-pipeline', 'none');
+    this.closedPipeline = opaquePipeline('gubim-closed-pipeline', 'back');
 
     // Transparent elements and ghosts blend over the opaque pass without writing depth.
     const blendedPipeline = (label: string, vertexEntryPoint: string): GPURenderPipeline =>
@@ -376,29 +384,33 @@ export class WebGpuRenderer implements RendererPort {
     this.transparentPipeline = blendedPipeline('gubim-transparent-pipeline', 'vs_main');
     this.ghostPipeline = blendedPipeline('gubim-ghost-pipeline', 'vs_ghost');
 
-    this.pickPipeline = device.createRenderPipeline({
-      label: 'gubim-pick-pipeline',
-      layout: pipelineLayout,
-      vertex: {
-        module: shaderModule,
-        entryPoint: 'vs_pick',
-        buffers: vertexBuffers
-      },
-      fragment: {
-        module: shaderModule,
-        entryPoint: 'fs_pick',
-        targets: [{ format: 'rg32uint' }]
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'none'
-      },
-      depthStencil: {
-        format: 'depth32float',
-        depthWriteEnabled: true,
-        depthCompare: 'greater'
-      }
-    });
+    // Picking culls what drawing culls, so a click finds what shows.
+    const pickPipeline = (label: string, cullMode: 'none' | 'back'): GPURenderPipeline =>
+      device.createRenderPipeline({
+        label,
+        layout: pipelineLayout,
+        vertex: {
+          module: shaderModule,
+          entryPoint: 'vs_pick',
+          buffers: vertexBuffers
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fs_pick',
+          targets: [{ format: 'rg32uint' }]
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode
+        },
+        depthStencil: {
+          format: 'depth32float',
+          depthWriteEnabled: true,
+          depthCompare: 'greater'
+        }
+      });
+    this.pickPipeline = pickPipeline('gubim-pick-pipeline', 'none');
+    this.closedPickPipeline = pickPipeline('gubim-closed-pick-pipeline', 'back');
 
     this.sceneUniformBuffer = device.createBuffer({
       label: 'gubim-scene-uniforms',
@@ -620,9 +632,6 @@ export class WebGpuRenderer implements RendererPort {
     const recordOffsetInModel = model.recordWords.length / 4;
     const localRecordIndexArray = new Uint32Array(vertexCount);
 
-    let opaqueIndexCount = 0;
-    let transparentIndexCount = 0;
-
     const ox = origin[0];
     const oy = origin[1];
     const oz = origin[2];
@@ -632,18 +641,10 @@ export class WebGpuRenderer implements RendererPort {
       const expressId = meshTable[base + MeshField.expressId] >>> 0;
       const firstVertex = meshTable[base + MeshField.firstVertex] >>> 0;
       const vCount = meshTable[base + MeshField.vertexCount] >>> 0;
-      const iCount = meshTable[base + MeshField.indexCount] >>> 0;
       const rgba = meshTable[base + MeshField.rgba] >>> 0;
       const rawFlags = meshTable[base + MeshField.flags] >>> 0;
 
       localRecordIndexArray.fill(r, firstVertex, firstVertex + vCount);
-
-      const isTransparent = (rawFlags & MeshFlag.Transparent) !== 0 || (rgba & 0xff) < 255;
-      if (isTransparent) {
-        transparentIndexCount += iCount;
-      } else {
-        opaqueIndexCount += iCount;
-      }
 
       const isSelected =
         this.selectedRef !== null &&
@@ -706,79 +707,19 @@ export class WebGpuRenderer implements RendererPort {
       localRecordIndexArray.byteLength
     );
 
-    let opaqueIndexBuffer: GPUBuffer | null = null;
-    let transparentIndexBuffer: GPUBuffer | null = null;
-    let indexGpuBytes = 0;
-
-    if (transparentIndexCount === 0) {
-      opaqueIndexBuffer = this.device.createBuffer({
-        size: Math.max(4, indices.byteLength),
+    const groups = groupIndices(indices, meshTable);
+    const indexBuffer = (values: Uint32Array): GPUBuffer | null => {
+      if (values.length === 0 || !this.device) return null;
+      const buffer = this.device.createBuffer({
+        size: values.byteLength,
         usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
       });
-      this.device.queue.writeBuffer(
-        opaqueIndexBuffer,
-        0,
-        indices.buffer,
-        indices.byteOffset,
-        indices.byteLength
-      );
-      indexGpuBytes += opaqueIndexBuffer.size;
-    } else if (opaqueIndexCount === 0) {
-      transparentIndexBuffer = this.device.createBuffer({
-        size: Math.max(4, indices.byteLength),
-        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
-      });
-      this.device.queue.writeBuffer(
-        transparentIndexBuffer,
-        0,
-        indices.buffer,
-        indices.byteOffset,
-        indices.byteLength
-      );
-      indexGpuBytes += transparentIndexBuffer.size;
-    } else {
-      const opaqueIndices = new Uint32Array(opaqueIndexCount);
-      const transparentIndices = new Uint32Array(transparentIndexCount);
-      let opCursor = 0;
-      let trCursor = 0;
-
-      for (let r = 0; r < recordCount; r++) {
-        const base = r * MESH_RECORD_WORDS;
-        const firstIndex = meshTable[base + MeshField.firstIndex] >>> 0;
-        const iCount = meshTable[base + MeshField.indexCount] >>> 0;
-        const rgba = meshTable[base + MeshField.rgba] >>> 0;
-        const rawFlags = meshTable[base + MeshField.flags] >>> 0;
-        const isTransparent = (rawFlags & MeshFlag.Transparent) !== 0 || (rgba & 0xff) < 255;
-
-        if (isTransparent) {
-          transparentIndices.set(indices.subarray(firstIndex, firstIndex + iCount), trCursor);
-          trCursor += iCount;
-        } else {
-          opaqueIndices.set(indices.subarray(firstIndex, firstIndex + iCount), opCursor);
-          opCursor += iCount;
-        }
-      }
-
-      opaqueIndexBuffer = this.device.createBuffer({
-        size: Math.max(4, opaqueIndices.byteLength),
-        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
-      });
-      this.device.queue.writeBuffer(opaqueIndexBuffer, 0, opaqueIndices.buffer, 0, opaqueIndices.byteLength);
-      indexGpuBytes += opaqueIndexBuffer.size;
-
-      transparentIndexBuffer = this.device.createBuffer({
-        size: Math.max(4, transparentIndices.byteLength),
-        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
-      });
-      this.device.queue.writeBuffer(
-        transparentIndexBuffer,
-        0,
-        transparentIndices.buffer,
-        0,
-        transparentIndices.byteLength
-      );
-      indexGpuBytes += transparentIndexBuffer.size;
-    }
+      this.device.queue.writeBuffer(buffer, 0, values.buffer, values.byteOffset, values.byteLength);
+      return buffer;
+    };
+    const opaqueIndexBuffer = indexBuffer(groups.opaque);
+    const transparentIndexBuffer = indexBuffer(groups.transparent);
+    const indexGpuBytes = (opaqueIndexBuffer?.size ?? 0) + (transparentIndexBuffer?.size ?? 0);
 
     const gpuBytes = positionBuffer.size + normalBuffer.size + recordIndexBuffer.size + indexGpuBytes;
 
@@ -790,8 +731,9 @@ export class WebGpuRenderer implements RendererPort {
       inView: true,
       recordOffsetInModel,
       recordCount,
-      opaqueIndexCount,
-      transparentIndexCount,
+      opaqueIndexCount: groups.opaque.length,
+      closedIndexCount: groups.closedCount,
+      transparentIndexCount: groups.transparent.length,
       positionBuffer,
       normalBuffer,
       recordIndexBuffer,
@@ -1243,6 +1185,7 @@ export class WebGpuRenderer implements RendererPort {
       !this.device ||
       !this.context ||
       !this.opaquePipeline ||
+      !this.closedPipeline ||
       !this.transparentPipeline ||
       !this.sceneBindGroup ||
       !this.depthTextureView
@@ -1279,7 +1222,6 @@ export class WebGpuRenderer implements RendererPort {
     pass.setBindGroup(0, this.sceneBindGroup);
 
     // Pass 1: Opaque geometry
-    pass.setPipeline(this.opaquePipeline);
     let batchIdx = 0;
     let hasTransparent = false;
 
@@ -1300,8 +1242,7 @@ export class WebGpuRenderer implements RendererPort {
           pass.setVertexBuffer(0, batch.positionBuffer);
           pass.setVertexBuffer(1, batch.normalBuffer);
           pass.setVertexBuffer(2, batch.recordIndexBuffer);
-          pass.setIndexBuffer(batch.opaqueIndexBuffer, 'uint32');
-          pass.drawIndexed(batch.opaqueIndexCount, 1, 0, 0, batchIdx);
+          this.drawOpaque(pass, batch, batchIdx, this.closedPipeline, this.opaquePipeline);
         }
         batchIdx++;
       }
@@ -1367,6 +1308,31 @@ export class WebGpuRenderer implements RendererPort {
     this.handlers.onFrame?.();
   }
 
+  /**
+   * Draws a batch's opaque indices, its vertex buffers already set: those of closed meshes
+   * through `closed`, which culls back faces, and the rest through `open`. A section plane may
+   * open a closed mesh up, so while one is set every index goes through `open`.
+   */
+  private drawOpaque(
+    pass: GPURenderPassEncoder,
+    batch: GpuBatchEntry,
+    batchIdx: number,
+    closed: GPURenderPipeline,
+    open: GPURenderPipeline
+  ): void {
+    if (batch.opaqueIndexCount === 0 || !batch.opaqueIndexBuffer) return;
+    const culled = this.sectionPlanes.length === 0 ? batch.closedIndexCount : 0;
+    pass.setIndexBuffer(batch.opaqueIndexBuffer, 'uint32');
+    if (culled > 0) {
+      pass.setPipeline(closed);
+      pass.drawIndexed(culled, 1, 0, 0, batchIdx);
+    }
+    if (batch.opaqueIndexCount > culled) {
+      pass.setPipeline(open);
+      pass.drawIndexed(batch.opaqueIndexCount - culled, 1, culled, 0, batchIdx);
+    }
+  }
+
   /** One at a time, in order: each waits for the last to read back. */
   pick(cssX: number, cssY: number): Promise<ElementRef | null> {
     const result = this.pickQueue.then(() => this.pickOnce(cssX, cssY));
@@ -1402,6 +1368,7 @@ export class WebGpuRenderer implements RendererPort {
       !this.device ||
       !this.canvas ||
       !this.pickPipeline ||
+      !this.closedPickPipeline ||
       !this.sceneBindGroup ||
       !this.idTexture ||
       !this.idTextureView ||
@@ -1441,7 +1408,6 @@ export class WebGpuRenderer implements RendererPort {
       });
 
       pass.setScissorRect(px, py, 1, 1);
-      pass.setPipeline(this.pickPipeline);
       pass.setBindGroup(0, this.sceneBindGroup);
 
       // Only batches whose box reaches the pixel can draw in it.
@@ -1463,11 +1429,9 @@ export class WebGpuRenderer implements RendererPort {
           pass.setVertexBuffer(0, batch.positionBuffer);
           pass.setVertexBuffer(1, batch.normalBuffer);
           pass.setVertexBuffer(2, batch.recordIndexBuffer);
-          if (batch.opaqueIndexCount > 0 && batch.opaqueIndexBuffer) {
-            pass.setIndexBuffer(batch.opaqueIndexBuffer, 'uint32');
-            pass.drawIndexed(batch.opaqueIndexCount, 1, 0, 0, batchIdx);
-          }
+          this.drawOpaque(pass, batch, batchIdx, this.closedPickPipeline, this.pickPipeline);
           if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+            pass.setPipeline(this.pickPipeline);
             pass.setIndexBuffer(batch.transparentIndexBuffer, 'uint32');
             pass.drawIndexed(batch.transparentIndexCount, 1, 0, 0, batchIdx);
           }
@@ -1642,6 +1606,8 @@ export class WebGpuRenderer implements RendererPort {
     this.transparentPipeline = null;
     this.ghostPipeline = null;
     this.pickPipeline = null;
+    this.closedPipeline = null;
+    this.closedPickPipeline = null;
   }
 
   destroy(): void {

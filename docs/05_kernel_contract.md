@@ -1,6 +1,6 @@
 # 05 — Contrato del Kernel y del Renderizador
 
-**Estado:** v1, revisión 7: la revisión 6 con la caja de cada lote (`box`, sección 3, T-116). La revisión 6 era la revisión 5, que recogía la revisión de DeepSeek a la revisión 4, con dos aclaraciones de redacción de la sección 6 tras la revisión de Gemini. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
+**Estado:** v1, revisión 8: la revisión 7 con la bandera `Closed` de las mallas cerradas (sección 3, T-118). La revisión 7 era la revisión 6 con la caja de cada lote (`box`, sección 3, T-116). La revisión 6 era la revisión 5, que recogía la revisión de DeepSeek a la revisión 4, con dos aclaraciones de redacción de la sección 6 tras la revisión de Gemini. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
 **Propósito:** Fuente única de los límites entre kernel, renderizador y aplicación.  
 **Código normativo:** [`src/domain/kernel/`](../src/domain/kernel/), [`DrawingTypes.ts`](../src/domain/drawings/DrawingTypes.ts) y [`ModelRecord.ts`](../src/domain/models/ModelRecord.ts). Si este documento y los tipos discrepan, es un error que debe corregirse.
 
@@ -111,7 +111,7 @@ Definidos en `GeometryBatch.ts`.
 
 - `rgba` es `0xRRGGBBAA`, sRGB sin premultiplicar.
 - Un elemento puede tener varios registros, en el mismo lote salvo que supere `MAX_BATCH_RADIUS` y se reparta en piezas (sección 2). El renderizador reúne los registros de un elemento por `expressId`, estén en el lote que estén. Cada índice de un registro apunta dentro de su rango de vértices.
-- **Orientación:** los triángulos son antihorarios vistos desde el lado de su normal, y la normal se calcula de ese orden. En un sólido cerrado, ese lado es el exterior. Una malla abierta no garantiza nada, así que el renderizador dibuja las dos caras.
+- **Orientación:** los triángulos son antihorarios vistos desde el lado de su normal, y la normal se calcula de ese orden. En un sólido cerrado, ese lado es el exterior. Una malla abierta no garantiza nada, así que el renderizador dibuja las dos caras. Solo de las mallas marcadas `Closed` puede omitir las caras traseras, y no mientras haya un plano de corte, que abre los sólidos.
 - **Banderas**, los bits sin definir valen 0:
 
 | Bit | Nombre | Significado |
@@ -119,6 +119,7 @@ Definidos en `GeometryBatch.ts`.
 | 0 | `Transparent` | `rgba` tiene alfa menor que 255, exactamente |
 | 1 | `Degraded` | Se evaluó solo en parte. Hay un diagnóstico con su `expressId` en `complete.diagnostics` |
 | 2 | `HiddenByDefault` | Seleccionable, pero empieza oculto. Hoy solo `IfcSpace`; añadir tipos no rompe el contrato, y esos tipos también quedan fuera de los planos (sección 5) |
+| 3 | `Closed` | La malla de la que sale el registro es cerrada y mira hacia fuera: cada lado, contando como uno los vértices en la misma posición, lo comparten exactamente dos de sus triángulos que lo recorren en sentidos opuestos, y cada parte conexa encierra un volumen positivo. Vista desde fuera no muestra caras traseras. Las piezas de una malla repartida la conservan. Una malla con una cavidad, con caras que solo se tocan en uniones en T o con un triángulo corrupto descartado no la lleva |
 
 - **`complete.meshCount`** cuenta registros de `meshTable`, no elementos.
 - **`complete.bounds`** son coordenadas absolutas de modelo de todo lo que no lleva `HiddenByDefault`. Queda indefinido si no queda nada.

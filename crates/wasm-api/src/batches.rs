@@ -22,6 +22,7 @@ const MAX_SPLIT_TRIANGLES: u64 = 1 << 20;
 const FLAG_TRANSPARENT: u32 = 1 << 0;
 const FLAG_DEGRADED: u32 = 1 << 1;
 const FLAG_HIDDEN_BY_DEFAULT: u32 = 1 << 2;
+const FLAG_CLOSED: u32 = 1 << 3;
 
 /// One block of triangles, laid out as `GeometryBatch` in `GeometryBatch.ts`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -66,6 +67,9 @@ impl Batch {
             if part.rgba & 0xFF != 0xFF {
                 flags |= FLAG_TRANSPARENT;
             }
+            if part.closed {
+                flags |= FLAG_CLOSED;
+            }
             self.mesh_table.extend_from_slice(&[
                 element.express_id,
                 first_vertex,
@@ -85,6 +89,9 @@ struct Part {
     normals: Vec<Vec3>,
     indices: Vec<u32>,
     rgba: u32,
+    /// The mesh it came from is closed and winds outward, so its back faces never show from
+    /// outside. Pieces of a split mesh keep it: they still lie on that surface.
+    closed: bool,
 }
 
 struct Prepared {
@@ -167,7 +174,13 @@ impl Prepared {
                     let centroid = (piece[0] + piece[1] + piece[2]) / 3.0;
                     let cell = (centroid / SPLIT_CELL).floor().as_i64vec3().to_array();
                     let parts = cells.entry(cell).or_insert_with(|| {
-                        let empty = |part: &Part| Part { positions: Vec::new(), normals: Vec::new(), indices: Vec::new(), rgba: part.rgba };
+                        let empty = |part: &Part| Part {
+                            positions: Vec::new(),
+                            normals: Vec::new(),
+                            indices: Vec::new(),
+                            rgba: part.rgba,
+                            closed: part.closed,
+                        };
                         self.parts.iter().map(|part| (empty(part), Shared::default())).collect()
                     });
                     let (out, shared) = &mut parts[index];
@@ -226,7 +239,10 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
             normals: Vec::new(),
             indices: Vec::new(),
             rgba: element_mesh.rgba,
+            closed: false,
         };
+        // Dropping a triangle with no area leaves no gap; dropping a corrupt one may.
+        let mut gap = false;
         // A mesh normally uses each of its positions at least once, so reserving that many
         // saves the map from growing step by step.
         let mut shared: KeyedMap<(u32, u64), u32> =
@@ -235,6 +251,7 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
             let corners = triangle.map(|id| mesh.positions[id as usize]);
             let Some(normal) = usable_normal(corners) else {
                 dropped += 1;
+                gap |= !corners.iter().all(|corner| corner.abs().max_element() <= MAX_COORDINATE);
                 continue;
             };
             let facing = (normal * 32767.0).round().as_i16vec3().to_array();
@@ -253,6 +270,7 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
             }
         }
         if !part.indices.is_empty() {
+            part.closed = !gap && mesh.is_closed_outward();
             parts.push(part);
         }
     }

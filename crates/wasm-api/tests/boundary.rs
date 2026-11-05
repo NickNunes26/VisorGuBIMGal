@@ -10,6 +10,7 @@ use wasm_api::loaded::{LoadedModel, OpenError};
 const RECORD_WORDS: usize = 7;
 const DEGRADED: u32 = 1 << 1;
 const HIDDEN: u32 = 1 << 2;
+const CLOSED: u32 = 1 << 3;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -268,6 +269,47 @@ fn an_element_whose_box_is_wider_than_the_radius_but_whose_corners_are_not_stays
 }
 
 #[test]
+fn closed_meshes_are_flagged_and_others_are_not() {
+    const OCTAHEDRON: &str = "(4.,0.,0.),(-4.,0.,0.),(0.,4.,0.),(0.,-4.,0.),(0.,0.,4.),(0.,0.,-4.)";
+    const ALL: &str = "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,1,6),(2,3,6),(4,2,6),(1,4,6)";
+    let proxy = "IFCPROXY('w',$,$,$,$,$,#3,$,.PRODUCT.,$)";
+    let flag_of = |points: &str, triangles: &str| {
+        let mut model = LoadedModel::open(faces(proxy, points, triangles).into_bytes()).unwrap();
+        let batches = stream(&mut model, usize::MAX);
+        batches.iter().for_each(check);
+        flags(&batches)
+    };
+    assert_eq!(flag_of(OCTAHEDRON, ALL), [CLOSED]);
+    // A face missing.
+    assert_eq!(flag_of(OCTAHEDRON, "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,1,6),(2,3,6),(4,2,6)"), [0]);
+    // A face with no area is dropped without a gap: the faces either side meet along it. Here
+    // (3,1,7) lies on the side from corner 1 to 3, between the whole face above and the face
+    // below split at 7.
+    let flat = "(4.,0.,0.),(-4.,0.,0.),(0.,4.,0.),(0.,-4.,0.),(0.,0.,4.),(0.,0.,-4.),(2.,2.,0.)";
+    let with_sliver = "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,1,7),(7,1,6),(3,7,6),(2,3,6),(4,2,6),(1,4,6)";
+    assert_eq!(flag_of(flat, with_sliver), [CLOSED | DEGRADED]);
+    // A corrupt corner drops the faces it touches and leaves a hole.
+    let corrupt = "(4.,0.,0.),(-4.,0.,0.),(0.,4.,0.),(0.,-4.,0.),(0.,0.,4.),(0.,0.,-4.E300)";
+    assert_eq!(flag_of(corrupt, ALL), [DEGRADED]);
+
+    // An extruded wall.
+    let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
+        #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+        #2=IFCWALL('w',$,$,$,$,$,#10,$);\n\
+        #10=IFCPRODUCTDEFINITIONSHAPE($,$,(#11));\n\
+        #11=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#12));\n\
+        #12=IFCEXTRUDEDAREASOLID(#13,#15,#16,3.);\n\
+        #13=IFCRECTANGLEPROFILEDEF(.AREA.,$,#14,4.,0.2);\n\
+        #14=IFCAXIS2PLACEMENT2D(#17,$);\n\
+        #15=IFCAXIS2PLACEMENT3D(#17,$,$);\n\
+        #16=IFCDIRECTION((0.,0.,1.));\n\
+        #17=IFCCARTESIANPOINT((0.,0.,0.));\n\
+        ENDSEC;END-ISO-10303-21;";
+    let mut model = LoadedModel::open(text.as_bytes().to_vec()).unwrap();
+    assert_eq!(flags(&stream(&mut model, usize::MAX)), [CLOSED]);
+}
+
+#[test]
 fn pieces_keep_their_element_flags() {
     // A space of 20 km: every piece starts hidden, and hidden things leave the bounds alone.
     let space = "IFCSPACE('s',$,$,$,$,$,#3,$,.ELEMENT.,.INTERNAL.,$)";
@@ -383,6 +425,8 @@ fn a_long_slab_at_real_coordinates_keeps_its_volume_when_split() {
     batches.iter().for_each(assert_normals_follow_triangles);
     assert!(batches.len() >= 4, "{} batches", batches.len());
     assert!(flags(&batches).iter().all(|flags| flags & DEGRADED == 0));
+    // Each piece still lies on the closed surface of the whole, so keeps its flag.
+    assert!(flags(&batches).iter().all(|flags| flags & CLOSED == CLOSED), "{:?}", flags(&batches));
     let (_, _, area, volume) = measure(&batches, [536000.0, 4747000.0, 260.0])[&2];
     assert!((volume - 60000.0).abs() < 0.5, "volume {volume}");
     assert!((area - (400000.0 + 12000.0 + 6.0)).abs() < 0.5, "area {area}");
