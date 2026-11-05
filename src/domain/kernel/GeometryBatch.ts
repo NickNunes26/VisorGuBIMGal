@@ -36,7 +36,8 @@ const NORMAL_TOLERANCE = 1e-3;
 /**
  * One transferable block of triangles. Positions are metres, IFC Z-up, as f32 relative to
  * `origin`. Indices are zero-based within this batch. An element may own several records,
- * one per colour for instance, always in one batch. Triangles run counter-clockwise seen
+ * one per colour for instance, in one batch unless it is wider than MAX_BATCH_RADIUS and the
+ * kernel split it into pieces across batches. Triangles run counter-clockwise seen
  * from the side their normal points to.
  */
 export interface GeometryBatch {

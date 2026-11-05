@@ -1,5 +1,7 @@
 //! Turns evaluated elements into wire-format geometry batches. See `docs/05` section 3.
 
+use std::collections::{BTreeMap, VecDeque};
+
 use glam::{DVec3, Vec3};
 use ifc_geometry::hash::KeyedMap;
 use ifc_geometry::{Diagnostic, ElementGeometry, ModelEvaluator};
@@ -8,6 +10,14 @@ use ifc_geometry::{Diagnostic, ElementGeometry, ModelEvaluator};
 pub const MAX_BATCH_RADIUS: f64 = 4096.0;
 /// Coordinates beyond this are corrupt: they would not survive the trip to `f32`. Metres.
 const MAX_COORDINATE: f64 = 1e9;
+/// An element wider than the radius is split: its triangles are halved until no side is longer
+/// than `SPLIT_SIDE`, then grouped by the cell of `SPLIT_CELL` holding each centroid. A corner
+/// lies within 2/3 of a side of its centroid, so a piece spans at most 4096 + 4/3 x 512 m on
+/// each axis, and no corner is more than 3843 m, plus 0.9 m of rounding, from its centre.
+const SPLIT_SIDE: f64 = 512.0;
+const SPLIT_CELL: f64 = 4096.0;
+/// Most triangles splitting may make of one element; past that it stays whole, flagged.
+const MAX_SPLIT_TRIANGLES: u64 = 1 << 20;
 
 const FLAG_TRANSPARENT: u32 = 1 << 0;
 const FLAG_DEGRADED: u32 = 1 << 1;
@@ -93,6 +103,94 @@ impl Prepared {
             .flat_map(|part| &part.positions)
             .all(|position| position.distance_squared(origin) <= limit)
     }
+
+    /// Whether it fits a batch of its own. The box answers for nearly every element; rounding
+    /// moves the origin by at most half a metre on each axis.
+    fn fits_alone(&self) -> bool {
+        let reach = (self.max - self.min).length() / 2.0 + 0.5 * 3f64.sqrt();
+        reach <= MAX_BATCH_RADIUS || self.fits(self.origin())
+    }
+
+    /// Pieces of an element too wide for one batch, in a fixed order, each with the element's
+    /// id and flags, or `None` when they would hold more than `MAX_SPLIT_TRIANGLES`.
+    fn split(&self) -> Option<Vec<Prepared>> {
+        // Halving every side `levels` times leaves 4^levels triangles: count before making any.
+        let levels_of = |corners: &[DVec3; 3]| {
+            let mut side = (0..3).map(|at| corners[at].distance(corners[(at + 1) % 3])).fold(0.0, f64::max);
+            let mut levels = 0u32;
+            while side > SPLIT_SIDE && levels <= 31 {
+                side /= 2.0;
+                levels += 1;
+            }
+            levels
+        };
+        let mut total = 0u64;
+        for part in &self.parts {
+            for triangle in part.indices.as_chunks::<3>().0 {
+                let levels = levels_of(&triangle.map(|index| part.positions[index as usize]));
+                if levels > 31 {
+                    return None;
+                }
+                total = total.saturating_add(1 << (2 * levels));
+            }
+        }
+        if total > MAX_SPLIT_TRIANGLES {
+            return None;
+        }
+
+        // Per cell, one part for each part of the element, sharing corners of equal position and
+        // normal. A BTreeMap keeps the pieces in the same order on every run.
+        type Shared = KeyedMap<([u64; 3], [u32; 3]), u32>;
+        let mut cells: BTreeMap<[i64; 3], Vec<(Part, Shared)>> = BTreeMap::new();
+        for (index, part) in self.parts.iter().enumerate() {
+            for triangle in part.indices.as_chunks::<3>().0 {
+                let corners = triangle.map(|index| part.positions[index as usize]);
+                // Every corner of a triangle carries its facing: see `prepare`.
+                let normal = part.normals[triangle[0] as usize];
+                // Depth first, so at most 3 triangles per level wait here, never all of them.
+                let mut stack = vec![(corners, levels_of(&corners))];
+                while let Some((piece, levels)) = stack.pop() {
+                    if levels > 0 {
+                        stack.extend(quarters(piece).map(|quarter| (quarter, levels - 1)));
+                        continue;
+                    }
+                    let centroid = (piece[0] + piece[1] + piece[2]) / 3.0;
+                    let cell = (centroid / SPLIT_CELL).floor().as_i64vec3().to_array();
+                    let parts = cells.entry(cell).or_insert_with(|| {
+                        let empty = |part: &Part| Part { positions: Vec::new(), normals: Vec::new(), indices: Vec::new(), rgba: part.rgba };
+                        self.parts.iter().map(|part| (empty(part), Shared::default())).collect()
+                    });
+                    let (out, shared) = &mut parts[index];
+                    for corner in piece {
+                        let key = (corner.to_array().map(f64::to_bits), normal.to_array().map(f32::to_bits));
+                        let next = out.positions.len() as u32;
+                        let at = *shared.entry(key).or_insert(next);
+                        if at == next {
+                            out.positions.push(corner);
+                            out.normals.push(normal);
+                        }
+                        out.indices.push(at);
+                    }
+                }
+            }
+        }
+
+        let pieces = cells.into_values().map(|parts| {
+            let parts: Vec<Part> = parts.into_iter().map(|(part, _)| part).filter(|part| !part.indices.is_empty()).collect();
+            let corners = parts.iter().flat_map(|part| &part.positions);
+            let min = corners.clone().fold(DVec3::INFINITY, |min, corner| min.min(*corner));
+            let max = corners.fold(DVec3::NEG_INFINITY, |max, corner| max.max(*corner));
+            Prepared { express_id: self.express_id, parts, flags: self.flags, min, max }
+        });
+        Some(pieces.collect())
+    }
+}
+
+/// The four triangles between a triangle's corners and the middles of its sides, each facing
+/// the same way as the whole.
+fn quarters([a, b, c]: [DVec3; 3]) -> [[DVec3; 3]; 4] {
+    let (ab, bc, ca) = ((a + b) / 2.0, (b + c) / 2.0, (c + a) / 2.0);
+    [[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]
 }
 
 /// `None` when a corner is corrupt or the triangle has no area, so it has no normal.
@@ -167,8 +265,8 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
 pub struct GeometryStream {
     ids: Vec<u32>,
     cursor: usize,
-    /// An element that did not fit the last batch.
-    pending: Option<Prepared>,
+    /// An element that did not fit the last batch, or the pieces of a split one still to go.
+    pending: VecDeque<Prepared>,
     mesh_count: u32,
     bounds: Option<(DVec3, DVec3)>,
     diagnostics: Vec<Diagnostic>,
@@ -179,7 +277,7 @@ impl GeometryStream {
         Self {
             ids,
             cursor: 0,
-            pending: None,
+            pending: VecDeque::new(),
             mesh_count: 0,
             bounds: None,
             diagnostics: Vec::new(),
@@ -231,7 +329,16 @@ impl GeometryStream {
                 if dropped > 0 {
                     prepared.flags |= FLAG_DEGRADED;
                 }
-                return Some(prepared);
+                if prepared.fits_alone() {
+                    return Some(prepared);
+                }
+                // Too wide: its pieces go in turn. One that cannot split stays whole, and
+                // `next_batch` flags it.
+                let Some(pieces) = prepared.split() else { return Some(prepared) };
+                self.pending.extend(pieces);
+                if let Some(first) = self.pending.pop_front() {
+                    return Some(first);
+                }
             }
         }
         None
@@ -253,7 +360,7 @@ impl GeometryStream {
     ) -> Option<Batch> {
         let mut batch: Option<Batch> = None;
         loop {
-            let element = match self.pending.take() {
+            let element = match self.pending.pop_front() {
                 Some(element) => element,
                 None => match self.advance(evaluator) {
                     Some(element) => element,
@@ -264,7 +371,7 @@ impl GeometryStream {
                 Some(open) => {
                     let room = open.triangle_count() + element.triangle_count() <= max_triangles;
                     if !room || !element.fits(open.origin) {
-                        self.pending = Some(element);
+                        self.pending.push_front(element);
                         return batch;
                     }
                     open.push(&element);
@@ -273,7 +380,7 @@ impl GeometryStream {
                 None => {
                     let mut element = element;
                     let origin = element.origin();
-                    let oversized = !element.fits(origin);
+                    let oversized = !element.fits_alone();
                     if oversized {
                         element.flags |= FLAG_DEGRADED;
                         let message = format!("element exceeds {MAX_BATCH_RADIUS} m from its origin");

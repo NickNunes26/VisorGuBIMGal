@@ -50,9 +50,10 @@ Hilo principal                         Web Workers, sin memoria compartida
 
 Cada lote lleva su propio `origin` en `f64`. No existe un origen por modelo: la geometría puede estar lejos de su ubicación (terrenos, alineaciones, coordenadas absolutas incrustadas), así que no se puede fijar antes de evaluarla.
 
-- El origen de un lote es el centro de la caja del primer elemento que contiene, redondeado al metro, con la mitad alejándose de cero.
+- El origen de un lote es el centro de la caja del primer elemento, o pieza, que contiene, redondeado al metro, con la mitad alejándose de cero.
 - Ningún vértice puede quedar a más de `MAX_BATCH_RADIUS` (4096 m) del origen. El kernel abre un lote nuevo cuando un elemento no cabe.
-- Si un solo elemento supera ese radio, se emite con su propio lote, la bandera `Degraded` y un diagnóstico de precisión.
+- Si un solo elemento supera ese radio alrededor del centro de su caja, el kernel lo reparte en piezas. Primero divide cada triángulo con un lado de más de 512 m en cuatro, por los puntos medios de sus lados, hasta que ninguno pase de 512 m. Luego agrupa los triángulos por la celda de 4096 m que contiene su centroide. Cada pieza conserva el `expressId`, las banderas y los colores del elemento, y viaja como un elemento más, así que un elemento repartido tiene registros en varios lotes. Ningún vértice de una pieza queda a más de unos 3844 m de su centro.
+- Si repartirlo diera más de 2^20 triángulos, el elemento se emite entero en su propio lote, con la bandera `Degraded` y el diagnóstico `batch-radius-exceeded`.
 - El renderizador calcula en la CPU, con `f64` y en cada fotograma, `batch.origin − cámara` para cada lote, y solo entonces pasa a `f32`. Ninguna coordenada absoluta llega a la GPU.
 - El kernel conserva Z arriba, porque corte y GIS trabajan en ese espacio. La conversión a la convención de la cámara es interna del renderizador.
 
@@ -108,7 +109,7 @@ Definidos en `GeometryBatch.ts`.
 | `meshTable` | `Uint32Array` | 7 palabras por registro: `expressId, firstVertex, vertexCount, firstIndex, indexCount, rgba, flags` |
 
 - `rgba` es `0xRRGGBBAA`, sRGB sin premultiplicar.
-- Un elemento puede tener varios registros, siempre en el mismo lote: nunca se parte entre lotes. Cada índice de un registro apunta dentro de su rango de vértices.
+- Un elemento puede tener varios registros, en el mismo lote salvo que supere `MAX_BATCH_RADIUS` y se reparta en piezas (sección 2). El renderizador reúne los registros de un elemento por `expressId`, estén en el lote que estén. Cada índice de un registro apunta dentro de su rango de vértices.
 - **Orientación:** los triángulos son antihorarios vistos desde el lado de su normal, y la normal se calcula de ese orden. En un sólido cerrado, ese lado es el exterior. Una malla abierta no garantiza nada, así que el renderizador dibuja las dos caras.
 - **Banderas**, los bits sin definir valen 0:
 
@@ -120,7 +121,7 @@ Definidos en `GeometryBatch.ts`.
 
 - **`complete.meshCount`** cuenta registros de `meshTable`, no elementos.
 - **`complete.bounds`** son coordenadas absolutas de modelo de todo lo que no lleva `HiddenByDefault`. Queda indefinido si no queda nada.
-- `findBatchError` valida este formato en pruebas y con datos simulados, incluida la longitud de las normales. El radio máximo lo garantiza el kernel y no se comprueba ahí, porque un elemento `Degraded` puede superarlo.
+- `findBatchError` valida este formato en pruebas y con datos simulados, incluida la longitud de las normales. El radio máximo lo garantiza el kernel y no se comprueba ahí, porque un elemento `Degraded` demasiado grande para repartirlo puede superarlo.
 - **Los lotes se transfieren, nunca se clonan** (RSK-06). Tras `addBatch`, el renderizador sube los datos a la GPU y no conserva copia en JS (RSK-03).
 - Los lotes son solo para el renderizador. `cad-slicer` trabaja dentro del kernel con la geometría evaluada de `ifc-geometry`, combinando origen y posición en `f64`.
 
@@ -335,7 +336,7 @@ impl Sheet {
 ### Flujo de geometría
 
 - `start_stream` empieza por el primer elemento. Llamarlo otra vez descarta un flujo sin terminar.
-- `next_batch` devuelve `None` cuando no quedan elementos. `max_triangles` es un tope flexible: un lote se cierra antes de superarlo, pero un elemento mayor viaja solo en su lote y nunca se parte.
+- `next_batch` devuelve `None` cuando no quedan elementos. `max_triangles` es un tope flexible: un lote se cierra antes de superarlo, pero un elemento, o pieza, mayor viaja solo en su lote y nunca se parte por ese tope. Solo el radio reparte un elemento (sección 2).
 - `finish_stream` se llama una vez tras `None`, libera las cachés y devuelve el JSON del evento `complete`, sin `type`. Sin flujo activo devuelve `meshCount` 0 y sin diagnósticos.
 
 **Corrección a `docs/03` sección 4:** una vista `Float32Array` sobre `wasmMemory.buffer` queda inválida en cuanto la memoria WASM crece, y la memoria de WASM no se puede transferir entre hilos. Por tanto, **ninguna vista sobre la memoria WASM sobrevive a una llamada**, y el recorrido real es:

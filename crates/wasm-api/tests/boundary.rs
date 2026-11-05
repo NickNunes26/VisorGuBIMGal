@@ -1,5 +1,6 @@
 //! What crosses the WASM boundary, checked natively over every file we have.
 
+use glam::DVec3;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use wasm_api::loaded::{LoadedModel, OpenError};
 
 const RECORD_WORDS: usize = 7;
 const DEGRADED: u32 = 1 << 1;
+const HIDDEN: u32 = 1 << 2;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -224,19 +226,186 @@ fn assert_normals_follow_triangles(batch: &Batch) {
         }
     }
 }
+/// One triangle of the given corners as element #2.
+fn one_triangle(corners: [[f64; 3]; 3]) -> String {
+    let [a, b, c] = corners.map(|[x, y, z]| format!("({x:.1},{y:.1},{z:.1})"));
+    faces("IFCPROXY('w',$,$,$,$,$,#3,$,.PRODUCT.,$)", &format!("{a},{b},{c}"), "(1,2,3)")
+}
+
+/// Element #2, given as its entity with representation #3, of a triangulated face set.
+fn faces(element: &str, points: &str, triangles: &str) -> String {
+    format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
+         #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+         #2={element};\n\
+         #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+         #4=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#5));\n\
+         #5=IFCTRIANGULATEDFACESET(#6,$,$,({triangles}),$);\n\
+         #6=IFCCARTESIANPOINTLIST3D(({points}));\n\
+         ENDSEC;END-ISO-10303-21;"
+    )
+}
+
 #[test]
-fn a_huge_element_is_flagged_instead_of_losing_precision_silently() {
-    let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
-        #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
-        #2=IFCPROXY('w',$,$,$,$,$,#3,$,.PRODUCT.,$);\n\
-        #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
-        #4=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#5));\n\
-        #5=IFCTRIANGULATEDFACESET(#6,$,$,((1,2,3)),$);\n\
-        #6=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(20000.,0.,0.),(0.,20000.,0.)));\n\
-        ENDSEC;END-ISO-10303-21;";
-    let mut model = LoadedModel::open(text.as_bytes().to_vec()).unwrap();
+fn an_element_whose_box_is_wider_than_the_radius_but_whose_corners_are_not_stays_whole() {
+    // An octahedron with corners 4000 m from its centre: its box reaches 6928 m.
+    let points = "(4000.,0.,0.),(-4000.,0.,0.),(0.,4000.,0.),(0.,-4000.,0.),(0.,0.,4000.),(0.,0.,-4000.)";
+    let triangles = "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,1,6),(2,3,6),(4,2,6),(1,4,6)";
+    let mut model = LoadedModel::open(faces("IFCPROXY('w',$,$,$,$,$,#3,$,.PRODUCT.,$)", points, triangles).into_bytes()).unwrap();
+    let batches = stream(&mut model, usize::MAX);
+    batches.iter().for_each(check);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].indices.len(), 24);
+    assert!(flags(&batches).iter().all(|flags| flags & DEGRADED == 0));
+}
+
+#[test]
+fn pieces_keep_their_element_flags() {
+    // A space of 20 km: every piece starts hidden, and hidden things leave the bounds alone.
+    let space = "IFCSPACE('s',$,$,$,$,$,#3,$,.ELEMENT.,.INTERNAL.,$)";
+    let mut model = LoadedModel::open(faces(space, "(0.,0.,0.),(20000.,0.,0.),(0.,20000.,0.)", "(1,2,3)").into_bytes()).unwrap();
+    let batches = stream(&mut model, usize::MAX);
+    batches.iter().for_each(check);
+    assert!(batches.len() >= 9, "{} batches", batches.len());
+    assert!(flags(&batches).iter().all(|flags| flags & (DEGRADED | HIDDEN) == HIDDEN), "{:?}", flags(&batches));
+    assert!(!model.finish_stream().contains(r#""bounds""#));
+}
+
+/// Per element: records, triangles, area, and signed volume about `reference`, all from the
+/// absolute corners the batches give, in f64.
+fn measure(batches: &[Batch], reference: [f64; 3]) -> BTreeMap<u32, (usize, usize, f64, f64)> {
+    let mut elements: BTreeMap<u32, (usize, usize, f64, f64)> = BTreeMap::new();
+    for batch in batches {
+        let corner = |index: u32| -> [f64; 3] {
+            let at = index as usize * 3;
+            std::array::from_fn(|axis| batch.positions[at + axis] as f64 + batch.origin[axis] - reference[axis])
+        };
+        for record in batch.mesh_table.as_chunks::<RECORD_WORDS>().0 {
+            let entry = elements.entry(record[0]).or_default();
+            entry.0 += 1;
+            let first = record[3] as usize;
+            for [a, b, c] in batch.indices[first..first + record[4] as usize].as_chunks::<3>().0 {
+                let ([ax, ay, az], [bx, by, bz], [cx, cy, cz]) = (corner(*a), corner(*b), corner(*c));
+                let (u, v) = ([bx - ax, by - ay, bz - az], [cx - ax, cy - ay, cz - az]);
+                let cross = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                entry.1 += 1;
+                entry.2 += cross.iter().map(|value| value * value).sum::<f64>().sqrt() / 2.0;
+                entry.3 += (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx)) / 6.0;
+            }
+        }
+    }
+    elements
+}
+
+fn flags(batches: &[Batch]) -> Vec<u32> {
+    batches.iter().flat_map(|batch| batch.mesh_table.as_chunks::<RECORD_WORDS>().0.iter().map(|record| record[6])).collect()
+}
+
+#[test]
+fn a_huge_triangle_is_split_into_pieces_within_the_radius() {
+    // Sides of 20, 20 and 28.3 km: halved six times to 442 m at most, so 4^6 triangles.
+    let text = one_triangle([[0.0, 0.0, 0.0], [20000.0, 0.0, 0.0], [0.0, 20000.0, 0.0]]);
+    let mut model = LoadedModel::open(text.into_bytes()).unwrap();
+    for max_triangles in [usize::MAX, 100] {
+        let batches = stream(&mut model, max_triangles);
+        batches.iter().for_each(check);
+        batches.iter().for_each(assert_normals_follow_triangles);
+        assert!(batches.len() >= 9, "{} batches", batches.len());
+        assert!(flags(&batches).iter().all(|flags| flags & DEGRADED == 0));
+        let elements = measure(&batches, [0.0; 3]);
+        let (records, triangles, area, _) = elements[&2];
+        assert_eq!(elements.len(), 1);
+        assert_eq!(triangles, 4096);
+        assert!((area - 2.0e8).abs() < 1.0, "area {area}");
+        let complete = model.finish_stream();
+        assert!(!complete.contains("batch-radius-exceeded"), "{complete}");
+        assert!(complete.starts_with(&format!(r#"{{"meshCount":{records}"#)), "{complete}");
+        assert!(complete.contains(r#""min":{"x":0,"y":0,"z":0}"#), "{complete}");
+        assert!(complete.contains(r#""max":{"x":20000,"y":20000,"z":0}"#), "{complete}");
+    }
+    let (first, second) = (stream(&mut model, usize::MAX), stream(&mut model, usize::MAX));
+    assert_eq!(first, second, "the same pieces each time");
+}
+
+#[test]
+fn a_triangle_of_ten_kilometres_or_tilted_on_every_axis_is_split_within_the_radius() {
+    // The first reaches 7071 m from its centre though its box diagonal is only 14 km; the
+    // second puts pieces across cells on all three axes, where their boxes are widest.
+    for corners in [
+        [[0.0, 0.0, 0.0], [10000.0, 0.0, 0.0], [0.0, 10000.0, 0.0]],
+        [[0.0, 0.0, 0.0], [30000.0, 1000.0, 29000.0], [1000.0, 30000.0, 29500.0]],
+    ] {
+        let mut model = LoadedModel::open(one_triangle(corners).into_bytes()).unwrap();
+        let batches = stream(&mut model, usize::MAX);
+        batches.iter().for_each(check);
+        assert!(batches.len() >= 2, "{} batches", batches.len());
+        assert!(flags(&batches).iter().all(|flags| flags & DEGRADED == 0));
+        let [a, b, c] = corners.map(DVec3::from_array);
+        let area = (b - a).cross(c - a).length() / 2.0;
+        let measured = measure(&batches, [0.0; 3])[&2].2;
+        assert!((measured - area).abs() < 1e-6 * area, "{measured} against {area}");
+    }
+}
+
+#[test]
+fn a_long_slab_at_real_coordinates_keeps_its_volume_when_split() {
+    // 20 km x 10 m x 0.3 m along a diagonal, near UTM coordinates: 60 000 m3, and
+    // 2 x 200 000 + 2 x 6000 + 2 x 3 = 412 006 m2.
+    let text = String::from(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
+         #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+         #2=IFCSLAB('s',$,$,$,$,#20,#10,$,$);\n\
+         #10=IFCPRODUCTDEFINITIONSHAPE($,$,(#11));\n\
+         #11=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#12));\n\
+         #12=IFCEXTRUDEDAREASOLID(#13,#15,#16,0.3);\n\
+         #13=IFCRECTANGLEPROFILEDEF(.AREA.,$,#14,20000.,10.);\n\
+         #14=IFCAXIS2PLACEMENT2D(#17,$);\n\
+         #15=IFCAXIS2PLACEMENT3D(#17,$,$);\n\
+         #16=IFCDIRECTION((0.,0.,1.));\n\
+         #17=IFCCARTESIANPOINT((0.,0.,0.));\n\
+         #20=IFCLOCALPLACEMENT($,#21);\n\
+         #21=IFCAXIS2PLACEMENT3D(#22,$,#23);\n\
+         #22=IFCCARTESIANPOINT((536000.,4747000.,260.));\n\
+         #23=IFCDIRECTION((1.,1.,0.));\n\
+         ENDSEC;END-ISO-10303-21;"
+    );
+    let mut model = LoadedModel::open(text.into_bytes()).unwrap();
+    let batches = stream(&mut model, usize::MAX);
+    batches.iter().for_each(check);
+    batches.iter().for_each(assert_normals_follow_triangles);
+    assert!(batches.len() >= 4, "{} batches", batches.len());
+    assert!(flags(&batches).iter().all(|flags| flags & DEGRADED == 0));
+    let (_, _, area, volume) = measure(&batches, [536000.0, 4747000.0, 260.0])[&2];
+    assert!((volume - 60000.0).abs() < 0.5, "volume {volume}");
+    assert!((area - (400000.0 + 12000.0 + 6.0)).abs() < 0.5, "area {area}");
+    assert!(!model.finish_stream().contains("batch-radius-exceeded"));
+
+    // Corners of the long sides lie 5 m across the axis. Within 3843 m of an origin, f32 keeps
+    // each coordinate to 1.22e-4 m, so at most 1.73e-4 m across; whole, the slab would reach
+    // 7071 m from its origin and twice that.
+    let mut worst: f64 = 0.0;
+    for batch in &batches {
+        for (position, normal) in batch.positions.as_chunks::<3>().0.iter().zip(batch.normals.as_chunks::<3>().0) {
+            let across = (f64::from(normal[1]) - f64::from(normal[0])) / 2f64.sqrt();
+            if across.abs() < 0.99 {
+                continue;
+            }
+            let [x, y] = [0, 1].map(|axis| f64::from(position[axis]) + batch.origin[axis]);
+            let offset = (-(x - 536000.0) + (y - 4747000.0)) / 2f64.sqrt();
+            worst = worst.max((offset * across.signum() - 5.0).abs());
+        }
+    }
+    assert!(worst > 0.0 && worst <= 1.73e-4, "{worst} m off the side");
+}
+
+#[test]
+fn an_element_too_big_to_split_stays_whole_and_flagged() {
+    // 100 000 km sides need 4^18 triangles to reach 512 m: past the budget.
+    let text = one_triangle([[0.0, 0.0, 0.0], [1.0e8, 0.0, 0.0], [0.0, 1.0e8, 0.0]]);
+    let mut model = LoadedModel::open(text.into_bytes()).unwrap();
     let batches = stream(&mut model, usize::MAX);
     assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].indices.len(), 3);
     assert_eq!(batches[0].mesh_table[6] & DEGRADED, DEGRADED);
     assert!(model.finish_stream().contains("batch-radius-exceeded"));
 }
