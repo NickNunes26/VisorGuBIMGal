@@ -10,7 +10,7 @@ const NO_NEIGHBOUR: u32 = u32::MAX;
 /// compared: 11 ms natively for 2,000 parts, 0.5 s for 20,000. Real shells have at most 25.
 const MAX_NESTED_PARTS: usize = 2_000;
 
-/// Sides leaving one corner beyond which `sides_pair_up` sorts them rather than scanning.
+/// Sides leaving one corner beyond which `side_partners` sorts them rather than scanning.
 const MAX_SCANNED_SIDES: u32 = 32;
 
 /// Triangles wind counter-clockwise seen from outside the solid.
@@ -113,9 +113,11 @@ impl Mesh {
 
     /// Whether no back face can show from outside: every side, with corners at one position
     /// counted as one, is shared by exactly two triangles running along it in opposite
-    /// directions, and every connected part encloses a positive volume, so winds outward. A
-    /// cavity winds inward, so a mesh with one is not closed here; nor is one whose faces meet
-    /// only at T-junctions.
+    /// directions, and every part, its triangles joined across those sides, encloses a positive
+    /// volume, so winds outward. A cavity winds inward, so a mesh with one is not closed here;
+    /// nor is one whose faces meet only at T-junctions, nor one with a part of no volume, such
+    /// as a triangle with a repeated corner or two faces back to back, which could otherwise join
+    /// an inward part to an outward one.
     pub fn is_closed_outward(&self) -> bool {
         let count = self.positions.len();
         // Every side pairs with another, so there are an even number of them.
@@ -127,8 +129,8 @@ impl Mesh {
         }
         // Most meshes share their corners already; only those that do not are welded.
         let own: Vec<u32> = (0..count as u32).collect();
-        let welded = if sides_pair_up(&self.triangles, &own) {
-            own
+        let partners = if let Some(partners) = side_partners(&self.triangles, &own) {
+            partners
         } else {
             // Adding zero turns -0.0 into 0.0, which has other bits.
             let mut keyed: Vec<([u64; 3], u32)> = self
@@ -145,14 +147,14 @@ impl Mesh {
                     _ => *index,
                 };
             }
-            if !sides_pair_up(&self.triangles, &welded) {
+            let Some(partners) = side_partners(&self.triangles, &welded) else {
                 return false;
-            }
-            welded
+            };
+            partners
         };
 
-        // Connected parts, by corners, without recursion: the WASM stack is 1 MB.
-        let mut parent: Vec<u32> = (0..count as u32).collect();
+        // Parts: triangles joined across their sides, without recursion: the WASM stack is 1 MB.
+        let mut parent: Vec<u32> = (0..self.triangles.len() as u32).collect();
         let root = |parent: &mut [u32], mut at: u32| {
             while parent[at as usize] != at {
                 let up = parent[parent[at as usize] as usize];
@@ -161,21 +163,20 @@ impl Mesh {
             }
             at
         };
-        for triangle in &self.triangles {
-            let [a, b, c] = triangle.map(|id| welded[id as usize]);
-            for other in [b, c] {
-                let (one, two) = (root(&mut parent, a), root(&mut parent, other));
+        for (triangle, across) in (0u32..).zip(&partners) {
+            for other in across {
+                let (one, two) = (root(&mut parent, triangle), root(&mut parent, *other));
                 if one != two {
                     parent[two as usize] = one;
                 }
             }
         }
         // Six times each part's volume, measured from a corner of the part for precision.
-        let mut pivots: Vec<Option<DVec3>> = vec![None; count];
-        let mut six_volumes = vec![0.0f64; count];
-        for triangle in &self.triangles {
+        let mut pivots: Vec<Option<DVec3>> = vec![None; self.triangles.len()];
+        let mut six_volumes = vec![0.0f64; self.triangles.len()];
+        for (index, triangle) in (0u32..).zip(&self.triangles) {
             let [a, b, c] = triangle.map(|id| self.positions[id as usize]);
-            let part = root(&mut parent, welded[triangle[0] as usize]) as usize;
+            let part = root(&mut parent, index) as usize;
             let pivot = *pivots[part].get_or_insert(a);
             six_volumes[part] += (a - pivot).dot((b - pivot).cross(c - pivot));
         }
@@ -401,10 +402,11 @@ impl Mesh {
     }
 }
 
-/// Whether each directed side, with corners renamed by `label`, appears once and its reverse
-/// too. The sides are grouped by the corner they leave, by counting rather than sorting them
-/// all, which cost a fifth of streaming a model.
-fn sides_pair_up(triangles: &[[u32; 3]], label: &[u32]) -> bool {
+/// For each triangle, with corners renamed by `label`, the triangles running back along its
+/// three sides; `None` unless each directed side appears once and its reverse too. A side whose
+/// ends are one corner is its own reverse. The sides are grouped by the corner they leave, by
+/// counting: sorting them all took a third longer.
+fn side_partners(triangles: &[[u32; 3]], label: &[u32]) -> Option<Vec<[u32; 3]>> {
     let count = label.len();
     let mut start = vec![0u32; count + 1];
     for triangle in triangles {
@@ -416,31 +418,50 @@ fn sides_pair_up(triangles: &[[u32; 3]], label: &[u32]) -> bool {
         start[at] += start[at - 1];
     }
     let mut fill = start.clone();
-    let mut ends = vec![0u32; triangles.len() * 3];
-    for triangle in triangles {
+    // Each side as the corner it reaches and its triangle.
+    let mut ends = vec![(0u32, 0u32); triangles.len() * 3];
+    for (index, triangle) in (0u32..).zip(triangles) {
         let [a, b, c] = triangle.map(|id| label[id as usize]);
         for (from, to) in [(a, b), (b, c), (c, a)] {
-            ends[fill[from as usize] as usize] = to;
+            ends[fill[from as usize] as usize] = (to, index);
             fill[from as usize] += 1;
         }
     }
     let range = |corner: u32| start[corner as usize] as usize..start[corner as usize + 1] as usize;
     // A few sides leave most corners, and scanning them beats sorting them. A corner with many,
     // the tip of a fine cone say, would make scanning quadratic, so then they are sorted.
-    if start.windows(2).all(|pair| pair[1] - pair[0] <= MAX_SCANNED_SIDES) {
-        return (0..count as u32).all(|from| {
-            let leaving = &ends[range(from)];
-            leaving.iter().enumerate().all(|(at, to)| !leaving[..at].contains(to) && ends[range(*to)].contains(&from))
-        });
+    let scanned = start.windows(2).all(|pair| pair[1] - pair[0] <= MAX_SCANNED_SIDES);
+    if !scanned {
+        for corner in 0..count as u32 {
+            ends[range(corner)].sort_unstable();
+        }
     }
-    for corner in 0..count as u32 {
-        ends[range(corner)].sort_unstable();
+    let repeated = (0..count as u32).any(|corner| {
+        let leaving = &ends[range(corner)];
+        if scanned {
+            leaving.iter().enumerate().any(|(at, (to, _))| leaving[..at].iter().any(|(other, _)| other == to))
+        } else {
+            leaving.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        }
+    });
+    if repeated {
+        return None;
     }
-    (0..count as u32).all(|from| {
-        let leaving = &ends[range(from)];
-        leaving.windows(2).all(|pair| pair[0] != pair[1])
-            && leaving.iter().all(|to| ends[range(*to)].binary_search(&from).is_ok())
-    })
+    let back = |from: u32, to: u32| -> Option<u32> {
+        let arriving = &ends[range(to)];
+        if scanned {
+            arriving.iter().find(|(end, _)| *end == from).map(|(_, triangle)| *triangle)
+        } else {
+            arriving.binary_search_by_key(&from, |(end, _)| *end).ok().map(|at| arriving[at].1)
+        }
+    };
+    triangles
+        .iter()
+        .map(|triangle| {
+            let [a, b, c] = triangle.map(|id| label[id as usize]);
+            Some([back(a, b)?, back(b, c)?, back(c, a)?])
+        })
+        .collect()
 }
 
 fn doubled_area([a, b, c]: &[DVec3; 3]) -> f64 {

@@ -119,7 +119,7 @@ Definidos en `GeometryBatch.ts`.
 | 0 | `Transparent` | `rgba` tiene alfa menor que 255, exactamente |
 | 1 | `Degraded` | Se evaluó solo en parte. Hay un diagnóstico con su `expressId` en `complete.diagnostics` |
 | 2 | `HiddenByDefault` | Seleccionable, pero empieza oculto. Hoy solo `IfcSpace`; añadir tipos no rompe el contrato, y esos tipos también quedan fuera de los planos (sección 5) |
-| 3 | `Closed` | La malla de la que sale el registro es cerrada y mira hacia fuera: cada lado, contando como uno los vértices en la misma posición, lo comparten exactamente dos de sus triángulos que lo recorren en sentidos opuestos, y cada parte conexa encierra un volumen positivo. Vista desde fuera no muestra caras traseras. Las piezas de una malla repartida la conservan. Una malla con una cavidad, con caras que solo se tocan en uniones en T o con un triángulo corrupto descartado no la lleva |
+| 3 | `Closed` | La malla de la que sale el registro es cerrada y mira hacia fuera: cada lado, contando como uno los vértices en la misma posición, lo comparten exactamente dos de sus triángulos que lo recorren en sentidos opuestos, y cada parte, con sus triángulos unidos por esos lados, encierra un volumen positivo. Vista desde fuera no muestra caras traseras. Las piezas de una malla repartida la conservan. No la lleva una malla con una cavidad, con caras que solo se tocan en uniones en T, con una parte sin volumen (un triángulo con un vértice repetido, dos caras espalda con espalda) o con un triángulo corrupto descartado |
 
 - **`complete.meshCount`** cuenta registros de `meshTable`, no elementos.
 - **`complete.bounds`** son coordenadas absolutas de modelo de todo lo que no lleva `HiddenByDefault`. Queda indefinido si no queda nada.

@@ -112,14 +112,36 @@ fn a_triangle_with_a_repeated_corner_cannot_close_a_hole() {
         holed.triangles.push([to, to, from]);
     }
     assert!(!holed.is_closed_outward(), "flaps on the hole's sides");
-    // On a closed box, one changes nothing that shows.
-    let mut flapped = cube();
-    flapped.triangles.extend([[0, 0, 6], [3, 5, 5]]);
-    assert!(flapped.is_closed_outward(), "a box with two triangles of no area");
-    // A triangle on one corner repeats its side: the mesh is left open, which is safe.
+    // A triangle on one corner repeats its side.
     let mut pointed = cube();
     pointed.triangles.extend([[5, 5, 5], [0, 0, 6]]);
     assert!(!pointed.is_closed_outward(), "a triangle of three equal corners");
+}
+
+#[test]
+fn parts_join_only_across_sides_so_nothing_of_no_volume_hides_an_inward_part() {
+    // Joined by corners, a triangle with a repeated corner or two faces back to back would make
+    // an inside-out box one part with an outward one, whose larger volume would hide it.
+    let big = Mesh::cuboid(DVec3::ZERO, DVec3::splat(4.0));
+    let small = flipped(Mesh::cuboid(DVec3::splat(10.0), DVec3::splat(11.0)));
+    let two = joined(&big, &small);
+    assert!(!two.is_closed_outward());
+    let (a, b) = (0, big.positions.len() as u32);
+    let mut flapped = two.clone();
+    flapped.triangles.extend([[a, a, b], [1, 1, 7]]);
+    assert!(!flapped.is_closed_outward(), "joined by triangles with a repeated corner");
+    let mut sheet = two.clone();
+    sheet.triangles.extend([[a, b, b + 6], [a, b + 6, b]]);
+    assert!(!sheet.is_closed_outward(), "joined by two faces back to back");
+    // Such a part has no volume, so even on a closed box it leaves the mesh open: safe.
+    let mut flap_on_box = cube();
+    flap_on_box.triangles.extend([[0, 0, 6], [3, 5, 5]]);
+    assert!(!flap_on_box.is_closed_outward(), "a box with two triangles of no area");
+    // Across the box's diagonal to a corner of its own, so no side is one of the box's.
+    let mut sheet_on_box = cube();
+    sheet_on_box.positions.push(DVec3::new(0.0, -1.0, 1.0));
+    sheet_on_box.triangles.extend([[0, 6, 8], [0, 8, 6]]);
+    assert!(!sheet_on_box.is_closed_outward(), "a box with two faces back to back inside it");
 }
 
 #[test]

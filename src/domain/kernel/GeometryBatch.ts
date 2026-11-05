@@ -27,8 +27,9 @@ export const MeshFlag = {
   HiddenByDefault: 1 << 2,
   /**
    * The mesh is closed and winds outward: every side is shared by two of its triangles running
-   * opposite ways, and every connected part encloses a positive volume. Seen from outside, its
-   * back faces never show, so renderers may cull them. Pieces of a split mesh keep it.
+   * opposite ways, and every part, its triangles joined across those sides, encloses a positive
+   * volume. Seen from outside, its back faces never show, so renderers may cull them. Pieces of
+   * a split mesh keep it.
    */
   Closed: 1 << 3
 } as const;
