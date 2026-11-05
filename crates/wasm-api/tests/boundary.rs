@@ -309,6 +309,72 @@ fn closed_meshes_are_flagged_and_others_are_not() {
     assert_eq!(flags(&stream(&mut model, usize::MAX)), [CLOSED]);
 }
 
+/// Walls #2 and #6 placing one mapped face set, `points` and `triangles`, through operators
+/// written as their Axis2, LocalOrigin and Scale3.
+fn mapped(points: &str, triangles: &str, first: (&str, &str, &str), second: (&str, &str, &str)) -> String {
+    format!(
+        "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\n\
+         #1=IFCPROJECT('p',$,$,$,$,$,$,$,$);\n\
+         #2=IFCWALL('w',$,$,$,$,$,#3,$);\n\
+         #3=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n\
+         #4=IFCSHAPEREPRESENTATION($,'Body','MappedRepresentation',(#50));\n\
+         #6=IFCWALL('x',$,$,$,$,$,#7,$);\n\
+         #7=IFCPRODUCTDEFINITIONSHAPE($,$,(#8));\n\
+         #8=IFCSHAPEREPRESENTATION($,'Body','MappedRepresentation',(#51));\n\
+         #50=IFCMAPPEDITEM(#52,#53);\n\
+         #51=IFCMAPPEDITEM(#52,#54);\n\
+         #52=IFCREPRESENTATIONMAP(#55,#56);\n\
+         #53=IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM($,{},{},$,$,$,{});\n\
+         #54=IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM($,{},{},$,$,$,{});\n\
+         #55=IFCAXIS2PLACEMENT3D(#59,$,$);\n\
+         #56=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#60));\n\
+         #59=IFCCARTESIANPOINT((0.,0.,0.));\n\
+         #60=IFCTRIANGULATEDFACESET(#61,$,$,({triangles}),$);\n\
+         #61=IFCCARTESIANPOINTLIST3D(({points}));\n\
+         #70=IFCDIRECTION((0.,-1.,0.));\n\
+         #71=IFCCARTESIANPOINT((0.,0.,0.));\n\
+         #72=IFCCARTESIANPOINT((20.,0.,0.));\n\
+         #73=IFCCARTESIANPOINT((1000000.,0.,0.));\n\
+         #74=IFCCARTESIANPOINT((1000000.,20.,0.));\n\
+         ENDSEC;END-ISO-10303-21;",
+        first.0, first.1, first.2, second.0, second.1, second.2
+    )
+}
+
+#[test]
+fn a_mapped_shape_is_checked_once_and_its_copies_keep_what_they_are() {
+    const OCTAHEDRON: &str = "(4.,0.,0.),(-4.,0.,0.),(0.,4.,0.),(0.,-4.,0.),(0.,0.,4.),(0.,0.,-4.)";
+    const ALL: &str = "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,1,6),(2,3,6),(4,2,6),(1,4,6)";
+    let stream_of = |text: String| {
+        let mut model = LoadedModel::open(text.into_bytes()).unwrap();
+        let batches = stream(&mut model, usize::MAX);
+        batches.iter().for_each(check);
+        let volumes: Vec<f64> = measure(&batches, [0.0; 3]).values().map(|element| element.3).collect();
+        (flags(&batches), volumes)
+    };
+    let plain = ("$", "#71", "$");
+    // A closed shape, its second copy mirrored: both stay closed, and both wind outward.
+    let (flags_of, volumes) = stream_of(mapped(OCTAHEDRON, ALL, plain, ("#70", "#72", "$")));
+    assert_eq!(flags_of, [CLOSED, CLOSED]);
+    assert!(volumes.iter().all(|volume| (volume - 4.0 * 4.0 * 4.0 * 4.0 / 3.0).abs() < 1e-6), "{volumes:?}");
+    // An open one: neither copy is marked.
+    let open = "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,1,6),(2,3,6),(4,2,6)";
+    assert_eq!(stream_of(mapped(OCTAHEDRON, open, plain, ("$", "#72", "$"))).0, [0, 0]);
+    // A unit cube whose second copy is stretched upward past any real coordinate: its top
+    // corners are dropped as corrupt and its bottom face stays, open, so the mark goes.
+    let cube = "(0.,0.,0.),(1.,0.,0.),(1.,1.,0.),(0.,1.,0.),(0.,0.,1.),(1.,0.,1.),(1.,1.,1.),(0.,1.,1.)";
+    let sides = "(1,3,2),(1,4,3),(5,6,7),(5,7,8),(1,2,6),(1,6,5),(2,3,7),(2,7,6),(3,4,8),(3,8,7),(4,1,5),(4,5,8)";
+    let (flags_of, _) = stream_of(mapped(cube, sides, plain, ("$", "#72", "1.E300")));
+    assert_eq!(flags_of, [CLOSED, DEGRADED]);
+    // Open as written, with a corner 1e-12 m off its neighbour, but closed once placed 1000 km
+    // away, where the two round to one: every copy is checked as placed.
+    let split = format!("{OCTAHEDRON},(4.000000000001,0.,0.)");
+    let parted = "(1,3,5),(3,2,5),(2,4,5),(4,1,5),(3,7,6),(2,3,6),(4,2,6),(7,4,6)";
+    assert_eq!(stream_of(mapped(&split, parted, plain, ("$", "#72", "$"))).0, [0, 0], "open near the origin");
+    let far = ("$", "#73", "$");
+    assert_eq!(stream_of(mapped(&split, parted, far, ("$", "#74", "$"))).0, [CLOSED, CLOSED], "closed far away");
+}
+
 #[test]
 fn pieces_keep_their_element_flags() {
     // A space of 20 km: every piece starts hidden, and hidden things leave the bounds alone.

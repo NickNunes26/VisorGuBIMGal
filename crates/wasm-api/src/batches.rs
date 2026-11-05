@@ -270,7 +270,7 @@ fn prepare(geometry: ElementGeometry) -> (Option<Prepared>, usize) {
             }
         }
         if !part.indices.is_empty() {
-            part.closed = !gap && mesh.is_closed_outward();
+            part.closed = !gap && element_mesh.closed.unwrap_or_else(|| mesh.is_closed_outward());
             parts.push(part);
         }
     }

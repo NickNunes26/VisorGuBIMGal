@@ -76,6 +76,11 @@ pub struct ElementMesh {
     pub mesh: Mesh,
     /// `0xRRGGBBAA`.
     pub rgba: u32,
+    /// `Some(true)` when the mesh is known to pass [`Mesh::is_closed_outward`]: a shape repeated
+    /// under a mapped representation is checked once, before any placement. A placement keeps
+    /// it closed and outward, as `transformed` turns the winding of a mirroring one, and can only
+    /// merge corners, never part them. `None` when not yet checked.
+    pub closed: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +122,8 @@ pub struct ModelEvaluator<'a> {
     units: ProjectUnits,
     placements: HashMap<u32, DMat4>,
     curves: HashMap<u32, Rc<Stationed>>,
-    instances: HashMap<u32, Mesh>,
+    /// Each repeated shape's mesh, and whether it is closed and winds outward, once asked.
+    instances: HashMap<u32, (Mesh, Option<bool>)>,
     instance_triangles: usize,
     openings: HashMap<u32, Vec<u32>>,
     item_colors: HashMap<u32, u32>,
@@ -960,31 +966,43 @@ impl<'a> ModelEvaluator<'a> {
         }
         let local = self.instance_of(id, &entity, &def, depth);
 
-        if let Some(mesh) = local {
+        if let Some((mesh, closed)) = local {
             out.push(ElementMesh {
                 mesh: transformed(mesh, transform),
                 rgba: color,
+                closed,
             });
         }
     }
 
     /// `solid`, remembered for items under a mapped representation, which models repeat by the
-    /// thousand. An item that raised a diagnostic is not kept, so each element reports it.
-    fn instance_of(&mut self, id: u32, entity: &Entity, def: &EntityDef, depth: usize) -> Option<Mesh> {
+    /// thousand, with whether it is closed, so that is checked once too. An item that raised a
+    /// diagnostic is not kept, so each element reports it.
+    fn instance_of(
+        &mut self,
+        id: u32,
+        entity: &Entity,
+        def: &EntityDef,
+        depth: usize,
+    ) -> Option<(Mesh, Option<bool>)> {
         if depth == 0 {
-            return self.solid(id, entity, def, depth);
+            return Some((self.solid(id, entity, def, depth)?, None));
         }
-        if let Some(mesh) = self.instances.get(&id) {
-            return Some(mesh.clone());
+        // Checked when the shape comes back, so one used once is not checked twice. Only a
+        // closed shape's answer is passed on: one that is not may become closed once placed,
+        // when rounding merges corners a hair apart, so each placed copy is checked.
+        if let Some((mesh, closed)) = self.instances.get_mut(&id) {
+            let closed = *closed.get_or_insert_with(|| mesh.is_closed_outward());
+            return Some((mesh.clone(), closed.then_some(true)));
         }
         let reported = self.diagnostics.len();
         let mesh = self.solid(id, entity, def, depth)?;
         let kept = self.instance_triangles + mesh.triangles.len();
         if self.diagnostics.len() == reported && kept <= MAX_INSTANCE_TRIANGLES {
             self.instance_triangles = kept;
-            self.instances.insert(id, mesh.clone());
+            self.instances.insert(id, (mesh.clone(), None));
         }
-        Some(mesh)
+        Some((mesh, None))
     }
 
     /// Exporters may style a boolean result or only the solid it started from.
