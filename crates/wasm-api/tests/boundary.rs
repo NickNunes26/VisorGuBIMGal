@@ -366,6 +366,9 @@ fn a_mapped_shape_is_checked_once_and_its_copies_keep_what_they_are() {
     let sides = "(1,3,2),(1,4,3),(5,6,7),(5,7,8),(1,2,6),(1,6,5),(2,3,7),(2,7,6),(3,4,8),(3,8,7),(4,1,5),(4,5,8)";
     let (flags_of, _) = stream_of(mapped(cube, sides, plain, ("$", "#72", "1.E300")));
     assert_eq!(flags_of, [CLOSED, DEGRADED]);
+    // Flattened to no height, its sides have no area and the rest encloses nothing.
+    let (flags_of, _) = stream_of(mapped(cube, sides, plain, ("$", "#72", "0.")));
+    assert_eq!(flags_of, [CLOSED, DEGRADED]);
     // Open as written, with a corner 1e-12 m off its neighbour, but closed once placed 1000 km
     // away, where the two round to one: every copy is checked as placed.
     let split = format!("{OCTAHEDRON},(4.000000000001,0.,0.)");

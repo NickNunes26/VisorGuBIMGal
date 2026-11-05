@@ -967,10 +967,12 @@ impl<'a> ModelEvaluator<'a> {
         let local = self.instance_of(id, &entity, &def, depth);
 
         if let Some((mesh, closed)) = local {
+            // A placement that flattens the shape leaves it no volume, so it is checked again.
+            let keeps_volume = transform.determinant().is_normal();
             out.push(ElementMesh {
                 mesh: transformed(mesh, transform),
                 rgba: color,
-                closed,
+                closed: closed.filter(|_| keeps_volume),
             });
         }
     }
