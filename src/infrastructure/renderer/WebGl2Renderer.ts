@@ -19,6 +19,7 @@ import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { canvasPoint, canvasRay } from './canvasView';
+import { chooseDepthMode, withDepthMode, type DepthMode } from './glDepth';
 import { waitForSync } from './glSync';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
@@ -96,6 +97,22 @@ bool sectioned(vec3 relPos) {
   return false;
 }`;
 
+// Depth, see glDepth.ts. With clip control, clip z is already reverse-Z in 0..w. Without it,
+// clipping needs -w..w, so z is remapped for that alone and the fragment writes the depth.
+const DEPTH_VS_OUT = `#ifdef FRAG_DEPTH
+out vec2 v_clipZW;
+#endif`;
+const DEPTH_VS_MAIN = `#ifdef FRAG_DEPTH
+  v_clipZW = clipPos.zw;
+  clipPos.z = clipPos.z * 2.0 - clipPos.w;
+#endif`;
+const DEPTH_FS_IN = `#ifdef FRAG_DEPTH
+in vec2 v_clipZW;
+#endif`;
+const DEPTH_FS_MAIN = `#ifdef FRAG_DEPTH
+  gl_FragDepth = v_clipZW.x / v_clipZW.y;
+#endif`;
+
 const VS_MAIN = `#version 300 es
 precision highp float;
 precision highp int;
@@ -118,6 +135,7 @@ out vec4 v_color;
 out vec3 v_viewNormal;
 out float v_worldUpZ;
 out vec3 v_relPos;
+${DEPTH_VS_OUT}
 
 void main() {
   int recIdx = int(u_recordBase + a_recordIdx);
@@ -140,7 +158,7 @@ void main() {
   vec3 relPos = u_batchOffset + a_position;
   vec4 viewPos = u_view * vec4(relPos, 1.0);
   vec4 clipPos = u_proj * viewPos;
-  clipPos.z = clipPos.z * 2.0 - clipPos.w;
+  ${DEPTH_VS_MAIN}
   gl_Position = clipPos;
   v_relPos = relPos;
 
@@ -170,6 +188,7 @@ in vec4 v_color;
 in vec3 v_viewNormal;
 in float v_worldUpZ;
 in vec3 v_relPos;
+${DEPTH_FS_IN}
 
 ${SECTION_GLSL}
 
@@ -177,6 +196,7 @@ out vec4 fragColor;
 
 void main() {
   if (sectioned(v_relPos)) discard;
+  ${DEPTH_FS_MAIN}
   float nLen = length(v_viewNormal);
   vec3 vNorm = (nLen > 1e-5) ? (v_viewNormal / nLen) : vec3(0.0, 0.0, 1.0);
 
@@ -211,6 +231,7 @@ uniform usampler2D u_recordTexture;
 
 flat out uvec2 v_pickId;
 out vec3 v_relPos;
+${DEPTH_VS_OUT}
 
 void main() {
   int recIdx = int(u_recordBase + a_recordIdx);
@@ -230,7 +251,7 @@ void main() {
   vec3 relPos = u_batchOffset + a_position;
   vec4 viewPos = u_view * vec4(relPos, 1.0);
   vec4 clipPos = u_proj * viewPos;
-  clipPos.z = clipPos.z * 2.0 - clipPos.w;
+  ${DEPTH_VS_MAIN}
   gl_Position = clipPos;
   v_relPos = relPos;
 
@@ -245,6 +266,7 @@ precision highp int;
 
 flat in uvec2 v_pickId;
 in vec3 v_relPos;
+${DEPTH_FS_IN}
 
 ${SECTION_GLSL}
 
@@ -252,6 +274,7 @@ out uvec4 fragPick;
 
 void main() {
   if (sectioned(v_relPos)) discard;
+  ${DEPTH_FS_MAIN}
   fragPick = uvec4(v_pickId.x, v_pickId.y, 0u, 1u);
 }
 `;
@@ -315,6 +338,15 @@ export class WebGl2Renderer implements RendererPort {
   private pickColorTexture: WebGLTexture | null = null;
   private pickDepthRenderbuffer: WebGLRenderbuffer | null = null;
 
+  /** The scene draws here for its float depth buffer, then is copied to the canvas. */
+  private sceneFramebuffer: WebGLFramebuffer | null = null;
+  private sceneColorRenderbuffer: WebGLRenderbuffer | null = null;
+  private sceneDepthRenderbuffer: WebGLRenderbuffer | null = null;
+  /** Size the framebuffers above were allocated at; a new context starts with none. */
+  private framebufferSize: [number, number] = [0, 0];
+  /** Kept for checks through the dev hook. */
+  private depthMode: DepthMode = 'frag-depth';
+
   private readonly camera = new Camera();
   /** Projection, view, then the section planes relative to the eye. */
   private readonly sceneUniformData = new Float32Array(32 + SECTION_FLOATS);
@@ -361,7 +393,8 @@ export class WebGl2Renderer implements RendererPort {
     try {
       gl = canvas.getContext('webgl2', {
         alpha: false,
-        depth: true,
+        // The scene has its own depth buffer.
+        depth: false,
         stencil: false,
         antialias: false,
         powerPreference: 'high-performance'
@@ -435,7 +468,9 @@ export class WebGl2Renderer implements RendererPort {
   }
 
   private createProgramsAndBuffers(gl: WebGL2RenderingContext): void {
-    this.mainProgram = createProgram(gl, VS_MAIN, FS_MAIN);
+    const mode = chooseDepthMode(gl);
+    this.depthMode = mode;
+    this.mainProgram = createProgram(gl, withDepthMode(VS_MAIN, mode), withDepthMode(FS_MAIN, mode));
     this.mainUniforms = {
       u_proj: gl.getUniformLocation(this.mainProgram, 'u_proj'),
       u_view: gl.getUniformLocation(this.mainProgram, 'u_view'),
@@ -447,7 +482,7 @@ export class WebGl2Renderer implements RendererPort {
       u_sections: gl.getUniformLocation(this.mainProgram, 'u_sections')
     };
 
-    this.pickProgram = createProgram(gl, VS_PICK, FS_PICK);
+    this.pickProgram = createProgram(gl, withDepthMode(VS_PICK, mode), withDepthMode(FS_PICK, mode));
     this.pickUniforms = {
       u_proj: gl.getUniformLocation(this.pickProgram, 'u_proj'),
       u_view: gl.getUniformLocation(this.pickProgram, 'u_view'),
@@ -481,6 +516,10 @@ export class WebGl2Renderer implements RendererPort {
     this.pickFramebuffer = gl.createFramebuffer();
     this.pickColorTexture = gl.createTexture();
     this.pickDepthRenderbuffer = gl.createRenderbuffer();
+    this.sceneFramebuffer = gl.createFramebuffer();
+    this.sceneColorRenderbuffer = gl.createRenderbuffer();
+    this.sceneDepthRenderbuffer = gl.createRenderbuffer();
+    this.framebufferSize = [0, 0];
 
     // Enable vertex attribute arrays once on the active context
     gl.enableVertexAttribArray(0);
@@ -497,15 +536,44 @@ export class WebGl2Renderer implements RendererPort {
     const width = Math.max(1, Math.floor((rect.width || this.canvas.clientWidth || 800) * dpr));
     const height = Math.max(1, Math.floor((rect.height || this.canvas.clientHeight || 600) * dpr));
 
-    if (this.canvas.width === width && this.canvas.height === height) {
+    const [allocatedWidth, allocatedHeight] = this.framebufferSize;
+    if (
+      this.canvas.width === width &&
+      this.canvas.height === height &&
+      allocatedWidth === width &&
+      allocatedHeight === height
+    ) {
       return;
     }
 
     this.canvas.width = width;
     this.canvas.height = height;
     this.camera.setAspect(width / height);
+    this.framebufferSize = [width, height];
 
     const gl = this.gl;
+    if (this.sceneFramebuffer && this.sceneColorRenderbuffer && this.sceneDepthRenderbuffer) {
+      gl.bindRenderbuffer(gl.RENDERBUFFER, this.sceneColorRenderbuffer);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, width, height);
+      gl.bindRenderbuffer(gl.RENDERBUFFER, this.sceneDepthRenderbuffer);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT32F, width, height);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFramebuffer);
+      gl.framebufferRenderbuffer(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.RENDERBUFFER,
+        this.sceneColorRenderbuffer
+      );
+      gl.framebufferRenderbuffer(
+        gl.FRAMEBUFFER,
+        gl.DEPTH_ATTACHMENT,
+        gl.RENDERBUFFER,
+        this.sceneDepthRenderbuffer
+      );
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+
     if (this.pickFramebuffer && this.pickColorTexture && this.pickDepthRenderbuffer) {
       gl.bindTexture(gl.TEXTURE_2D, this.pickColorTexture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -525,7 +593,7 @@ export class WebGl2Renderer implements RendererPort {
       );
 
       gl.bindRenderbuffer(gl.RENDERBUFFER, this.pickDepthRenderbuffer);
-      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT32F, width, height);
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFramebuffer);
       gl.framebufferTexture2D(
@@ -1208,8 +1276,11 @@ export class WebGl2Renderer implements RendererPort {
     this.updateGpuSceneTables();
 
     const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    const { width, height } = this.canvas;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFramebuffer);
+    gl.viewport(0, 0, width, height);
+    // A pick that failed half way may have left it on, and it limits clears and the copy.
+    gl.disable(gl.SCISSOR_TEST);
 
     // The transparent pass ends with depth writes off, and clearing obeys the depth mask,
     // so turn writes back on first or the next frame keeps this one's depth and draws nothing.
@@ -1357,6 +1428,11 @@ export class WebGl2Renderer implements RendererPort {
       }
       gl.uniform1i(this.mainUniforms.u_ghostPass, 0);
     }
+
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.sceneFramebuffer);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
     this.renderCount++;
     this.lastFrameCpuMs = performance.now() - t0;
@@ -1599,7 +1675,20 @@ export class WebGl2Renderer implements RendererPort {
         this.gl.deleteRenderbuffer(this.pickDepthRenderbuffer);
         this.pickDepthRenderbuffer = null;
       }
+      if (this.sceneFramebuffer) {
+        this.gl.deleteFramebuffer(this.sceneFramebuffer);
+        this.sceneFramebuffer = null;
+      }
+      if (this.sceneColorRenderbuffer) {
+        this.gl.deleteRenderbuffer(this.sceneColorRenderbuffer);
+        this.sceneColorRenderbuffer = null;
+      }
+      if (this.sceneDepthRenderbuffer) {
+        this.gl.deleteRenderbuffer(this.sceneDepthRenderbuffer);
+        this.sceneDepthRenderbuffer = null;
+      }
     }
+    this.framebufferSize = [0, 0];
 
     this.gl = null;
   }
