@@ -101,6 +101,28 @@ fn a_side_of_three_or_four_faces_is_not_closed() {
 }
 
 #[test]
+fn a_triangle_with_a_repeated_corner_cannot_close_a_hole() {
+    // Such a triangle runs both ways along its one real side, so it pairs with itself and has
+    // no area: it never stands in for a side a hole lacks.
+    let mut holed = cube();
+    let [a, b, c] = holed.triangles.remove(0);
+    let [d, e, f] = holed.triangles.remove(0);
+    for [from, to] in [[a, b], [b, c], [c, a], [d, e], [e, f], [f, d]] {
+        holed.triangles.push([to, from, from]);
+        holed.triangles.push([to, to, from]);
+    }
+    assert!(!holed.is_closed_outward(), "flaps on the hole's sides");
+    // On a closed box, one changes nothing that shows.
+    let mut flapped = cube();
+    flapped.triangles.extend([[0, 0, 6], [3, 5, 5]]);
+    assert!(flapped.is_closed_outward(), "a box with two triangles of no area");
+    // A triangle on one corner repeats its side: the mesh is left open, which is safe.
+    let mut pointed = cube();
+    pointed.triangles.extend([[5, 5, 5], [0, 0, 6]]);
+    assert!(!pointed.is_closed_outward(), "a triangle of three equal corners");
+}
+
+#[test]
 fn broken_meshes_are_not_closed() {
     assert!(!Mesh::default().is_closed_outward(), "empty");
     let mut out_of_range = cube();
