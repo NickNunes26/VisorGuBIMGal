@@ -4,6 +4,8 @@ use crate::batches::{Batch, GeometryStream};
 use crate::drawing::{DrawingRequest, DrawingStream};
 use crate::encode::{complete_json, diagnostics_json};
 use crate::json::to_json;
+use crate::shape::element_shape;
+pub use crate::shape::ElementShape;
 use ifc_geometry::ModelEvaluator;
 use spatial_tree::{ElementQuery, ModelData, SearchField};
 use step_parser::{ParseError, StepIndex, index};
@@ -59,9 +61,16 @@ struct ActiveStream {
     stream: GeometryStream,
 }
 
+struct Query {
+    evaluator: ModelEvaluator<'static>,
+    /// What the stream draws, ascending.
+    drawn: Vec<u32>,
+}
+
 pub struct LoadedModel {
     stream: Option<ActiveStream>,
     drawing: Option<DrawingStream>,
+    query: Option<Query>,
     data: ModelData<'static>,
     file: &'static StepIndex<'static>,
     _allocation: Allocation,
@@ -74,7 +83,7 @@ impl LoadedModel {
             let identifiers = file.schema_identifiers().iter().map(ToString::to_string).collect();
             return Err(OpenError::UnsupportedSchema(identifiers));
         };
-        Ok(Self { stream: None, drawing: None, data, file, _allocation: allocation })
+        Ok(Self { stream: None, drawing: None, query: None, data, file, _allocation: allocation })
     }
 
     pub fn summary_json(&self) -> String {
@@ -109,6 +118,19 @@ impl LoadedModel {
             text: text.to_string(),
             property_name: property_name.map(str::to_string),
         }))
+    }
+
+    /// `None` for an id the stream does not draw. Its own evaluator, kept for the next query.
+    pub fn element_mesh(&mut self, express_id: u32) -> Option<ElementShape> {
+        if self.query.is_none() {
+            self.query = ModelEvaluator::new(self.file).ok().map(|evaluator| {
+                let drawn = evaluator.element_ids();
+                Query { evaluator, drawn }
+            });
+        }
+        let query = self.query.as_mut()?;
+        query.drawn.binary_search(&express_id).ok()?;
+        element_shape(&query.evaluator.evaluate(express_id)?)
     }
 
     /// Starts from the first element. Evaluator caches last only as long as the stream.

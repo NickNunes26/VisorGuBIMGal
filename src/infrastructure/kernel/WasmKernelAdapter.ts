@@ -4,6 +4,7 @@ import {
   KernelError,
   type DrawingId,
   type ElementDetails,
+  type ElementMesh,
   type ElementQuery,
   type ExportedDrawing,
   type GeneratedDrawing,
@@ -183,6 +184,17 @@ export class WasmKernelAdapter implements KernelPort {
       return await worker.call<number[]>({ op: 'find', query });
     } catch (error) {
       if (isClosed(error)) return [];
+      throw error;
+    }
+  }
+
+  async elementMesh(modelId: ModelId, expressId: number): Promise<ElementMesh | null> {
+    const worker = this.workers.get(modelId);
+    if (!worker) return null;
+    try {
+      return await worker.call<ElementMesh | null>({ op: 'mesh', expressId });
+    } catch (error) {
+      if (isClosed(error)) return null;
       throw error;
     }
   }

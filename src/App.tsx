@@ -8,6 +8,9 @@ import { GisMapPanel } from './ui/components/GisMapPanel';
 import { DisplayBar } from './ui/components/DisplayBar';
 import { SectionBar } from './ui/components/SectionBar';
 import { SearchPanel } from './ui/components/SearchPanel';
+import { MeasureBar } from './ui/components/MeasureBar';
+import { MeasureOverlay } from './ui/components/MeasureOverlay';
+import { MeasureController } from './ui/viewer/MeasureController';
 import { NO_SECTION, sceneBounds, sectionPlanes, type SectionState } from './ui/viewer/section';
 import { BimViewer } from './ui/viewer/BimViewer';
 import {
@@ -55,11 +58,23 @@ export default function App() {
 
   const ifcClasses = useMemo(() => classCounts(Object.values(spatialTrees)), [spatialTrees]);
 
+  const measure = useMemo(() => new MeasureController(renderer, kernel), []);
+
   const [section, setSection] = useState<SectionState>(NO_SECTION);
   const bounds = useMemo(() => sceneBounds(models), [models]);
   useEffect(() => {
-    renderer.setSectionPlanes(sectionPlanes(section, bounds));
-  }, [section, bounds]);
+    const planes = sectionPlanes(section, bounds);
+    renderer.setSectionPlanes(planes);
+    measure.setPlanes(planes);
+  }, [section, bounds, measure]);
+
+  // With no model left there is nothing to measure on
+  useEffect(() => {
+    if (models.length === 0) {
+      measure.setKind(null);
+      measure.clear();
+    }
+  }, [models.length, measure]);
 
   const handleIsolate = useCallback((target: DisplayTarget) => {
     setDisplayRule((prev) => ({ ...prev, isolate: target }));
@@ -248,7 +263,8 @@ export default function App() {
     });
     setSelectedElement((prev) => (prev?.modelId === id ? null : prev));
     setDisplayRule((prev) => withoutModel(prev, id));
-  }, []);
+    measure.forgetModel(id);
+  }, [measure]);
 
   // Locate model on GIS map
   const handleLocateOnGis = useCallback((model: ModelRecord) => {
@@ -345,9 +361,14 @@ export default function App() {
             onSelectElement={(ref) => void handleSelectElement(ref)}
             onHoverElement={setHoveredRef}
             onInitError={setRendererError}
+            onPoint={measure.point}
+            onPointerMove={measure.hover}
+            onFrame={measure.frame}
             statusText={statusText}
             isWorking={isWorking}
-          />
+          >
+            <MeasureOverlay controller={measure} renderer={renderer} />
+          </BimViewer>
 
           {models.length > 0 && (
             <div className="viewport-tools">
@@ -361,6 +382,7 @@ export default function App() {
                 onShowAll={() => setDisplayRule((prev) => ({ ...SHOW_ALL, ghost: prev.ghost }))}
               />
               <SectionBar section={section} bounds={bounds} onChange={setSection} />
+              <MeasureBar controller={measure} />
             </div>
           )}
 

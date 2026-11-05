@@ -1,5 +1,6 @@
 import type { ModelBounds } from '../../domain/models/ModelRecord';
 import type { ViewPreset } from '../../domain/kernel/RendererPort';
+import type { Ray, Vec3 } from '../../domain/measure/geometry';
 
 const ISO_AZIMUTH = -Math.PI / 4; // +X, -Y (front-right in IFC Z-up)
 const ISO_ELEVATION = Math.atan(1 / Math.SQRT2); // ~35.264 deg above horizontal
@@ -147,6 +148,53 @@ export class Camera {
     }
   }
 
+  private near(): number {
+    return Math.max(0.01, Math.min(2.0, this.distance * 0.002));
+  }
+
+  /** Forward, right and up unit vectors in IFC Z-up; see writeUniforms. */
+  private axes(): { forward: Vec3; right: Vec3; up: Vec3 } {
+    const cosPhi = Math.cos(this.elevation);
+    const sinPhi = Math.sin(this.elevation);
+    const cosTheta = Math.cos(this.azimuth);
+    const sinTheta = Math.sin(this.azimuth);
+    return {
+      forward: [-cosPhi * cosTheta, -cosPhi * sinTheta, -sinPhi],
+      right: [-sinTheta, cosTheta, 0],
+      up: [-sinPhi * cosTheta, -sinPhi * sinTheta, cosPhi]
+    };
+  }
+
+  /**
+   * Where a point shows, in normalised device coordinates (x right, y up, -1 to 1 across the
+   * view), in f64. Null in front of the near plane or behind the eye.
+   */
+  project(point: Vec3): { x: number; y: number } | null {
+    const eye = this.getEye();
+    const { forward, right, up } = this.axes();
+    const d: Vec3 = [point[0] - eye[0], point[1] - eye[1], point[2] - eye[2]];
+    const along = (axis: Vec3) => d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+    const depth = along(forward);
+    if (!(depth >= this.near())) return null;
+    const h = 1.0 / Math.tan(this.fovY * 0.5);
+    return { x: ((h / this.aspect) * along(right)) / depth, y: (h * along(up)) / depth };
+  }
+
+  /** The ray from the eye through a point in normalised device coordinates. */
+  rayAt(ndcX: number, ndcY: number): Ray {
+    const { forward, right, up } = this.axes();
+    const h = 1.0 / Math.tan(this.fovY * 0.5);
+    const a = (ndcX * this.aspect) / h;
+    const b = ndcY / h;
+    const v: Vec3 = [
+      forward[0] + right[0] * a + up[0] * b,
+      forward[1] + right[1] * a + up[1] * b,
+      forward[2] + right[2] * a + up[2] * b
+    ];
+    const l = Math.hypot(v[0], v[1], v[2]);
+    return { origin: this.getEye(), direction: [v[0] / l, v[1] / l, v[2] / l] };
+  }
+
   /**
    * Writes column-major Reverse-Z projection (floats 0..15) and
    * rotation-only view matrix at the camera eye (floats 16..31).
@@ -155,7 +203,7 @@ export class Camera {
     // 1. Reverse-Z perspective projection matrix (clip z in [0, w], near -> 1, far -> 0)
     const h = 1.0 / Math.tan(this.fovY * 0.5);
     const w = h / this.aspect;
-    const near = Math.max(0.01, Math.min(2.0, this.distance * 0.002));
+    const near = this.near();
     const far = Math.max(50000.0, this.distance * 250.0);
     const a = near / (far - near);
     const b = (far * near) / (far - near);

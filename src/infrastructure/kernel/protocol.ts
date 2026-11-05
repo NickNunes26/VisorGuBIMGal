@@ -10,6 +10,7 @@ export type WorkerRequest =
   | { op: 'details'; expressId: number }
   | { op: 'tree' }
   | { op: 'find'; query: ElementQuery }
+  | { op: 'mesh'; expressId: number }
   | { op: 'draw-start'; request: number[] }
   | { op: 'draw-next' }
   | { op: 'draw-finish' }

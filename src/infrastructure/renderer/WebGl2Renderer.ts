@@ -9,13 +9,16 @@ import {
 import {
   MAX_SECTION_PLANES,
   type ElementDisplay,
+  type PointerMode,
   type RendererEventHandlers,
   type RendererPort,
   type SectionPlane,
   type ViewPreset
 } from '../../domain/kernel/RendererPort';
+import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
+import { canvasPoint, canvasRay } from './canvasView';
 import { waitForSync } from './glSync';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
@@ -336,6 +339,8 @@ export class WebGl2Renderer implements RendererPort {
   private deviceLostBanner: HTMLDivElement | null = null;
   private isDestroyed = false;
   private isPicking = false;
+  private pickQueue: Promise<unknown> = Promise.resolve();
+  private pointerMode: PointerMode = 'select';
   private initGeneration = 0;
 
   // Telemetry for verification and performance checks
@@ -561,7 +566,15 @@ export class WebGl2Renderer implements RendererPort {
 
     const stopInput = attachCanvasInput(canvas, this.camera, {
       onViewChange: () => this.requestRender(),
+      onHover: (at) => {
+        if (this.pointerMode === 'measure') this.handlers.onPointerMove?.(at);
+      },
+      idleCursor: () => this.idleCursor(),
       onClick: (cssX, cssY) => {
+        if (this.pointerMode === 'measure') {
+          this.handlers.onPoint?.(cssX, cssY);
+          return;
+        }
         void this.pick(cssX, cssY).then((hit) => {
           this.setSelection(hit);
           this.handlers.onSelect?.(hit);
@@ -1347,9 +1360,34 @@ export class WebGl2Renderer implements RendererPort {
 
     this.renderCount++;
     this.lastFrameCpuMs = performance.now() - t0;
+    this.handlers.onFrame?.();
   }
 
-  async pick(cssX: number, cssY: number): Promise<ElementRef | null> {
+  /** One at a time, in order: each waits for the last to read back. */
+  pick(cssX: number, cssY: number): Promise<ElementRef | null> {
+    const result = this.pickQueue.then(() => this.pickOnce(cssX, cssY));
+    this.pickQueue = result.catch(() => null);
+    return result;
+  }
+
+  setPointerMode(mode: PointerMode): void {
+    this.pointerMode = mode;
+    if (this.canvas) this.canvas.style.cursor = this.idleCursor();
+  }
+
+  private idleCursor(): string {
+    return this.pointerMode === 'measure' ? 'crosshair' : 'grab';
+  }
+
+  rayAt(x: number, y: number): Ray | null {
+    return this.canvas && this.gl ? canvasRay(this.camera, this.canvas, x, y) : null;
+  }
+
+  project(point: Vec3): { x: number; y: number } | null {
+    return this.canvas && this.gl ? canvasPoint(this.camera, this.canvas, point) : null;
+  }
+
+  private async pickOnce(cssX: number, cssY: number): Promise<ElementRef | null> {
     if (
       this.isDestroyed ||
       this.isPicking ||

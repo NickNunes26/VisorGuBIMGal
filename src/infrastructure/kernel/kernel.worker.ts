@@ -1,6 +1,11 @@
 import type { ModelId } from '../../domain/models/ModelRecord';
 import type { GeometryBatch } from '../../domain/kernel/GeometryBatch';
-import type { KernelDiagnostic, KernelErrorCode, ModelSummary } from '../../domain/kernel/KernelPort';
+import type {
+  ElementMesh,
+  KernelDiagnostic,
+  KernelErrorCode,
+  ModelSummary
+} from '../../domain/kernel/KernelPort';
 import type { StreamStep, WorkerRequest, WorkerResponse } from './protocol';
 import init, { allocationFailed, Model, Sheet } from './pkg/wasm_api';
 
@@ -103,6 +108,18 @@ function nextBatch(): { value: StreamStep; transfer: Transferable[] } {
   return { value: { complete: { type: 'complete', ...complete, diagnostics } }, transfer: [] };
 }
 
+function elementMesh(expressId: number): { value: ElementMesh | null; transfer: Transferable[] } {
+  const view = current().model.elementMesh(expressId);
+  if (!view) return { value: null, transfer: [] };
+  try {
+    const mesh = { positions: view.takePositions(), indices: view.takeIndices(), edges: view.takeEdges() };
+    const transfer = [mesh.positions.buffer, mesh.indices.buffer, mesh.edges.buffer] as Transferable[];
+    return { value: mesh, transfer };
+  } finally {
+    view.free();
+  }
+}
+
 function currentSheet(): Sheet {
   if (!sheet) throw new RequestError('drawing-not-found', 'El plano no existe.');
   return sheet;
@@ -167,6 +184,8 @@ function handle(request: WorkerRequest): { value: unknown; transfer: Transferabl
       const ids = current().model.findElements(field, text, propertyName);
       return { value: Array.from(ids), transfer: [] };
     }
+    case 'mesh':
+      return elementMesh(request.expressId);
   }
 }
 

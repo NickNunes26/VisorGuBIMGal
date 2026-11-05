@@ -8,6 +8,10 @@ export interface CanvasInputHandlers {
   onViewChange(): void;
   /** A press and release that did not move, in CSS pixels from the canvas's top left. */
   onClick(cssX: number, cssY: number): void;
+  /** A mouse moving with no button down, in CSS pixels; null once it leaves the canvas. */
+  onHover?(at: { x: number; y: number } | null): void;
+  /** The mouse cursor while no button is down; 'grab' if not given. */
+  idleCursor?(): string;
 }
 
 interface Pair {
@@ -96,9 +100,17 @@ export function attachCanvasInput(
     }
   };
 
+  const idleCursor = () => handlers.idleCursor?.() ?? 'grab';
+
   const onPointerMove = (e: PointerEvent) => {
     const pointer = pointers.get(e.pointerId);
-    if (!pointer) return;
+    if (!pointer) {
+      if (e.pointerType === 'mouse' && pointers.size === 0 && handlers.onHover) {
+        const rect = canvas.getBoundingClientRect();
+        handlers.onHover({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+      }
+      return;
+    }
     if (Math.hypot(e.clientX - pressX, e.clientY - pressY) > CLICK_SLOP) moved = true;
 
     if (pointers.size >= 2) {
@@ -129,7 +141,7 @@ export function attachCanvasInput(
     if (pointers.size > 0) return;
 
     panning = false;
-    if (e.pointerType === 'mouse') canvas.style.cursor = 'grab';
+    if (e.pointerType === 'mouse') canvas.style.cursor = idleCursor();
     if (completed && wasOnly && !moved && !multi && pressButton === 0) {
       const rect = canvas.getBoundingClientRect();
       handlers.onClick(e.clientX - rect.left, e.clientY - rect.top);
@@ -149,6 +161,10 @@ export function attachCanvasInput(
     e.preventDefault();
   };
 
+  const onPointerLeave = (e: PointerEvent) => {
+    if (e.pointerType === 'mouse' && pointers.size === 0) handlers.onHover?.(null);
+  };
+
   canvas.addEventListener('pointerdown', onPointerDown);
   canvas.addEventListener('pointermove', onPointerMove);
   canvas.addEventListener('pointerup', onPointerUp);
@@ -156,9 +172,10 @@ export function attachCanvasInput(
   canvas.addEventListener('lostpointercapture', onPointerCancel);
   canvas.addEventListener('wheel', onWheel, { passive: false });
   canvas.addEventListener('contextmenu', onContextMenu);
+  canvas.addEventListener('pointerleave', onPointerLeave);
   // The browser must not scroll or zoom the page under a finger on the canvas.
   canvas.style.touchAction = 'none';
-  canvas.style.cursor = 'grab';
+  canvas.style.cursor = idleCursor();
 
   return () => {
     settlePair(false);
@@ -169,5 +186,6 @@ export function attachCanvasInput(
     canvas.removeEventListener('lostpointercapture', onPointerCancel);
     canvas.removeEventListener('wheel', onWheel);
     canvas.removeEventListener('contextmenu', onContextMenu);
+    canvas.removeEventListener('pointerleave', onPointerLeave);
   };
 }

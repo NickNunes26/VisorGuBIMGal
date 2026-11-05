@@ -131,6 +131,21 @@ export interface ElementQuery {
   propertyName?: string;
 }
 
+/**
+ * One element's triangles, for measuring: the surface the stream draws, every mesh of the
+ * element in one. Absolute model coordinates in metres (IFC Z-up) as f64, three per vertex;
+ * corners within a micrometre are one vertex, so neighbouring triangles share indices.
+ */
+export interface ElementMesh {
+  positions: Float64Array;
+  indices: Uint32Array;
+  /**
+   * The edges a user sees, as pairs of vertex indices, low first: borders, and creases where
+   * the surface turns more than 20 degrees. None inside a flat face or across a curved one.
+   */
+  edges: Uint32Array;
+}
+
 export type DrawingId = string;
 
 export interface GeneratedDrawing {
@@ -172,6 +187,9 @@ export interface KernelPort {
 
   /** Ascending expressIds of the matching elements; empty when the model is not open. */
   findElements(modelId: ModelId, query: ElementQuery): Promise<number[]>;
+
+  /** Null when the stream draws nothing for the element or the model is not open. */
+  elementMesh(modelId: ModelId, expressId: number): Promise<ElementMesh | null>;
 
   /**
    * Cuts the given models together in the frame named by `options`, so hidden lines work

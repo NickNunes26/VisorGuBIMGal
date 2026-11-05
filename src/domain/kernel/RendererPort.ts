@@ -1,5 +1,6 @@
 import type { ElementRef, ModelBounds, ModelId } from '../models/ModelRecord';
 import type { GeometryBatch } from './GeometryBatch';
+import type { Ray, Vec3 } from '../measure/geometry';
 
 export type ViewPreset = 'iso' | 'top' | 'front' | 'side';
 
@@ -22,9 +23,19 @@ export interface SectionPlane {
 /** A section box takes six planes; no more are drawn. */
 export const MAX_SECTION_PLANES = 6;
 
+/** 'measure': a click reports a point instead of selecting, and the mouse is followed. */
+export type PointerMode = 'select' | 'measure';
+
+/** Canvas positions are CSS pixels from the canvas's top left. */
 export interface RendererEventHandlers {
   onSelect?: (ref: ElementRef | null) => void;
   onHover?: (ref: ElementRef | null) => void;
+  /** In 'measure' mode, a click; nothing is selected. */
+  onPoint?: (x: number, y: number) => void;
+  /** In 'measure' mode, a mouse moving over the canvas with no button down; null once it leaves. */
+  onPointerMove?: (at: { x: number; y: number } | null) => void;
+  /** After each drawn frame, so an overlay can follow the camera and the canvas size. */
+  onFrame?: () => void;
 }
 
 /**
@@ -63,6 +74,18 @@ export interface RendererPort {
 
   setViewPreset(preset: ViewPreset): void;
   fitToView(): void;
+
+  /** 'select' until changed. */
+  setPointerMode(mode: PointerMode): void;
+  /**
+   * The element drawn at a canvas position, as a click would select it: ghosts and what the
+   * section cuts away are passed through. Null over the background or before initialize.
+   */
+  pick(x: number, y: number): Promise<ElementRef | null>;
+  /** The ray from the eye through a canvas position, in absolute model coordinates. */
+  rayAt(x: number, y: number): Ray | null;
+  /** Where an absolute point shows on the canvas; null behind the eye or before initialize. */
+  project(point: Vec3): { x: number; y: number } | null;
 
   /** Releases GPU resources and removes every listener it added. */
   destroy(): void;

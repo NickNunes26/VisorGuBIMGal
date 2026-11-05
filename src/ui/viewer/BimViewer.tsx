@@ -1,7 +1,7 @@
-import React, { useEffect, useRef, useState, type DragEvent } from 'react';
+import React, { useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react';
 import { RefreshCw, Box, Compass, Eye, UploadCloud } from 'lucide-react';
 import type { ElementRef } from '../../domain/models/ModelRecord';
-import type { RendererPort } from '../../domain/kernel/RendererPort';
+import type { RendererEventHandlers, RendererPort } from '../../domain/kernel/RendererPort';
 
 interface BimViewerProps {
   renderer: RendererPort;
@@ -9,8 +9,14 @@ interface BimViewerProps {
   onSelectElement: (ref: ElementRef | null) => void;
   onHoverElement?: (ref: ElementRef | null) => void;
   onInitError?: (message: string | null) => void;
+  /** Measure mode and frames, passed to the renderer as they are. */
+  onPoint?: RendererEventHandlers['onPoint'];
+  onPointerMove?: RendererEventHandlers['onPointerMove'];
+  onFrame?: RendererEventHandlers['onFrame'];
   statusText: string;
   isWorking: boolean;
+  /** Drawn over the canvas, in its coordinates. */
+  children?: ReactNode;
 }
 
 export const BimViewer: React.FC<BimViewerProps> = ({
@@ -19,8 +25,12 @@ export const BimViewer: React.FC<BimViewerProps> = ({
   onSelectElement,
   onHoverElement,
   onInitError,
+  onPoint,
+  onPointerMove,
+  onFrame,
   statusText,
-  isWorking
+  isWorking,
+  children
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -29,9 +39,12 @@ export const BimViewer: React.FC<BimViewerProps> = ({
   useEffect(() => {
     renderer.setHandlers({
       onSelect: (ref) => onSelectElement(ref),
-      onHover: (ref) => onHoverElement?.(ref)
+      onHover: (ref) => onHoverElement?.(ref),
+      onPoint,
+      onPointerMove,
+      onFrame
     });
-  }, [renderer, onSelectElement, onHoverElement]);
+  }, [renderer, onSelectElement, onHoverElement, onPoint, onPointerMove, onFrame]);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -80,6 +93,7 @@ export const BimViewer: React.FC<BimViewerProps> = ({
       onDrop={handleDrop}
     >
       <canvas ref={canvasRef} className="bim-viewport" tabIndex={0} />
+      {children}
 
       {/* Floating viewport controls */}
       <div className="viewport-overlay-toolbar">

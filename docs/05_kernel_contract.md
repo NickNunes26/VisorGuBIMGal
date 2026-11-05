@@ -159,6 +159,27 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 - **Sin nada que buscar** (texto vacío y sin `propertyName` útil) devuelve una lista vacía.
 - Un modelo cerrado da una lista vacía, no un error.
 
+### Malla de un elemento
+
+`elementMesh(modelId, expressId)` devuelve los triángulos de un elemento para medir sobre él (`ElementMesh`):
+
+- **La superficie que dibuja el flujo:** los mismos triángulos, huecos ya restados y sin los degenerados, con todas las mallas del elemento juntas. Sin color ni normales.
+- **Coordenadas absolutas de modelo en `f64`**, metros y Z arriba, sin origen de lote: la medida no pierde la precisión que `f32` perdería lejos del origen.
+- **Vértices compartidos:** las esquinas a menos de una micra son un solo vértice, que conserva la posición de la primera. Un triángulo que al fundirse queda sin área se descarta.
+- **`edges`:** las aristas que ve un usuario, en pares de índices con el menor primero. Son los bordes (un lado con un solo triángulo, o con más de dos) y los pliegues, donde las normales de los dos triángulos se separan más de 20°. Nunca la diagonal de una cara plana ni las facetas de una superficie curva: los círculos tienen 32 lados, a 11,25°.
+- `null` si el flujo no dibuja nada para ese `expressId` (aberturas, productos sin representación, ids desconocidos) o si el modelo está cerrado.
+- El Worker usa un evaluador propio, que conserva sus cachés para las consultas siguientes, así que puede intercalarse con un flujo o un plano. Un elemento de un millón de triángulos tarda unos 3,5 s en el Worker; en el hilo principal solo se copian los índices de las esquinas.
+
+### Medición en el renderizador
+
+Para medir, `RendererPort` da lo mínimo y no sabe nada de medidas:
+
+- `setPointerMode('measure')` hace que un clic llame a `onPoint(x, y)` en vez de seleccionar, y que el ratón sin botones pulsados llame a `onPointerMove`, con `null` al salir del lienzo. Órbita, desplazamiento y zoom no cambian. Por defecto es `'select'`.
+- `pick(x, y)` es la misma selección del clic: no ve fantasmas ni lo que el corte quita. Las peticiones se atienden de una en una y en orden.
+- `rayAt(x, y)` y `project(point)` pasan de posición en el lienzo a rayo y de punto a posición, en `f64` y coordenadas absolutas de modelo. Concuerdan con las matrices con que se dibuja.
+- `onFrame` se llama tras cada fotograma dibujado, para que una capa encima del lienzo siga a la cámara.
+- Las posiciones del lienzo son píxeles CSS desde su esquina superior izquierda.
+
 ### Errores y diagnósticos
 
 **`KernelError`** es el fallo de toda una operación, que rechaza su promesa:
@@ -169,6 +190,7 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 | `streamGeometry` | `model-not-open` si no estaba abierto; `out-of-memory`, `internal` |
 | `getElementDetails`, `getSpatialTree` | `out-of-memory`, `internal`. Un modelo cerrado o un elemento desconocido da `null`, no un error |
 | `findElements` | `out-of-memory`, `internal`. Un modelo cerrado da `[]` |
+| `elementMesh` | `out-of-memory`, `internal`. Un modelo cerrado o un elemento sin geometría da `null` |
 | `generateDrawing` | `model-not-open` si no queda ningún modelo abierto; `drawing-frame-empty` si hay modelos abiertos y el marco los excluye a todos, con el motivo en el mensaje; `out-of-memory`, `internal` |
 | `exportDrawing` | `drawing-not-found`, `out-of-memory`, `internal` |
 | `discardDrawing`, `closeModel` | Nunca: son idempotentes |
@@ -272,6 +294,10 @@ impl Model {
     pub fn summary_json(&self) -> String;
     pub fn element_details_json(&self, express_id: u32) -> Option<String>;
     pub fn spatial_tree_json(&self) -> Option<String>;
+    pub fn find_elements(&self, field: &str, text: &str, property_name: Option<String>)
+        -> Result<Vec<u32>, JsError>;
+    /// Con `take_positions`, `take_indices` y `take_edges`, como `BatchView`.
+    pub fn element_mesh(&mut self, express_id: u32) -> Option<ShapeView>;
 
     pub fn start_stream(&mut self);
     /// Modelo de extracción: el Worker pide el siguiente lote cuando puede enviarlo.

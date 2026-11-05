@@ -1,7 +1,9 @@
 import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/ModelRecord';
 import { findBatchError, type GeometryBatch } from '../../domain/kernel/GeometryBatch';
+import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import type {
   ElementDisplay,
+  PointerMode,
   RendererEventHandlers,
   RendererPort,
   SectionPlane,
@@ -20,6 +22,7 @@ export class AutoRenderer implements RendererPort {
   }) | null = null;
   private activeBackend: BackendType | null = null;
   private handlers: RendererEventHandlers = {};
+  private pointerMode: PointerMode = 'select';
   private preInitQueue: Array<(r: RendererPort) => void> = [];
   private backendListeners: Set<(backend: BackendType | null) => void> = new Set();
 
@@ -116,6 +119,7 @@ export class AutoRenderer implements RendererPort {
       chosenBackend = 'webgl2';
     }
 
+    chosenRenderer.setPointerMode(this.pointerMode);
     this.activeRenderer = chosenRenderer;
     this.activeBackend = chosenBackend;
     this.notifyBackendChange(chosenBackend);
@@ -227,6 +231,23 @@ export class AutoRenderer implements RendererPort {
     } else {
       this.preInitQueue.push((r) => r.fitToView());
     }
+  }
+
+  setPointerMode(mode: PointerMode): void {
+    this.pointerMode = mode;
+    this.activeRenderer?.setPointerMode(mode);
+  }
+
+  pick(x: number, y: number): Promise<ElementRef | null> {
+    return this.activeRenderer ? this.activeRenderer.pick(x, y) : Promise.resolve(null);
+  }
+
+  rayAt(x: number, y: number): Ray | null {
+    return this.activeRenderer?.rayAt(x, y) ?? null;
+  }
+
+  project(point: Vec3): { x: number; y: number } | null {
+    return this.activeRenderer?.project(point) ?? null;
   }
 
   destroy(): void {

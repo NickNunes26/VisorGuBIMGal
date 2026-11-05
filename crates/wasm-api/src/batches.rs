@@ -96,7 +96,7 @@ impl Prepared {
 }
 
 /// `None` when a corner is corrupt or the triangle has no area, so it has no normal.
-fn usable_normal(corners: [DVec3; 3]) -> Option<Vec3> {
+pub(crate) fn usable_normal(corners: [DVec3; 3]) -> Option<Vec3> {
     if !corners.iter().all(|corner| corner.abs().max_element() <= MAX_COORDINATE) {
         return None;
     }

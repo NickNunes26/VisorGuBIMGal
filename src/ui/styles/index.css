@@ -429,7 +429,8 @@ canvas.bim-viewport {
 }
 
 .display-bar,
-.section-bar {
+.section-bar,
+.measure-bar {
   background-color: rgba(15, 23, 42, 0.85);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -503,6 +504,90 @@ canvas.bim-viewport {
   font-size: 11px;
   color: var(--text-muted);
   overflow-wrap: anywhere;
+}
+
+.measure-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 2px 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.measure-result {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+
+.measure-kind {
+  flex: 1;
+  color: var(--text-muted);
+}
+
+.measure-value {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Over the canvas, under the tool bars, and never in the way of the pointer. */
+.measure-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 5;
+}
+
+.measure-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.measure-line {
+  stroke: #facc15;
+  stroke-width: 2;
+}
+
+.measure-dashed {
+  stroke-dasharray: 5 4;
+}
+
+.measure-draft {
+  stroke: #fde68a;
+}
+
+.measure-fill {
+  fill: rgba(250, 204, 21, 0.18);
+  stroke: none;
+}
+
+.measure-point {
+  fill: #facc15;
+  stroke: #0f172a;
+  stroke-width: 1;
+}
+
+.measure-snap {
+  fill: none;
+  stroke: #22d3ee;
+  stroke-width: 2;
+}
+
+.measure-label {
+  position: absolute;
+  transform: translate(-50%, -130%);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(250, 204, 21, 0.6);
+  color: #f8fafc;
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .tree-spatial-label {

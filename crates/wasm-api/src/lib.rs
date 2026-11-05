@@ -5,6 +5,7 @@ pub mod drawing;
 mod encode;
 mod json;
 pub mod loaded;
+pub mod shape;
 
 use drawing::{DrawingRequest, ExportOptions, SheetStore};
 use loaded::{LoadedModel, OpenError};
@@ -140,6 +141,12 @@ impl Model {
             .ok_or_else(|| JsError::new(&format!("internal||unknown search field: {field}")))
     }
 
+    /// See `KernelPort.elementMesh`.
+    #[wasm_bindgen(js_name = elementMesh)]
+    pub fn element_mesh(&mut self, express_id: u32) -> Option<ShapeView> {
+        self.inner.element_mesh(express_id).map(|shape| ShapeView { shape })
+    }
+
     #[wasm_bindgen(js_name = startStream)]
     pub fn start_stream(&mut self) {
         self.inner.start_stream();
@@ -262,6 +269,30 @@ impl BatchView {
     #[wasm_bindgen(js_name = takeMeshTable)]
     pub fn take_mesh_table(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.batch.mesh_table)
+    }
+}
+
+/// As `BatchView`, for one element's shape.
+#[wasm_bindgen]
+pub struct ShapeView {
+    shape: shape::ElementShape,
+}
+
+#[wasm_bindgen]
+impl ShapeView {
+    #[wasm_bindgen(js_name = takePositions)]
+    pub fn take_positions(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.shape.positions)
+    }
+
+    #[wasm_bindgen(js_name = takeIndices)]
+    pub fn take_indices(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.shape.indices)
+    }
+
+    #[wasm_bindgen(js_name = takeEdges)]
+    pub fn take_edges(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.shape.edges)
     }
 }
 
