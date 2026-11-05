@@ -115,6 +115,22 @@ export type ElementDetails = Omit<SelectedElementDetails, 'modelName' | 'attribu
   materials: MaterialInfo[];
 };
 
+/**
+ * A search over the elements of `elementCount`. 'any' tries name, class, GlobalId and property
+ * values; 'property' looks at the values of the element's properties and quantities, its type's
+ * included, as the properties panel shows them (booleans as true and false).
+ */
+export interface ElementQuery {
+  field: 'any' | 'name' | 'class' | 'globalId' | 'property';
+  /** Trimmed, then matched as a substring, ignoring case except in a GlobalId. */
+  text: string;
+  /**
+   * For 'property' only: just the properties of this name, ignoring case. With it an empty
+   * `text` finds every element that has such a property; without it, empty finds nothing.
+   */
+  propertyName?: string;
+}
+
 export type DrawingId = string;
 
 export interface GeneratedDrawing {
@@ -153,6 +169,9 @@ export interface KernelPort {
   getElementDetails(ref: ElementRef): Promise<ElementDetails | null>;
 
   getSpatialTree(modelId: ModelId): Promise<SpatialTree | null>;
+
+  /** Ascending expressIds of the matching elements; empty when the model is not open. */
+  findElements(modelId: ModelId, query: ElementQuery): Promise<number[]>;
 
   /**
    * Cuts the given models together in the frame named by `options`, so hidden lines work

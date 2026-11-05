@@ -316,3 +316,18 @@ fn summary_and_details_use_the_contract_field_names() {
     }
     assert!(model.element_details_json(999_999).is_none());
 }
+
+#[test]
+fn search_fields_cross_by_their_contract_names() {
+    let bytes = fs::read(root().join("public/samples/SimpleWall.ifc")).unwrap();
+    let model = LoadedModel::open(bytes).unwrap();
+    // #219 is the wall and #572 the door, by their lines in the file.
+    assert_eq!(model.find_elements("name", "bearing wall", None), Some(vec![219]));
+    assert_eq!(model.find_elements("class", "door", None), Some(vec![572]));
+    assert_eq!(model.find_elements("globalId", "As_wUF", None), Some(vec![572]));
+    assert_eq!(model.find_elements("any", "346", None), Some(vec![219, 572]));
+    let external = model.find_elements("property", "", Some("IsExternal"));
+    assert!(external.is_some_and(|ids| !ids.is_empty()));
+    assert_eq!(model.find_elements("Name", "wall", None), None, "names are exact");
+    assert_eq!(model.find_elements("", "wall", None), None);
+}

@@ -5,7 +5,7 @@ use crate::drawing::{DrawingRequest, DrawingStream};
 use crate::encode::{complete_json, diagnostics_json};
 use crate::json::to_json;
 use ifc_geometry::ModelEvaluator;
-use spatial_tree::ModelData;
+use spatial_tree::{ElementQuery, ModelData, SearchField};
 use step_parser::{ParseError, StepIndex, index};
 
 /// Owns the allocations that `LoadedModel`'s other fields borrow.
@@ -87,6 +87,28 @@ impl LoadedModel {
 
     pub fn element_details_json(&self, express_id: u32) -> Option<String> {
         self.data.element_details(express_id).map(|details| to_json(&details))
+    }
+
+    /// `field` is an `ElementQuery['field']` of the contract; `None` for any other.
+    pub fn find_elements(
+        &self,
+        field: &str,
+        text: &str,
+        property_name: Option<&str>,
+    ) -> Option<Vec<u32>> {
+        let field = match field {
+            "any" => SearchField::Any,
+            "name" => SearchField::Name,
+            "class" => SearchField::Class,
+            "globalId" => SearchField::GlobalId,
+            "property" => SearchField::Property,
+            _ => return None,
+        };
+        Some(self.data.find_elements(&ElementQuery {
+            field,
+            text: text.to_string(),
+            property_name: property_name.map(str::to_string),
+        }))
     }
 
     /// Starts from the first element. Evaluator caches last only as long as the stream.

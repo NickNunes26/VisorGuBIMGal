@@ -1,6 +1,6 @@
 import type { ModelId } from '../../domain/models/ModelRecord';
 import type { GeometryBatch } from '../../domain/kernel/GeometryBatch';
-import type { GeometryEvent, KernelErrorCode } from '../../domain/kernel/KernelPort';
+import type { ElementQuery, GeometryEvent, KernelErrorCode } from '../../domain/kernel/KernelPort';
 
 /** A Worker holds one model, opened by its first request, or one drawing's sheet. */
 export type WorkerRequest =
@@ -9,6 +9,7 @@ export type WorkerRequest =
   | { op: 'next-batch' }
   | { op: 'details'; expressId: number }
   | { op: 'tree' }
+  | { op: 'find'; query: ElementQuery }
   | { op: 'draw-start'; request: number[] }
   | { op: 'draw-next' }
   | { op: 'draw-finish' }

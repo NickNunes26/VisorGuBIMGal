@@ -192,6 +192,108 @@ pub struct ElementDetails {
     pub materials: Vec<MaterialInfo>,
 }
 
+/// Where `ModelData::find_elements` looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchField {
+    /// Name, class, GlobalId or property value.
+    Any,
+    Name,
+    /// The IFC class, such as `IfcWallStandardCase`.
+    Class,
+    GlobalId,
+    /// The values of the element's properties and quantities, its type's included.
+    Property,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementQuery {
+    pub field: SearchField,
+    /// Trimmed, then matched as a substring, ignoring case except in a GlobalId.
+    pub text: String,
+    /// For `Property` only: just the properties of this name, ignoring case. With it an empty
+    /// `text` finds every element that has such a property.
+    pub property_name: Option<String>,
+}
+
+/// A query ready to compare, folded once.
+struct Needle<'q> {
+    exact: &'q str,
+    folded: String,
+    property_name: Option<String>,
+}
+
+impl Needle<'_> {
+    fn in_text(&self, text: &str) -> bool {
+        text.to_lowercase().contains(&self.folded)
+    }
+}
+
+/// A number as JavaScript's `String` writes it, which is what the properties panel shows.
+fn js_number(number: f64) -> String {
+    if number == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = number.abs();
+    if (1e-6..1e21).contains(&magnitude) {
+        return number.to_string();
+    }
+    // Rust writes `1e-7` and `1.5e21` where JavaScript writes `1e-7` and `1.5e+21`.
+    let text = format!("{number:e}");
+    match text.split_once('e') {
+        Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+            format!("{mantissa}e+{exponent}")
+        }
+        _ => text,
+    }
+}
+
+/// The texts a value shows, one per scalar. Unknown logicals and nulls show nothing.
+fn value_texts(value: &AttributeValue, out: &mut Vec<String>) {
+    match value {
+        AttributeValue::Null => {}
+        AttributeValue::Number(number) => out.push(js_number(*number)),
+        AttributeValue::Text(text) => out.push(text.clone()),
+        AttributeValue::Enum(name) => match name.as_str() {
+            "T" => out.push("true".to_string()),
+            "F" => out.push("false".to_string()),
+            "U" => {}
+            other => out.push(other.to_string()),
+        },
+        AttributeValue::Ref(id) => out.push(format!("#{id}")),
+        AttributeValue::Typed { value, .. } => value_texts(value, out),
+        AttributeValue::List(items) => items.iter().for_each(|item| value_texts(item, out)),
+    }
+}
+
+/// Whether the property, or a member of a complex one, matches. A member inherits a match on
+/// its complex property's name.
+fn property_matches(item: &PropertyItem, needle: &Needle, named: bool) -> bool {
+    let named = named
+        || needle
+            .property_name
+            .as_ref()
+            .is_none_or(|name| item.name.to_lowercase() == *name);
+    let mut texts = Vec::new();
+    match &item.value {
+        PropertyValue::Single(value) => value_texts(value, &mut texts),
+        PropertyValue::Enumerated(values) | PropertyValue::List(values) => {
+            values.iter().for_each(|value| value_texts(value, &mut texts));
+        }
+        PropertyValue::Bounded { lower, upper, set_point } => {
+            for value in [lower, upper, set_point].into_iter().flatten() {
+                value_texts(value, &mut texts);
+            }
+        }
+        PropertyValue::Table { defining, defined } => {
+            defining.iter().chain(defined).for_each(|value| value_texts(value, &mut texts));
+        }
+        PropertyValue::Complex(items) => {
+            return items.iter().any(|member| property_matches(member, needle, named));
+        }
+    }
+    named && (needle.folded.is_empty() || texts.iter().any(|text| needle.in_text(text)))
+}
+
 #[derive(Default)]
 struct Relations {
     /// Whole to parts, from `IfcRelAggregates`.
@@ -1155,6 +1257,99 @@ impl<'a> ModelData<'a> {
         Some((magnitude * (cos * y - sin * x) / x.hypot(y)).abs())
     }
 
+    /// The element's own property set ids, then its type's, ascending and without repeats.
+    fn property_set_ids(&self, id: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut own = self.relations.property_sets.get(&id).cloned().unwrap_or_default();
+        own.sort_unstable();
+        own.dedup();
+        let mut from_type = self
+            .relations
+            .types
+            .get(&id)
+            .and_then(|type_id| self.lookup(*type_id))
+            .map(|(entity, def)| refs(attribute(&entity, &def, "HasPropertySets")))
+            .unwrap_or_default();
+        from_type.sort_unstable();
+        from_type.dedup();
+        (own, from_type)
+    }
+
+    /// Whether any property of the element matches, with the sets `element_details` gives it.
+    /// Each set is read once however many elements share it.
+    fn properties_match(
+        &self,
+        id: u32,
+        needle: &Needle,
+        sets: &mut HashMap<u32, Option<(String, bool)>>,
+    ) -> bool {
+        let mut checked = |set_id: u32| -> Option<(String, bool)> {
+            sets.entry(set_id)
+                .or_insert_with(|| {
+                    self.property_set(set_id).map(|set| {
+                        let found =
+                            set.properties.iter().any(|item| property_matches(item, needle, false));
+                        (set.name, found)
+                    })
+                })
+                .clone()
+        };
+        let (own, from_type) = self.property_set_ids(id);
+        let mut own_names = Vec::new();
+        for set_id in own {
+            let Some((name, found)) = checked(set_id) else { continue };
+            if found {
+                return true;
+            }
+            own_names.push(name);
+        }
+        // A set on the element overrides the type's set of the same name.
+        from_type.into_iter().any(|set_id| {
+            checked(set_id).is_some_and(|(name, found)| found && !own_names.contains(&name))
+        })
+    }
+
+    /// The elements of `elementCount` that match, ascending.
+    pub fn find_elements(&self, query: &ElementQuery) -> Vec<u32> {
+        let exact = query.text.trim();
+        let property_name = query
+            .property_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && query.field == SearchField::Property)
+            .map(str::to_lowercase);
+        if exact.is_empty() && property_name.is_none() {
+            return Vec::new();
+        }
+        let needle = Needle { exact, folded: exact.to_lowercase(), property_name };
+        let mut sets = HashMap::new();
+        self.product_ids()
+            .into_iter()
+            .filter(|id| {
+                let Some((entity, def)) = self.lookup(*id) else { return false };
+                let name = || {
+                    text(attribute(&entity, &def, "Name")).is_some_and(|name| needle.in_text(&name))
+                };
+                let class = || needle.in_text(def.name());
+                let global_id = || {
+                    text(attribute(&entity, &def, "GlobalId"))
+                        .is_some_and(|global_id| global_id.contains(needle.exact))
+                };
+                match query.field {
+                    SearchField::Name => name(),
+                    SearchField::Class => class(),
+                    SearchField::GlobalId => global_id(),
+                    SearchField::Property => self.properties_match(*id, &needle, &mut sets),
+                    SearchField::Any => {
+                        name()
+                            || class()
+                            || global_id()
+                            || self.properties_match(*id, &needle, &mut sets)
+                    }
+                }
+            })
+            .collect()
+    }
+
     pub fn element_details(&self, id: u32) -> Option<ElementDetails> {
         let (entity, def) = self.lookup(id)?;
         let attributes = def
@@ -1166,10 +1361,8 @@ impl<'a> ModelData<'a> {
             .collect();
 
         let type_id = self.relations.types.get(&id).copied();
-        let mut type_set_ids = Vec::new();
         let type_object = type_id.and_then(|type_id| {
             let (type_entity, type_def) = self.lookup(type_id)?;
-            type_set_ids = refs(attribute(&type_entity, &type_def, "HasPropertySets"));
             Some(TypeObjectRef {
                 express_id: type_id,
                 type_name: type_def.name().to_string(),
@@ -1177,11 +1370,7 @@ impl<'a> ModelData<'a> {
                 global_id: text(attribute(&type_entity, &type_def, "GlobalId")),
             })
         });
-        let mut own_ids = self.relations.property_sets.get(&id).cloned().unwrap_or_default();
-        own_ids.sort_unstable();
-        own_ids.dedup();
-        type_set_ids.sort_unstable();
-        type_set_ids.dedup();
+        let (own_ids, type_set_ids) = self.property_set_ids(id);
 
         // A set on the element overrides the type's set of the same name.
         let mut property_sets: Vec<PropertySet> = own_ids

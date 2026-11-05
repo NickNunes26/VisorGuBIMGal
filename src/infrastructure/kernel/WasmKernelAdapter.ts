@@ -4,6 +4,7 @@ import {
   KernelError,
   type DrawingId,
   type ElementDetails,
+  type ElementQuery,
   type ExportedDrawing,
   type GeneratedDrawing,
   type GeometryEvent,
@@ -171,6 +172,17 @@ export class WasmKernelAdapter implements KernelPort {
       return await worker.call<SpatialTree | null>({ op: 'tree' });
     } catch (error) {
       if (isClosed(error)) return null;
+      throw error;
+    }
+  }
+
+  async findElements(modelId: ModelId, query: ElementQuery): Promise<number[]> {
+    const worker = this.workers.get(modelId);
+    if (!worker) return [];
+    try {
+      return await worker.call<number[]>({ op: 'find', query });
+    } catch (error) {
+      if (isClosed(error)) return [];
       throw error;
     }
   }

@@ -127,6 +127,19 @@ impl Model {
         self.inner.element_details_json(express_id)
     }
 
+    /// Ascending expressIds. See `KernelPort.findElements`.
+    #[wasm_bindgen(js_name = findElements)]
+    pub fn find_elements(
+        &self,
+        field: &str,
+        text: &str,
+        property_name: Option<String>,
+    ) -> Result<Vec<u32>, JsError> {
+        self.inner
+            .find_elements(field, text, property_name.as_deref())
+            .ok_or_else(|| JsError::new(&format!("internal||unknown search field: {field}")))
+    }
+
     #[wasm_bindgen(js_name = startStream)]
     pub fn start_stream(&mut self) {
         self.inner.start_stream();

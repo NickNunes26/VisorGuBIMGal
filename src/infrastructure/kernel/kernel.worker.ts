@@ -162,6 +162,11 @@ function handle(request: WorkerRequest): { value: unknown; transfer: Transferabl
       const json = current().model.spatialTreeJson();
       return { value: json ? JSON.parse(json) : null, transfer: [] };
     }
+    case 'find': {
+      const { field, text, propertyName } = request.query;
+      const ids = current().model.findElements(field, text, propertyName);
+      return { value: Array.from(ids), transfer: [] };
+    }
   }
 }
 

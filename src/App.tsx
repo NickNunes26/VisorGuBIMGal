@@ -7,6 +7,7 @@ import { SectionDxfPanel } from './ui/components/SectionDxfPanel';
 import { GisMapPanel } from './ui/components/GisMapPanel';
 import { DisplayBar } from './ui/components/DisplayBar';
 import { SectionBar } from './ui/components/SectionBar';
+import { SearchPanel } from './ui/components/SearchPanel';
 import { NO_SECTION, sceneBounds, sectionPlanes, type SectionState } from './ui/viewer/section';
 import { BimViewer } from './ui/viewer/BimViewer';
 import {
@@ -30,7 +31,7 @@ import type { KernelDiagnostic, SpatialTree } from './domain/kernel/KernelPort';
 import { kernel, renderer } from './infrastructure/composition';
 import { leafletService } from './infrastructure/gis/LeafletService';
 
-import { Layers, FolderTree, Sliders, Scissors } from 'lucide-react';
+import { Layers, FolderTree, Sliders, Scissors, Search } from 'lucide-react';
 
 export default function App() {
   const [models, setModels] = useState<ModelRecord[]>([]);
@@ -79,7 +80,7 @@ export default function App() {
   }, []);
 
   // Tab state
-  const [leftTab, setLeftTab] = useState<'models' | 'tree'>('models');
+  const [leftTab, setLeftTab] = useState<'models' | 'tree' | 'search'>('models');
   const [rightTab, setRightTab] = useState<'props' | 'dxf'>('props');
   const [isGisExpanded, setIsGisExpanded] = useState<boolean>(false);
 
@@ -290,12 +291,19 @@ export default function App() {
               onClick={() => setLeftTab('tree')}
             >
               <FolderTree size={13} />
-              <span>Árbol espacial</span>
+              <span>Árbol</span>
+            </button>
+            <button
+              className={`tab-btn tab-search ${leftTab === 'search' ? 'active' : ''}`}
+              onClick={() => setLeftTab('search')}
+            >
+              <Search size={13} />
+              <span>Buscar</span>
             </button>
           </div>
 
           <div className="panel-body">
-            {leftTab === 'models' ? (
+            {leftTab === 'models' && (
               <ModelsPanel
                 models={models}
                 onToggleVisibility={handleToggleVisibility}
@@ -303,7 +311,8 @@ export default function App() {
                 onLocateOnGis={handleLocateOnGis}
                 onSelectElement={(ref) => void handleSelectElement(ref)}
               />
-            ) : (
+            )}
+            {leftTab === 'tree' && (
               <SpatialTreePanel
                 models={models}
                 spatialTrees={spatialTrees}
@@ -313,6 +322,18 @@ export default function App() {
                 onHide={handleHide}
               />
             )}
+            {/* Kept mounted, so the search and its results survive a change of tab */}
+            <div style={{ display: leftTab === 'search' ? 'block' : 'none' }}>
+              <SearchPanel
+                models={models}
+                spatialTrees={spatialTrees}
+                kernel={kernel}
+                selectedRef={selectedRef}
+                onSelectElement={(ref) => void handleSelectElement(ref)}
+                onIsolate={handleIsolate}
+                onHide={handleHide}
+              />
+            </div>
           </div>
         </aside>
 

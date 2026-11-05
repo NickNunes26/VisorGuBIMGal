@@ -6,7 +6,9 @@ import type { ElementRef, ModelId } from '../../domain/models/ModelRecord';
 export type DisplayTarget =
   | { by: 'class'; type: string }
   | { by: 'spatial'; modelId: ModelId; expressId: number; name: string }
-  | { by: 'element'; ref: ElementRef };
+  | { by: 'element'; ref: ElementRef }
+  /** The results of a search when it was applied: a model loaded later is not part of it. */
+  | { by: 'search'; label: string; matches: Readonly<Record<ModelId, readonly number[]>> };
 
 export interface DisplayRule {
   /** Only its members are drawn as usual; the rest are hidden, or ghosts with `ghost`. */
@@ -65,6 +67,7 @@ export function targetMembers(
   tree: SpatialTree | undefined
 ): number[] {
   if (target.by === 'element') return target.ref.modelId === modelId ? [target.ref.expressId] : [];
+  if (target.by === 'search') return [...(target.matches[modelId] ?? [])];
   if (!tree) return [];
   if (target.by === 'spatial') {
     return target.modelId === modelId ? spatialMembers(tree, target.expressId) : [];
@@ -112,11 +115,19 @@ export function classCounts(trees: readonly SpatialTree[]): ClassCount[] {
 export function withoutModel(rule: DisplayRule, modelId: ModelId): DisplayRule {
   const keeps = (target: DisplayTarget) =>
     target.by === 'class' ||
+    target.by === 'search' ||
     (target.by === 'spatial' ? target.modelId !== modelId : target.ref.modelId !== modelId);
+  // A search keeps its results in the other models.
+  const trimmed = (target: DisplayTarget): DisplayTarget => {
+    if (target.by !== 'search' || !(modelId in target.matches)) return target;
+    const matches = { ...target.matches };
+    delete matches[modelId];
+    return { ...target, matches };
+  };
   return {
     ...rule,
-    isolate: rule.isolate && keeps(rule.isolate) ? rule.isolate : null,
-    hidden: rule.hidden.filter(keeps)
+    isolate: rule.isolate && keeps(rule.isolate) ? trimmed(rule.isolate) : null,
+    hidden: rule.hidden.filter(keeps).map(trimmed)
   };
 }
 
@@ -128,11 +139,24 @@ export function sameTarget(a: DisplayTarget, b: DisplayTarget): boolean {
   if (a.by === 'element' && b.by === 'element') {
     return a.ref.modelId === b.ref.modelId && a.ref.expressId === b.ref.expressId;
   }
+  if (a.by === 'search' && b.by === 'search') {
+    const models = Object.keys(a.matches);
+    return (
+      a.label === b.label &&
+      models.length === Object.keys(b.matches).length &&
+      models.every((modelId) => {
+        const left = a.matches[modelId];
+        const right = b.matches[modelId];
+        return right !== undefined && left.length === right.length && left.every((id, at) => id === right[at]);
+      })
+    );
+  }
   return false;
 }
 
 export function describeTarget(target: DisplayTarget): string {
   if (target.by === 'class') return target.type;
   if (target.by === 'spatial') return target.name;
+  if (target.by === 'search') return target.label;
   return `#${target.ref.expressId}`;
 }

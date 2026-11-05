@@ -148,6 +148,17 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 | `unit` | Si se resuelve, ver sección 2 |
 | `methodOfMeasurement` | Solo en cantidades, si el archivo lo declara |
 
+### Búsqueda
+
+`findElements(modelId, query)` devuelve, en `expressId` ascendente, los elementos de `elementCount` que cumplen `ElementQuery`:
+
+- **Texto:** se recorta y se busca como subcadena. Mayúsculas y minúsculas dan igual (minúsculas Unicode), salvo en el `GlobalId`, que las distingue porque su codificación también lo hace.
+- **`field`:** `name` mira el atributo `Name`; `class`, el nombre de la clase IFC (`IfcWallStandardCase` sale con `wall`); `globalId`, el `GlobalId`; `property`, los valores de propiedades y cantidades; `any`, todo lo anterior.
+- **Valores de propiedad:** los conjuntos son los mismos que da `getElementDetails`: los del elemento y los de su tipo, y un conjunto del elemento anula al del tipo con el mismo nombre. Se mira cada escalar tal como lo muestra el panel: números como los escribe JavaScript (`String`), lógicos como `true` y `false`, enumerados por su nombre. En valores enumerados, de lista, acotados y de tabla cuenta cada escalar; en una propiedad compleja, cada miembro. Los nombres de conjuntos y propiedades no son valores.
+- **`propertyName`:** solo con `property`. Limita la búsqueda a las propiedades con ese nombre, sin distinguir mayúsculas; si es el de una propiedad compleja, a todos sus miembros. Con él, un `text` vacío encuentra todo elemento que tenga esa propiedad.
+- **Sin nada que buscar** (texto vacío y sin `propertyName` útil) devuelve una lista vacía.
+- Un modelo cerrado da una lista vacía, no un error.
+
 ### Errores y diagnósticos
 
 **`KernelError`** es el fallo de toda una operación, que rechaza su promesa:
@@ -157,6 +168,7 @@ Garantías de cada campo de `PropertyItem` que entrega el kernel:
 | `openModel` | `parse`, `unsupported-schema`, `out-of-memory`, `internal` |
 | `streamGeometry` | `model-not-open` si no estaba abierto; `out-of-memory`, `internal` |
 | `getElementDetails`, `getSpatialTree` | `out-of-memory`, `internal`. Un modelo cerrado o un elemento desconocido da `null`, no un error |
+| `findElements` | `out-of-memory`, `internal`. Un modelo cerrado da `[]` |
 | `generateDrawing` | `model-not-open` si no queda ningún modelo abierto; `drawing-frame-empty` si hay modelos abiertos y el marco los excluye a todos, con el motivo en el mensaje; `out-of-memory`, `internal` |
 | `exportDrawing` | `drawing-not-found`, `out-of-memory`, `internal` |
 | `discardDrawing`, `closeModel` | Nunca: son idempotentes |
