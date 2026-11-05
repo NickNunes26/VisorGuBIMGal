@@ -8,6 +8,7 @@ import type {
   KernelPort
 } from '../../domain/kernel/KernelPort';
 import type { ModelId, ModelRecord } from '../../domain/models/ModelRecord';
+import { widenForPreview } from './drawingPreview';
 
 interface SectionDxfPanelProps {
   models: ModelRecord[];
@@ -337,7 +338,7 @@ export const SectionDxfPanel: React.FC<SectionDxfPanelProps> = ({ models, kernel
               justifyContent: 'center',
               padding: '6px'
             }}
-            dangerouslySetInnerHTML={{ __html: previewSvg }}
+            dangerouslySetInnerHTML={{ __html: widenForPreview(previewSvg) }}
           />
 
           <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
