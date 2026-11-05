@@ -359,6 +359,50 @@ fn an_edge_of_three_faces_does_not_panic_or_lose_triangles() {
 }
 
 #[test]
+fn an_edge_of_three_faces_at_a_corner_of_many_edges_joins_nothing() {
+    // The same fork, with 40 more triangles meeting only at corner 0, so its edges are many
+    // and grouped by sorting rather than scanning.
+    let mut positions = vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::NEG_Y, DVec3::Z];
+    let mut triangles = vec![[0, 1, 2], [0, 1, 3], [0, 1, 4]];
+    for at in 0..40u32 {
+        let angle = f64::from(at) * 0.15;
+        positions.push(DVec3::new(-2.0, angle.cos(), angle.sin()));
+        positions.push(DVec3::new(-2.0, angle.cos(), angle.sin()) + DVec3::new(0.0, 0.0, 0.05));
+        triangles.push([0, 5 + 2 * at, 6 + 2 * at]);
+    }
+    let mut mesh = Mesh { positions, triangles };
+    let wanted = mesh.clone();
+    mesh.orient_shell();
+    assert_eq!(mesh, wanted);
+}
+
+#[test]
+fn a_closed_cone_with_a_tip_of_many_edges_turns_outward() {
+    // A tall cone of 48 sides, tip first and base centre second, so their edges are grouped by
+    // sorting; every third side is turned inward. Each side is larger than a base triangle, so
+    // only joining across the tip and the base centre, and judging the whole by its volume,
+    // turns them all outward.
+    let segments = 48u32;
+    let mut positions = vec![DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO];
+    for at in 0..segments {
+        let angle = std::f64::consts::TAU * f64::from(at) / f64::from(segments);
+        positions.push(DVec3::new(angle.cos(), angle.sin(), 0.0));
+    }
+    let rim = |at: u32| 2 + at % segments;
+    let mut triangles = Vec::new();
+    for at in 0..segments {
+        let side = [0, rim(at), rim(at + 1)];
+        triangles.push(if at % 3 == 0 { [side[0], side[2], side[1]] } else { side });
+        triangles.push([1, rim(at + 1), rim(at)]);
+    }
+    let mut mesh = Mesh { positions, triangles };
+    assert!(!mesh.is_closed_outward());
+    mesh.orient_shell();
+    assert!(mesh.is_closed_outward());
+    assert!(mesh.volume() > 0.0);
+}
+
+#[test]
 fn a_large_shell_is_walked_without_recursion() {
     // A strip of a million triangles, every other one flipped: a recursive walk would overflow
     // the 1 MB stack of a WASM build.

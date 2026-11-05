@@ -132,21 +132,7 @@ impl Mesh {
         let partners = if let Some(partners) = side_partners(&self.triangles, &own) {
             partners
         } else {
-            // Adding zero turns -0.0 into 0.0, which has other bits.
-            let mut keyed: Vec<([u64; 3], u32)> = self
-                .positions
-                .iter()
-                .zip(0u32..)
-                .map(|(position, index)| ((*position + DVec3::ZERO).to_array().map(f64::to_bits), index))
-                .collect();
-            keyed.sort_unstable();
-            let mut welded = vec![0u32; count];
-            for (at, (key, index)) in keyed.iter().enumerate() {
-                welded[*index as usize] = match at.checked_sub(1).map(|before| &keyed[before]) {
-                    Some((before, _)) if before == key => welded[keyed[at - 1].1 as usize],
-                    _ => *index,
-                };
-            }
+            let welded = welded_labels(&self.positions);
             let Some(partners) = side_partners(&self.triangles, &welded) else {
                 return false;
             };
@@ -197,36 +183,52 @@ impl Mesh {
     /// shells still join across shared edges, but a part is only a cavity in a part of its own
     /// shell.
     pub fn orient_shells(&mut self, starts: &[usize]) {
-        // Adding zero turns -0.0 into 0.0, which has other bits.
-        let key = |index: u32| (self.positions[index as usize] + DVec3::ZERO).to_array().map(f64::to_bits);
-        // Corners sorted by position share a label with the one before when equal. Any labels
-        // work, as long as equal positions share one.
-        let mut order: Vec<u32> = (0..self.positions.len() as u32).collect();
-        order.sort_unstable_by_key(|index| key(*index));
-        let mut welded = vec![0u32; self.positions.len()];
-        if let Some(first) = order.first() {
-            welded[*first as usize] = *first;
-        }
-        for pair in order.windows(2) {
-            let same = key(pair[0]) == key(pair[1]);
-            welded[pair[1] as usize] = if same { welded[pair[0] as usize] } else { pair[1] };
-        }
+        let welded = welded_labels(&self.positions);
         let corners = |triangle: [u32; 3]| triangle.map(|id| welded[id as usize]);
-        // Sorting the edges groups each one's faces with no allocation per edge, which a map of
-        // lists cost on every shell. Only an edge of exactly two faces joins them.
-        let mut edges: Vec<(u32, u32, u32, u8)> = Vec::with_capacity(self.triangles.len() * 3);
-        for (index, triangle) in self.triangles.iter().enumerate() {
+        // Edges grouped by their lower corner, by counting, then by their upper one, with no
+        // allocation per edge, which a map of lists cost on every shell; sorting them all took
+        // longer. Only an edge of exactly two faces joins them.
+        let count = self.positions.len();
+        let mut start = vec![0u32; count + 1];
+        for triangle in &self.triangles {
             let [a, b, c] = corners(*triangle);
-            for (side, (from, to)) in [(a, b), (b, c), (c, a)].into_iter().enumerate() {
-                edges.push((from.min(to), from.max(to), index as u32, side as u8));
+            for (from, to) in [(a, b), (b, c), (c, a)] {
+                start[from.min(to) as usize + 1] += 1;
             }
         }
-        edges.sort_unstable();
+        for at in 1..=count {
+            start[at] += start[at - 1];
+        }
+        let mut fill = start.clone();
+        // Each edge as its upper corner, its triangle and which side of it.
+        let mut edges = vec![(0u32, 0u32, 0u8); self.triangles.len() * 3];
+        for (index, triangle) in (0u32..).zip(&self.triangles) {
+            let [a, b, c] = corners(*triangle);
+            for (side, (from, to)) in (0u8..).zip([(a, b), (b, c), (c, a)]) {
+                let low = from.min(to) as usize;
+                edges[fill[low] as usize] = (from.max(to), index, side);
+                fill[low] += 1;
+            }
+        }
         let mut neighbours = vec![[NO_NEIGHBOUR; 3]; self.triangles.len()];
-        for group in edges.chunk_by(|one, two| (one.0, one.1) == (two.0, two.1)) {
-            if let [(_, _, one, one_side), (_, _, two, two_side)] = group {
-                neighbours[*one as usize][*one_side as usize] = *two;
-                neighbours[*two as usize][*two_side as usize] = *one;
+        for low in 0..count {
+            let group = &mut edges[start[low] as usize..start[low + 1] as usize];
+            if group.len() > MAX_SCANNED_SIDES as usize {
+                group.sort_unstable();
+                for same in group.chunk_by(|one, two| one.0 == two.0) {
+                    if let [(_, one, one_side), (_, two, two_side)] = same {
+                        neighbours[*one as usize][*one_side as usize] = *two;
+                        neighbours[*two as usize][*two_side as usize] = *one;
+                    }
+                }
+                continue;
+            }
+            // Few edges leave most corners: scanning them beats sorting them.
+            for (at, (high, one, one_side)) in group.iter().enumerate() {
+                let mut others = group.iter().enumerate().filter(|(other, edge)| *other != at && edge.0 == *high);
+                if let (Some((_, (_, two, _))), None) = (others.next(), others.next()) {
+                    neighbours[*one as usize][*one_side as usize] = *two;
+                }
             }
         }
         let mut flip = vec![false; self.triangles.len()];
@@ -400,6 +402,26 @@ impl Mesh {
             .sum();
         solid_angle / (4.0 * std::f64::consts::PI)
     }
+}
+
+/// A label for each corner, shared by corners at one position. Any labels work, as long as
+/// equal positions share one. The keys are made once and sorted, not made per comparison.
+fn welded_labels(positions: &[DVec3]) -> Vec<u32> {
+    // Adding zero turns -0.0 into 0.0, which has other bits.
+    let mut keyed: Vec<([u64; 3], u32)> = positions
+        .iter()
+        .zip(0u32..)
+        .map(|(position, index)| ((*position + DVec3::ZERO).to_array().map(f64::to_bits), index))
+        .collect();
+    keyed.sort_unstable();
+    let mut welded = vec![0u32; positions.len()];
+    for (at, (key, index)) in keyed.iter().enumerate() {
+        welded[*index as usize] = match at.checked_sub(1).map(|before| &keyed[before]) {
+            Some((before, earlier)) if before == key => welded[*earlier as usize],
+            _ => *index,
+        };
+    }
+    welded
 }
 
 /// For each triangle, with corners renamed by `label`, the triangles running back along its
