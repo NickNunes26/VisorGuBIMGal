@@ -1,6 +1,6 @@
 # 05 — Contrato del Kernel y del Renderizador
 
-**Estado:** v1, revisión 6: la revisión 5, que recogía la revisión de DeepSeek a la revisión 4, con dos aclaraciones de redacción de la sección 6 tras la revisión de Gemini. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
+**Estado:** v1, revisión 7: la revisión 6 con la caja de cada lote (`box`, sección 3, T-116). La revisión 6 era la revisión 5, que recogía la revisión de DeepSeek a la revisión 4, con dos aclaraciones de redacción de la sección 6 tras la revisión de Gemini. `CONTRACT_VERSION` sigue en 1 porque ninguna versión se ha publicado aún. La sección 7 lista lo que el código aún no cumple.  
 **Propósito:** Fuente única de los límites entre kernel, renderizador y aplicación.  
 **Código normativo:** [`src/domain/kernel/`](../src/domain/kernel/), [`DrawingTypes.ts`](../src/domain/drawings/DrawingTypes.ts) y [`ModelRecord.ts`](../src/domain/models/ModelRecord.ts). Si este documento y los tipos discrepan, es un error que debe corregirse.
 
@@ -103,6 +103,7 @@ Definidos en `GeometryBatch.ts`.
 | `modelId` | `ModelId` | Modelo del lote. Un registro identifica `ElementRef(batch.modelId, expressId)`; su `expressId` solo no identifica nada |
 | `sequence` | `u32` | Empieza en 1 en cada flujo y sube de uno en uno |
 | `origin` | `[f64; 3]` | Coordenadas absolutas de modelo. Vértice absoluto = `origin + position` |
+| `box` | `{ min, max }`, cada uno `[f32; 3]` | El menor y el mayor valor de `positions` en cada eje, relativos a `origin` como ellas y exactos. Ceros si no hay vértices. El renderizador no dibuja un lote cuya caja queda entera fuera de la vista |
 | `positions` | `Float32Array` | xyz por vértice, coordenadas locales de lote |
 | `normals` | `Float32Array` | xyz por vértice, de longitud 1 ± 1e-3. Las aristas vivas duplican vértices |
 | `indices` | `Uint32Array` | Triángulos, base cero dentro del lote |
@@ -121,7 +122,7 @@ Definidos en `GeometryBatch.ts`.
 
 - **`complete.meshCount`** cuenta registros de `meshTable`, no elementos.
 - **`complete.bounds`** son coordenadas absolutas de modelo de todo lo que no lleva `HiddenByDefault`. Queda indefinido si no queda nada.
-- `findBatchError` valida este formato en pruebas y con datos simulados, incluida la longitud de las normales. El radio máximo lo garantiza el kernel y no se comprueba ahí, porque un elemento `Degraded` demasiado grande para repartirlo puede superarlo.
+- `findBatchError` valida este formato en pruebas y con datos simulados, incluidas la longitud de las normales y la caja. El radio máximo lo garantiza el kernel y no se comprueba ahí, porque un elemento `Degraded` demasiado grande para repartirlo puede superarlo.
 - **Los lotes se transfieren, nunca se clonan** (RSK-06). Tras `addBatch`, el renderizador sube los datos a la GPU y no conserva copia en JS (RSK-03).
 - Los lotes son solo para el renderizador. `cad-slicer` trabaja dentro del kernel con la geometría evaluada de `ifc-geometry`, combinando origen y posición en `f64`.
 
@@ -337,6 +338,7 @@ impl Sheet {
 
 - `start_stream` empieza por el primer elemento. Llamarlo otra vez descarta un flujo sin terminar.
 - `next_batch` devuelve `None` cuando no quedan elementos. `max_triangles` es un tope flexible: un lote se cierra antes de superarlo, pero un elemento, o pieza, mayor viaja solo en su lote y nunca se parte por ese tope. Solo el radio reparte un elemento (sección 2).
+- `BatchView` da `origin()`, `bounds()`, que es `box` como `[minX, minY, minZ, maxX, maxY, maxZ]`, y los `take_*`.
 - `finish_stream` se llama una vez tras `None`, libera las cachés y devuelve el JSON del evento `complete`, sin `type`. Sin flujo activo devuelve `meshCount` 0 y sin diagnósticos.
 
 **Corrección a `docs/03` sección 4:** una vista `Float32Array` sobre `wasmMemory.buffer` queda inválida en cuanto la memoria WASM crece, y la memoria de WASM no se puede transferir entre hilos. Por tanto, **ninguna vista sobre la memoria WASM sobrevive a una llamada**, y el recorrido real es:

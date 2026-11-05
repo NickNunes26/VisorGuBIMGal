@@ -1,6 +1,7 @@
 import type { ModelBounds } from '../../domain/models/ModelRecord';
 import type { ViewPreset } from '../../domain/kernel/RendererPort';
 import type { Ray, Vec3 } from '../../domain/measure/geometry';
+import type { Frustum } from './frustum';
 
 const ISO_AZIMUTH = -Math.PI / 4; // +X, -Y (front-right in IFC Z-up)
 const ISO_ELEVATION = Math.atan(1 / Math.SQRT2); // ~35.264 deg above horizontal
@@ -152,6 +153,10 @@ export class Camera {
     return Math.max(0.01, Math.min(2.0, this.distance * 0.002));
   }
 
+  private far(): number {
+    return Math.max(50000.0, this.distance * 250.0);
+  }
+
   /** Forward, right and up unit vectors in IFC Z-up; see writeUniforms. */
   private axes(): { forward: Vec3; right: Vec3; up: Vec3 } {
     const cosPhi = Math.cos(this.elevation);
@@ -196,6 +201,35 @@ export class Camera {
   }
 
   /**
+   * What `writeUniforms` lets through, as planes in absolute coordinates: depth between near
+   * and far, and each side of the view, where a camera coordinate equals the depth over its
+   * projection scale.
+   */
+  frustum(): Frustum {
+    const eye = this.getEye();
+    const { forward, right, up } = this.axes();
+    const h = 1.0 / Math.tan(this.fovY * 0.5);
+    const w = h / this.aspect;
+    const planes = new Float64Array(24);
+    const put = (at: number, n: Vec3, offset: number) => {
+      planes.set(n, at);
+      planes[at + 3] = offset - (n[0] * eye[0] + n[1] * eye[1] + n[2] * eye[2]);
+    };
+    const tilt = (scale: number, side: Vec3): Vec3 => [
+      forward[0] + scale * side[0],
+      forward[1] + scale * side[1],
+      forward[2] + scale * side[2]
+    ];
+    put(0, forward, -this.near());
+    put(4, [-forward[0], -forward[1], -forward[2]], this.far());
+    put(8, tilt(-w, right), 0);
+    put(12, tilt(w, right), 0);
+    put(16, tilt(-h, up), 0);
+    put(20, tilt(h, up), 0);
+    return planes;
+  }
+
+  /**
    * Writes column-major Reverse-Z projection (floats 0..15) and
    * rotation-only view matrix at the camera eye (floats 16..31).
    */
@@ -204,7 +238,7 @@ export class Camera {
     const h = 1.0 / Math.tan(this.fovY * 0.5);
     const w = h / this.aspect;
     const near = this.near();
-    const far = Math.max(50000.0, this.distance * 250.0);
+    const far = this.far();
     const a = near / (far - near);
     const b = (far * near) / (far - near);
 

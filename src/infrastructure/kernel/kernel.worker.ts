@@ -74,11 +74,13 @@ function readBatch(modelId: ModelId, model: Model): GeometryBatch | null {
   if (!view) return null;
   try {
     const [x, y, z] = view.origin();
+    const [minX, minY, minZ, maxX, maxY, maxZ] = view.bounds();
     sequence += 1;
     return {
       modelId,
       sequence,
       origin: [x, y, z],
+      box: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
       positions: view.takePositions(),
       normals: view.takeNormals(),
       indices: view.takeIndices(),

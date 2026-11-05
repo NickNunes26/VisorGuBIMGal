@@ -19,6 +19,7 @@ import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { canvasPoint, canvasRay } from './canvasView';
+import { markBatchesInView } from './frustum';
 import { chooseDepthMode, withDepthMode, type DepthMode } from './glDepth';
 import { waitForSync } from './glSync';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
@@ -37,6 +38,11 @@ const UPLOAD_BYTES_PER_FRAME = 2 * 1024 * 1024;
 
 interface GlBatchEntry {
   origin: readonly [number, number, number];
+  /** The kernel's box, absolute: origin plus its least and greatest position. */
+  min: Vec3;
+  max: Vec3;
+  /** Set each frame by markBatchesInView. */
+  inView: boolean;
   recordOffsetInModel: number;
   recordCount: number;
   opaqueIndexCount: number;
@@ -378,6 +384,7 @@ export class WebGl2Renderer implements RendererPort {
   // Telemetry for verification and performance checks
   private renderCount = 0;
   private lastFrameCpuMs = 0;
+  private drawnBatches = 0;
 
   setHandlers(handlers: RendererEventHandlers): void {
     this.handlers = handlers;
@@ -862,8 +869,12 @@ export class WebGl2Renderer implements RendererPort {
 
     const gpuBytes = posByteLen + normByteLen + recIdxByteLen + indexGpuBytes;
 
+    const { min, max } = batch.box;
     model.batches.push({
       origin: [ox, oy, oz],
+      min: [ox + min[0], oy + min[1], oz + min[2]],
+      max: [ox + max[0], oy + max[1], oz + max[2]],
+      inView: true,
       recordOffsetInModel,
       recordCount,
       opaqueIndexCount,
@@ -1274,6 +1285,7 @@ export class WebGl2Renderer implements RendererPort {
     const t0 = performance.now();
     this.uploadQueuedBatches();
     this.updateGpuSceneTables();
+    this.drawnBatches = markBatchesInView(this.models.values(), this.camera.frustum(), this.camera.getEye());
 
     const gl = this.gl;
     const { width, height } = this.canvas;
@@ -1315,6 +1327,7 @@ export class WebGl2Renderer implements RendererPort {
       gl.uniform1i(this.mainUniforms.u_modelVisible, 1);
 
       for (const batch of model.batches) {
+        if (!batch.inView) continue;
         if (batch.transparentIndexCount > 0) {
           hasTransparent = true;
         }
@@ -1356,7 +1369,7 @@ export class WebGl2Renderer implements RendererPort {
         gl.uniform1i(this.mainUniforms.u_modelVisible, 1);
 
         for (const batch of model.batches) {
-          if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+          if (batch.inView && batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
             gl.uniform3f(
               this.mainUniforms.u_batchOffset,
               batch.origin[0] - eye[0],
@@ -1396,6 +1409,7 @@ export class WebGl2Renderer implements RendererPort {
         gl.uniform1i(this.mainUniforms.u_modelVisible, 1);
 
         for (const batch of model.batches) {
+          if (!batch.inView) continue;
           gl.uniform3f(
             this.mainUniforms.u_batchOffset,
             batch.origin[0] - eye[0],
@@ -1612,7 +1626,8 @@ export class WebGl2Renderer implements RendererPort {
       liveGpuBuffers,
       allocatedGpuBytes,
       renderCount: this.renderCount,
-      lastFrameCpuMs: this.lastFrameCpuMs
+      lastFrameCpuMs: this.lastFrameCpuMs,
+      drawnBatches: this.drawnBatches
     };
   }
 

@@ -251,6 +251,11 @@ impl BatchView {
         self.batch.origin.to_vec()
     }
 
+    /// `[minX, minY, minZ, maxX, maxY, maxZ]` of the positions, relative to the origin.
+    pub fn bounds(&self) -> Vec<f32> {
+        [self.batch.min, self.batch.max].concat()
+    }
+
     #[wasm_bindgen(js_name = takePositions)]
     pub fn take_positions(&mut self) -> Vec<f32> {
         std::mem::take(&mut self.batch.positions)

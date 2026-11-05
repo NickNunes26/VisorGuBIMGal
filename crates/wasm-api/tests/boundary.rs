@@ -41,6 +41,14 @@ fn check(batch: &Batch) {
     assert_eq!(batch.indices.len() % 3, 0);
     assert_eq!(batch.mesh_table.len() % RECORD_WORDS, 0);
     assert!(batch.positions.iter().all(|value| value.is_finite()));
+    // The box is exactly the least and greatest position on each axis: the renderer culls by it.
+    let corners = batch.positions.as_chunks::<3>().0;
+    for axis in 0..3 {
+        let values = corners.iter().map(|corner| corner[axis]);
+        let (least, greatest) = (values.clone().reduce(f32::min), values.reduce(f32::max));
+        assert_eq!(batch.min[axis], least.unwrap_or(0.0), "min {axis}");
+        assert_eq!(batch.max[axis], greatest.unwrap_or(0.0), "max {axis}");
+    }
 
     for normal in batch.normals.as_chunks::<3>().0 {
         let length = normal.iter().map(|value| value * value).sum::<f32>().sqrt();

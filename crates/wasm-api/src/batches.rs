@@ -31,6 +31,10 @@ pub struct Batch {
     pub normals: Vec<f32>,
     pub indices: Vec<u32>,
     pub mesh_table: Vec<u32>,
+    /// Least and greatest of `positions` on each axis, relative to `origin` like them. Zeros
+    /// while there are none.
+    pub min: [f32; 3],
+    pub max: [f32; 3],
 }
 
 impl Batch {
@@ -45,6 +49,12 @@ impl Batch {
             let first_index = self.indices.len() as u32;
             for position in &part.positions {
                 let local = (*position - origin).as_vec3();
+                let (min, max) = if self.positions.is_empty() {
+                    (local, local)
+                } else {
+                    (Vec3::from_array(self.min).min(local), Vec3::from_array(self.max).max(local))
+                };
+                (self.min, self.max) = (min.to_array(), max.to_array());
                 self.positions.extend_from_slice(&local.to_array());
             }
             for normal in &part.normals {

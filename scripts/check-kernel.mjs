@@ -46,10 +46,12 @@ for (const file of files) {
     const view = model.nextBatch(65536);
     if (!view) break;
     const [x, y, z] = view.origin();
+    const [minX, minY, minZ, maxX, maxY, maxZ] = view.bounds();
     const batch = {
       modelId: 'check',
       sequence: ++batches,
       origin: [x, y, z],
+      box: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
       positions: view.takePositions(),
       normals: view.takeNormals(),
       indices: view.takeIndices(),

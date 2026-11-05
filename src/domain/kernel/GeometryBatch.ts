@@ -46,6 +46,11 @@ export interface GeometryBatch {
   sequence: number;
   /** Absolute model coordinates, as f64. Absolute vertex = origin + position. */
   origin: readonly [number, number, number];
+  /**
+   * Least and greatest of `positions` on each axis, relative to `origin` like them, exactly.
+   * Zeros when there are none. Renderers skip a batch whose box is out of view.
+   */
+  box: { min: readonly [number, number, number]; max: readonly [number, number, number] };
   positions: Float32Array;
   normals: Float32Array;
   indices: Uint32Array;
@@ -60,6 +65,17 @@ export function findBatchError(batch: GeometryBatch): string | null {
   if (normals.length !== positions.length) return 'normals length differs from positions length';
   // A lone element above the radius is allowed if Degraded, so this checks only finiteness.
   if (!positions.every(Number.isFinite)) return 'positions contain a non-finite value';
+  for (let axis = 0; axis < 3; axis++) {
+    let least = positions.length > 0 ? Infinity : 0;
+    let greatest = positions.length > 0 ? -Infinity : 0;
+    for (let at = axis; at < positions.length; at += 3) {
+      least = Math.min(least, positions[at]);
+      greatest = Math.max(greatest, positions[at]);
+    }
+    if (batch.box.min[axis] !== least || batch.box.max[axis] !== greatest) {
+      return `box differs from the positions on axis ${axis}`;
+    }
+  }
   for (let at = 0; at < normals.length; at += 3) {
     const length = Math.hypot(normals[at], normals[at + 1], normals[at + 2]);
     if (!(Math.abs(length - 1) <= NORMAL_TOLERANCE)) return `normal ${at / 3} is not unit length`;

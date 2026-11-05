@@ -18,6 +18,7 @@ import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { canvasPoint, canvasRay } from './canvasView';
+import { markBatchesInView } from './frustum';
 import { RENDERER_WGSL } from './shaders';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
@@ -32,6 +33,11 @@ const UPLOAD_BYTES_PER_FRAME = 2 * 1024 * 1024;
 
 interface GpuBatchEntry {
   origin: readonly [number, number, number];
+  /** The kernel's box, absolute: origin plus its least and greatest position. */
+  min: Vec3;
+  max: Vec3;
+  /** Set each frame by markBatchesInView. */
+  inView: boolean;
   recordOffsetInModel: number;
   recordCount: number;
   opaqueIndexCount: number;
@@ -78,6 +84,8 @@ export interface RendererDebugStats {
   allocatedGpuBytes: number;
   renderCount: number;
   lastFrameCpuMs: number;
+  /** Batches the last frame drew, out of batchCount: the rest were out of view or hidden. */
+  drawnBatches: number;
 }
 
 export class WebGpuRenderer implements RendererPort {
@@ -148,6 +156,7 @@ export class WebGpuRenderer implements RendererPort {
   // Telemetry for verification and performance checks
   private renderCount = 0;
   private lastFrameCpuMs = 0;
+  private drawnBatches = 0;
 
   setHandlers(handlers: RendererEventHandlers): void {
     this.handlers = handlers;
@@ -770,8 +779,12 @@ export class WebGpuRenderer implements RendererPort {
 
     const gpuBytes = positionBuffer.size + normalBuffer.size + recordIndexBuffer.size + indexGpuBytes;
 
+    const { min, max } = batch.box;
     model.batches.push({
       origin: [ox, oy, oz],
+      min: [ox + min[0], oy + min[1], oz + min[2]],
+      max: [ox + max[0], oy + max[1], oz + max[2]],
+      inView: true,
       recordOffsetInModel,
       recordCount,
       opaqueIndexCount,
@@ -1237,6 +1250,7 @@ export class WebGpuRenderer implements RendererPort {
     const t0 = performance.now();
     this.uploadQueuedBatches();
     this.updateGpuSceneTables();
+    this.drawnBatches = markBatchesInView(this.models.values(), this.camera.frustum(), this.camera.getEye());
 
     const colorView = this.context.getCurrentTexture().createView();
     const encoder = this.device.createCommandEncoder();
@@ -1272,6 +1286,10 @@ export class WebGpuRenderer implements RendererPort {
         continue;
       }
       for (const batch of model.batches) {
+        if (!batch.inView) {
+          batchIdx++;
+          continue;
+        }
         if (batch.transparentIndexCount > 0) {
           hasTransparent = true;
         }
@@ -1296,7 +1314,7 @@ export class WebGpuRenderer implements RendererPort {
           continue;
         }
         for (const batch of model.batches) {
-          if (batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
+          if (batch.inView && batch.transparentIndexCount > 0 && batch.transparentIndexBuffer) {
             pass.setVertexBuffer(0, batch.positionBuffer);
             pass.setVertexBuffer(1, batch.normalBuffer);
             pass.setVertexBuffer(2, batch.recordIndexBuffer);
@@ -1318,6 +1336,10 @@ export class WebGpuRenderer implements RendererPort {
           continue;
         }
         for (const batch of model.batches) {
+          if (!batch.inView) {
+            batchIdx++;
+            continue;
+          }
           pass.setVertexBuffer(0, batch.positionBuffer);
           pass.setVertexBuffer(1, batch.normalBuffer);
           pass.setVertexBuffer(2, batch.recordIndexBuffer);
@@ -1526,7 +1548,8 @@ export class WebGpuRenderer implements RendererPort {
       liveGpuBuffers,
       allocatedGpuBytes,
       renderCount: this.renderCount,
-      lastFrameCpuMs: this.lastFrameCpuMs
+      lastFrameCpuMs: this.lastFrameCpuMs,
+      drawnBatches: this.drawnBatches
     };
   }
 
