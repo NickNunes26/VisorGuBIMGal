@@ -18,7 +18,7 @@ import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { canvasPoint, canvasRay } from './canvasView';
-import { markBatchesInView } from './frustum';
+import { boxMayShow, markBatchesInView, pixelWindow } from './frustum';
 import { RENDERER_WGSL } from './shaders';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
 import {
@@ -86,6 +86,8 @@ export interface RendererDebugStats {
   lastFrameCpuMs: number;
   /** Batches the last frame drew, out of batchCount: the rest were out of view or hidden. */
   drawnBatches: number;
+  /** Batches the last pick drew: those whose box reaches the pixel. */
+  pickedBatches: number;
 }
 
 export class WebGpuRenderer implements RendererPort {
@@ -157,6 +159,7 @@ export class WebGpuRenderer implements RendererPort {
   private renderCount = 0;
   private lastFrameCpuMs = 0;
   private drawnBatches = 0;
+  private pickedBatches = 0;
 
   setHandlers(handlers: RendererEventHandlers): void {
     this.handlers = handlers;
@@ -1441,6 +1444,10 @@ export class WebGpuRenderer implements RendererPort {
       pass.setPipeline(this.pickPipeline);
       pass.setBindGroup(0, this.sceneBindGroup);
 
+      // Only batches whose box reaches the pixel can draw in it.
+      const pixelView = this.camera.frustum(pixelWindow(px, py, this.canvas.width, this.canvas.height));
+      const eye = this.camera.getEye();
+      this.pickedBatches = 0;
       let batchIdx = 0;
       for (const model of this.models.values()) {
         if (!model.visible) {
@@ -1448,6 +1455,11 @@ export class WebGpuRenderer implements RendererPort {
           continue;
         }
         for (const batch of model.batches) {
+          if (!boxMayShow(pixelView, batch.min, batch.max, eye)) {
+            batchIdx++;
+            continue;
+          }
+          this.pickedBatches++;
           pass.setVertexBuffer(0, batch.positionBuffer);
           pass.setVertexBuffer(1, batch.normalBuffer);
           pass.setVertexBuffer(2, batch.recordIndexBuffer);
@@ -1549,7 +1561,8 @@ export class WebGpuRenderer implements RendererPort {
       allocatedGpuBytes,
       renderCount: this.renderCount,
       lastFrameCpuMs: this.lastFrameCpuMs,
-      drawnBatches: this.drawnBatches
+      drawnBatches: this.drawnBatches,
+      pickedBatches: this.pickedBatches
     };
   }
 

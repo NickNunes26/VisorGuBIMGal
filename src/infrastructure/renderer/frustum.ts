@@ -6,6 +6,26 @@ import type { Vec3 } from '../../domain/measure/geometry';
  */
 export type Frustum = Float64Array;
 
+/** A rectangle of the view in normalised device coordinates, x right and y up, -1 to 1. */
+export interface ViewWindow {
+  left: number;
+  right: number;
+  bottom: number;
+  top: number;
+}
+
+export const WHOLE_VIEW: ViewWindow = { left: -1, right: 1, bottom: -1, top: 1 };
+
+/** What one pixel of a width × height view covers; x and y count from the top left. */
+export function pixelWindow(x: number, y: number, width: number, height: number): ViewWindow {
+  return {
+    left: (2 * x) / width - 1,
+    right: (2 * (x + 1)) / width - 1,
+    bottom: 1 - (2 * (y + 1)) / height,
+    top: 1 - (2 * y) / height
+  };
+}
+
 /**
  * Room left around a box, in metres. The GPU adds `origin − eye` and a position in f32, which
  * rounds by some 6e-8 of the distance to the eye; this is far more, and still under 1 mm per

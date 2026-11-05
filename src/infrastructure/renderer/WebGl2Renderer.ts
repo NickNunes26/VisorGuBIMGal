@@ -19,7 +19,7 @@ import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { Camera } from './Camera';
 import { attachCanvasInput } from './canvasInput';
 import { canvasPoint, canvasRay } from './canvasView';
-import { markBatchesInView } from './frustum';
+import { boxMayShow, markBatchesInView, pixelWindow } from './frustum';
 import { chooseDepthMode, withDepthMode, type DepthMode } from './glDepth';
 import { waitForSync } from './glSync';
 import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './sectionPlanes';
@@ -385,6 +385,7 @@ export class WebGl2Renderer implements RendererPort {
   private renderCount = 0;
   private lastFrameCpuMs = 0;
   private drawnBatches = 0;
+  private pickedBatches = 0;
 
   setHandlers(handlers: RendererEventHandlers): void {
     this.handlers = handlers;
@@ -1527,12 +1528,17 @@ export class WebGl2Renderer implements RendererPort {
       gl.uniform1i(this.pickUniforms.u_recordTexture, 0);
 
       const eye = this.camera.getEye();
+      // Only batches whose box reaches the pixel can draw in it.
+      const pixelView = this.camera.frustum(pixelWindow(px, py, this.canvas.width, this.canvas.height));
+      this.pickedBatches = 0;
 
       for (const model of this.models.values()) {
         if (!model.visible) continue;
         gl.uniform1i(this.pickUniforms.u_modelVisible, 1);
 
         for (const batch of model.batches) {
+          if (!boxMayShow(pixelView, batch.min, batch.max, eye)) continue;
+          this.pickedBatches++;
           gl.uniform3f(
             this.pickUniforms.u_batchOffset,
             batch.origin[0] - eye[0],
@@ -1627,7 +1633,8 @@ export class WebGl2Renderer implements RendererPort {
       allocatedGpuBytes,
       renderCount: this.renderCount,
       lastFrameCpuMs: this.lastFrameCpuMs,
-      drawnBatches: this.drawnBatches
+      drawnBatches: this.drawnBatches,
+      pickedBatches: this.pickedBatches
     };
   }
 

@@ -280,7 +280,8 @@ export class AutoRenderer implements RendererPort {
       allocatedGpuBytes: 0,
       renderCount: 0,
       lastFrameCpuMs: 0,
-      drawnBatches: 0
+      drawnBatches: 0,
+      pickedBatches: 0
     };
   }
 }

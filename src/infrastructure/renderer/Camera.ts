@@ -1,7 +1,7 @@
 import type { ModelBounds } from '../../domain/models/ModelRecord';
 import type { ViewPreset } from '../../domain/kernel/RendererPort';
 import type { Ray, Vec3 } from '../../domain/measure/geometry';
-import type { Frustum } from './frustum';
+import { WHOLE_VIEW, type Frustum, type ViewWindow } from './frustum';
 
 const ISO_AZIMUTH = -Math.PI / 4; // +X, -Y (front-right in IFC Z-up)
 const ISO_ELEVATION = Math.atan(1 / Math.SQRT2); // ~35.264 deg above horizontal
@@ -201,11 +201,11 @@ export class Camera {
   }
 
   /**
-   * What `writeUniforms` lets through, as planes in absolute coordinates: depth between near
-   * and far, and each side of the view, where a camera coordinate equals the depth over its
-   * projection scale.
+   * What `writeUniforms` lets through a window of the view, as planes in absolute coordinates:
+   * depth between near and far, and each side of the window, where a camera coordinate times
+   * its projection scale equals the depth times the window's edge.
    */
-  frustum(): Frustum {
+  frustum(window: ViewWindow = WHOLE_VIEW): Frustum {
     const eye = this.getEye();
     const { forward, right, up } = this.axes();
     const h = 1.0 / Math.tan(this.fovY * 0.5);
@@ -215,17 +215,18 @@ export class Camera {
       planes.set(n, at);
       planes[at + 3] = offset - (n[0] * eye[0] + n[1] * eye[1] + n[2] * eye[2]);
     };
-    const tilt = (scale: number, side: Vec3): Vec3 => [
-      forward[0] + scale * side[0],
-      forward[1] + scale * side[1],
-      forward[2] + scale * side[2]
+    // edge·forward − scale·side: inside when the side coordinate shows at or before the edge.
+    const tilt = (edge: number, scale: number, side: Vec3): Vec3 => [
+      edge * forward[0] - scale * side[0],
+      edge * forward[1] - scale * side[1],
+      edge * forward[2] - scale * side[2]
     ];
     put(0, forward, -this.near());
     put(4, [-forward[0], -forward[1], -forward[2]], this.far());
-    put(8, tilt(-w, right), 0);
-    put(12, tilt(w, right), 0);
-    put(16, tilt(-h, up), 0);
-    put(20, tilt(h, up), 0);
+    put(8, tilt(window.right, w, right), 0);
+    put(12, tilt(-window.left, -w, right), 0);
+    put(16, tilt(window.top, h, up), 0);
+    put(20, tilt(-window.bottom, -h, up), 0);
     return planes;
   }
 
