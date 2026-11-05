@@ -124,10 +124,14 @@ export function withoutModel(rule: DisplayRule, modelId: ModelId): DisplayRule {
     delete matches[modelId];
     return { ...target, matches };
   };
+  // One with no results left would isolate nothing and hide every model, later ones included.
+  const live = (target: DisplayTarget) =>
+    target.by !== 'search' || Object.values(target.matches).some((ids) => ids.length > 0);
+  const isolate = rule.isolate && keeps(rule.isolate) ? trimmed(rule.isolate) : null;
   return {
     ...rule,
-    isolate: rule.isolate && keeps(rule.isolate) ? trimmed(rule.isolate) : null,
-    hidden: rule.hidden.filter(keeps).map(trimmed)
+    isolate: isolate && live(isolate) ? isolate : null,
+    hidden: rule.hidden.filter(keeps).map(trimmed).filter(live)
   };
 }
 
