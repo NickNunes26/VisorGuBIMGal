@@ -205,34 +205,61 @@ fn clean_ring(mut ring: Vec<DVec2>) -> Vec<DVec2> {
     ring
 }
 
-/// Triangulates a polygon with holes. Rings need at least three points each.
-fn triangulate_rings(rings: &[&[DVec2]]) -> Vec<[u32; 3]> {
-    let mut points: Vec<[f64; 2]> = Vec::new();
-    let mut hole_starts: Vec<u32> = Vec::new();
-    for (index, ring) in rings.iter().enumerate() {
-        if index > 0 {
-            hole_starts.push(points.len() as u32);
-        }
-        points.extend(ring.iter().map(|point| [point.x, point.y]));
-    }
-    let mut indices: Vec<u32> = Vec::new();
-    Earcut::new().earcut(points.iter().copied(), &hole_starts, &mut indices);
+/// Earcut and its inputs, kept between faces: making them anew for each face was a fifth of
+/// the time spent allocating on a large faceted model.
+#[derive(Default)]
+struct Triangulator {
+    earcut: Earcut<f64>,
+    points: Vec<[f64; 2]>,
+    hole_starts: Vec<u32>,
+    indices: Vec<u32>,
+}
 
-    indices
-        .as_chunks::<3>().0.iter()
-        .map(|triangle| {
-            let (a, b, c) = (triangle[0], triangle[1], triangle[2]);
+/// A polygon this many corners or more gives its buffers back afterwards, so one huge face
+/// does not keep them for the rest of the model.
+const KEPT_TRIANGULATOR_CORNERS: usize = 4096;
+
+thread_local! {
+    static TRIANGULATOR: std::cell::RefCell<Triangulator> = std::cell::RefCell::default();
+}
+
+/// Triangulates the polygon `fill` writes, its corners and then where each hole starts among
+/// them, and hands `emit` each triangle, counter-clockwise, as indices into those corners.
+fn triangulate_with(fill: impl FnOnce(&mut Vec<[f64; 2]>, &mut Vec<u32>), mut emit: impl FnMut([u32; 3])) {
+    TRIANGULATOR.with_borrow_mut(|kept| {
+        let Triangulator { earcut, points, hole_starts, indices } = kept;
+        points.clear();
+        hole_starts.clear();
+        fill(points, hole_starts);
+        earcut.earcut(points.iter().copied(), hole_starts, indices);
+        for &[a, b, c] in indices.as_chunks::<3>().0 {
             let corner = |id: u32| {
                 let [x, y] = points[id as usize];
                 DVec2::new(x, y)
             };
-            if (corner(b) - corner(a)).perp_dot(corner(c) - corner(a)) < 0.0 {
-                [a, c, b]
-            } else {
-                [a, b, c]
+            emit(if (corner(b) - corner(a)).perp_dot(corner(c) - corner(a)) < 0.0 { [a, c, b] } else { [a, b, c] });
+        }
+        if points.len() >= KEPT_TRIANGULATOR_CORNERS {
+            *kept = Triangulator::default();
+        }
+    });
+}
+
+/// Triangulates a polygon with holes. Rings need at least three points each.
+fn triangulate_rings(rings: &[&[DVec2]]) -> Vec<[u32; 3]> {
+    let mut triangles = Vec::new();
+    triangulate_with(
+        |points, hole_starts| {
+            for (index, ring) in rings.iter().enumerate() {
+                if index > 0 {
+                    hole_starts.push(points.len() as u32);
+                }
+                points.extend(ring.iter().map(|point| [point.x, point.y]));
             }
-        })
-        .collect()
+        },
+        |triangle| triangles.push(triangle),
+    );
+    triangles
 }
 
 /// Flips edges so each starts where the last one ended. A loop has to connect, and real
@@ -2859,6 +2886,10 @@ struct FaceBuilder {
     ids: KeyedMap<(u64, u64, u64), u32>,
     /// Faces share their corners, so each is decoded from the file once per shell.
     points: KeyedMap<u32, DVec3>,
+    /// Corner ids of the face at hand, and of all its rings in turn, kept to save allocations
+    /// per face.
+    corners: Vec<u32>,
+    ring_corners: Vec<u32>,
 }
 
 impl FaceBuilder {
@@ -2881,6 +2912,18 @@ impl FaceBuilder {
 
     /// A face across its corners, sharing them with the faces before it.
     fn flat_face(&mut self, outer: Vec<DVec3>, holes: Vec<Vec<DVec3>>, same_sense: bool) {
+        // Most faces have no hole: their corners go in the kept list.
+        if holes.is_empty() {
+            let mut corners = std::mem::take(&mut self.corners);
+            corners.clear();
+            corners.extend(outer.into_iter().map(|point| self.vertex(point)));
+            if !same_sense {
+                corners.reverse();
+            }
+            self.face(&corners, &[]);
+            self.corners = corners;
+            return;
+        }
         let mut rings = std::iter::once(outer).chain(holes).map(|ring| {
             let mut ids: Vec<u32> = ring.into_iter().map(|point| self.vertex(point)).collect();
             if !same_sense {
@@ -2914,20 +2957,27 @@ impl FaceBuilder {
         };
         let u = normal.any_orthonormal_vector();
         let v = normal.cross(u);
-        let flatten = |id: u32| DVec2::new(corner(id).dot(u), corner(id).dot(v));
-
-        let mut ids: Vec<u32> = outer.to_vec();
-        let mut rings: Vec<Vec<DVec2>> = vec![outer.iter().map(|id| flatten(*id)).collect()];
-        for hole in holes.iter().filter(|hole| hole.len() >= 3) {
-            ids.extend_from_slice(hole);
-            rings.push(hole.iter().map(|id| flatten(*id)).collect());
-        }
-        let borrowed: Vec<&[DVec2]> = rings.iter().map(Vec::as_slice).collect();
-        let triangles = triangulate_rings(&borrowed);
-        for [a, b, c] in triangles {
-            self.mesh
-                .triangles
-                .push([ids[a as usize], ids[b as usize], ids[c as usize]]);
-        }
+        let positions = &self.mesh.positions;
+        let flatten = |id: &u32| {
+            let corner = positions[*id as usize];
+            [corner.dot(u), corner.dot(v)]
+        };
+        let holes = || holes.iter().filter(|hole| hole.len() >= 3);
+        // The outer ring's corners and then each hole's, as the triangulation numbers them.
+        let ids = &mut self.ring_corners;
+        ids.clear();
+        ids.extend_from_slice(outer);
+        holes().for_each(|hole| ids.extend_from_slice(hole));
+        let (ids, triangles) = (&*ids, &mut self.mesh.triangles);
+        triangulate_with(
+            |points, hole_starts| {
+                points.extend(outer.iter().map(flatten));
+                for hole in holes() {
+                    hole_starts.push(points.len() as u32);
+                    points.extend(hole.iter().map(flatten));
+                }
+            },
+            |[a, b, c]| triangles.push([a, b, c].map(|at| ids[at as usize])),
+        );
     }
 }

@@ -666,6 +666,28 @@ fn a_face_reads_the_same_however_its_records_are_written() {
 }
 
 #[test]
+fn a_face_without_a_hole_turns_with_its_bound_and_its_surface_sense() {
+    // The bottom of the box alone, 1 by 2 m, counter-clockwise from above as written.
+    for (face, orientation, up) in [
+        ("IFCFACE((#21))", ".T.", 1.0),
+        ("IFCFACE((#21))", ".F.", -1.0),
+        ("IFCFACESURFACE((#21),#60,.T.)", ".T.", 1.0),
+        ("IFCFACESURFACE((#21),#60,.F.)", ".T.", -1.0),
+        ("IFCFACESURFACE((#21),#60,.F.)", ".F.", 1.0),
+    ] {
+        let body = format!(
+            "#20=IFCPOLYLOOP((#10,#11,#12,#13));\n#21=IFCFACEOUTERBOUND(#20,{orientation});\n#22={face};\n\
+             #60=IFCPLANE(#61);\n#61=IFCAXIS2PLACEMENT3D(#10,$,$);\n\
+             #40=IFCCONNECTEDFACESET((#22));\n#5=IFCFACEBASEDSURFACEMODEL((#40));\n"
+        );
+        let facing = facing(&evaluate(&body));
+        close(facing.z, up * 2.0 * 2.0);
+        close(facing.x, 0.0);
+        close(facing.y, 0.0);
+    }
+}
+
+#[test]
 fn a_face_left_with_too_few_corners_is_reported() {
     let body = faces("#14,#15") + "#5=IFCFACEBASEDSURFACEMODEL((#40));\n";
     let (_, codes) = diagnostics_of(&body);
