@@ -686,7 +686,7 @@ fn a_profile_segment_running_back_against_the_distance_is_left_to_the_polyline()
 /// The authored alignment's stations, as `(station, [x, y, z], [tolerance; 3])` from its
 /// expected values file, read without a JSON library: each station holds `fields` values in order.
 fn authored_stations(json: &str, fields: usize) -> Vec<(f64, DVec3, DVec3)> {
-    let stations = &json[json.rfind("\"stations\"").expect("a stations list")..];
+    let stations = &json[json.rfind("\"stations\"").expect("a stations list")..]; let stations = &stations[..stations.find("\n  }").unwrap_or(stations.len())];
     let numbers = |key: &str| -> Vec<f64> {
         stations
             .split(key)
@@ -823,6 +823,80 @@ fn authored_linear_placement_boxes_match_their_expected_values() {
         ] {
             let (wanted, tol) = at(field);
             assert!((actual - wanted).abs() <= tol, "{name} {field}: {actual} against {wanted} +- {tol}");
+        }
+    }
+    assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());
+}
+
+#[test]
+fn authored_bridge_deck_and_piers_match_their_expected_values() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/authored");
+    let text = std::fs::read_to_string(folder.join("bridge.ifc")).unwrap();
+    let json = std::fs::read_to_string(folder.join("bridge.expected.json")).unwrap();
+    let stations = authored_stations(&json, 5);
+    assert_eq!(stations.len(), 9);
+    let station_diags = check_authored_stations(&text, "=IFCGRADIENTCURVE(", &stations);
+    assert!(station_diags.is_empty(), "{station_diags:?}");
+
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+
+    let deck_line = text
+        .lines()
+        .find(|line| line.contains("=IFCSLAB(") && line.contains("'guBIM bridge deck'"))
+        .expect("bridge deck");
+    let deck_id: u32 = deck_line[1..deck_line.find('=').unwrap()].parse().unwrap();
+    let deck_elem = evaluator.evaluate(deck_id).expect("deck mesh");
+    let deck_mesh = &deck_elem.meshes[0].mesh;
+    assert_eq!(deck_mesh.open_edges(), 0, "deck must be closed");
+    let (deck_vol, deck_vol_tol) = expected_quantity(&json, &["\"deck\":", "\"volume\":"]);
+    close(deck_mesh.volume(), deck_vol, deck_vol_tol);
+    let (dmin, dmax) = bounds(deck_mesh);
+    for (actual, field) in [
+        (dmin.x, "\"x_min\":"),
+        (dmax.x, "\"x_max\":"),
+        (dmin.y, "\"y_min\":"),
+        (dmax.y, "\"y_max\":"),
+        (dmin.z, "\"z_min\":"),
+        (dmax.z, "\"z_max\":"),
+    ] {
+        let (wanted, tol) = expected_quantity(&json, &["\"deck\":", "\"bbox_local\":", field]);
+        assert!((actual - wanted).abs() <= tol, "deck {field}: {actual} against {wanted} +- {tol}");
+    }
+
+    for pier_index in 1..=3 {
+        let name = format!("guBIM pier {pier_index}");
+        let tag = format!("'{name}'");
+        let line = text
+            .lines()
+            .find(|line| line.contains("=IFCCOLUMN(") && line.contains(&tag))
+            .expect(&name);
+        let id: u32 = line[1..line.find('=').unwrap()].parse().unwrap();
+        let element = evaluator.evaluate(id).expect(&name);
+        let mesh = &element.meshes[0].mesh;
+        assert_eq!(mesh.open_edges(), 0, "{name}");
+        let pier_key = format!("\"{name}\"");
+        let at = |field: &str| expected_quantity(&json, &["\"piers\":", &pier_key, field]);
+        let (vol, vol_tol) = at("\"volume\":");
+        close(mesh.volume(), vol, vol_tol);
+        let (min, max) = bounds(mesh);
+        let centre = (min + max) / 2.0;
+        for (actual, field) in [
+            (centre.x, "\"centre_x\":"),
+            (centre.y, "\"centre_y\":"),
+            (centre.z, "\"centre_z\":"),
+            (min.x, "\"x_min\":"),
+            (max.x, "\"x_max\":"),
+            (min.y, "\"y_min\":"),
+            (max.y, "\"y_max\":"),
+            (min.z, "\"z_min\":"),
+            (max.z, "\"z_max\":"),
+        ] {
+            let (wanted, tol) = at(field);
+            assert!(
+                (actual - wanted).abs() <= tol.max(1e-3),
+                "{name} {field}: {actual} against {wanted} +- {tol}"
+            );
         }
     }
     assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());

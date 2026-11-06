@@ -287,7 +287,6 @@ def create_deck(model, context, bridge, basis):
     positions = []
     for i in range(count + 1):
         station = min(i * DECK_SECTION_SPACING, H_LENGTH)
-        h = heading(station)
         location = model.create_entity(
             "IfcPointByDistanceExpression",
             DistanceAlong=model.create_entity("IfcLengthMeasure",
@@ -305,8 +304,7 @@ def create_deck(model, context, bridge, basis):
         positions.append(model.create_entity(
             "IfcAxis2PlacementLinear", Location=location,
             Axis=direction(model, (0.0, 0.0, 1.0)),
-            RefDirection=direction(model,
-                                   (-math.sin(h), math.cos(h), 0.0))))
+            RefDirection=direction(model, (0.0, 1.0, 0.0))))
     solid = model.create_entity(
         "IfcSectionedSolidHorizontal",
         Directrix=basis,
