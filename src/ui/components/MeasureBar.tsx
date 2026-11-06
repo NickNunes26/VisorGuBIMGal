@@ -1,10 +1,13 @@
-import React, { useEffect, useSyncExternalStore } from 'react';
-import { Check, Trash2, X } from 'lucide-react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
+import { Check, Download, Trash2, X } from 'lucide-react';
 import { MEASURE_KINDS, canClose, measurementText, type MeasureKind } from '../viewer/measure';
 import type { MeasureController } from '../viewer/MeasureController';
+import type { CsvGroupBy } from '../viewer/csvExport';
 
 interface MeasureBarProps {
   controller: MeasureController;
+  onExportCsv?: (groupBy: CsvGroupBy) => void;
+  isExportingCsv?: boolean;
 }
 
 const LABELS = Object.fromEntries(MEASURE_KINDS.map(({ kind, label }) => [kind, label])) as Record<
@@ -12,8 +15,13 @@ const LABELS = Object.fromEntries(MEASURE_KINDS.map(({ kind, label }) => [kind, 
   string
 >;
 
-export const MeasureBar: React.FC<MeasureBarProps> = ({ controller }) => {
+export const MeasureBar: React.FC<MeasureBarProps> = ({
+  controller,
+  onExportCsv,
+  isExportingCsv = false
+}) => {
   const { kind, draft, measurements } = useSyncExternalStore(controller.subscribe, controller.getState);
+  const [groupBy, setGroupBy] = useState<CsvGroupBy>('class');
   const hint = MEASURE_KINDS.find((item) => item.kind === kind)?.hint;
 
   // Escape starts the measurement in hand again; Enter closes an area.
@@ -67,6 +75,32 @@ export const MeasureBar: React.FC<MeasureBarProps> = ({ controller }) => {
           </button>
         )}
       </div>
+
+      {onExportCsv && (
+        <div className="display-bar-row">
+          <span className="display-bar-label">CSV</span>
+          <select
+            className="select csv-group-select"
+            value={groupBy}
+            onChange={(event) => setGroupBy(event.target.value as CsvGroupBy)}
+            title="Agrupar mediciones CSV por clase o planta"
+          >
+            <option value="class">Por clase IFC</option>
+            <option value="storey">Por planta</option>
+          </select>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm csv-export-btn"
+            style={{ whiteSpace: 'nowrap' }}
+            disabled={isExportingCsv}
+            onClick={() => onExportCsv(groupBy)}
+            title="Exportar mediciones a CSV por clase o planta"
+          >
+            <Download size={12} />
+            <span>{isExportingCsv ? 'Exportando...' : 'CSV'}</span>
+          </button>
+        </div>
+      )}
 
       {hint && (
         <div className="display-bar-status measure-hint">

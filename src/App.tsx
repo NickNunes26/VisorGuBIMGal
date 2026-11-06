@@ -11,6 +11,13 @@ import { SearchPanel } from './ui/components/SearchPanel';
 import { MeasureBar } from './ui/components/MeasureBar';
 import { SavedViewsBar } from './ui/components/SavedViewsBar';
 import { parseModelUrlParam } from './ui/viewer/urlModel';
+import {
+  buildMedicionesCsv,
+  extractSpatialElements,
+  resolveElementQuantities,
+  type CsvGroupBy,
+  type ElementQuantityRow
+} from './ui/viewer/csvExport';
 import { applySavedView, captureSavedView, savedViewWithoutModel, type SavedView } from './ui/viewer/savedViews';
 import { MeasureOverlay } from './ui/components/MeasureOverlay';
 import { MeasureController } from './ui/viewer/MeasureController';
@@ -52,6 +59,7 @@ export default function App() {
   const [displayRule, setDisplayRule] = useState<DisplayRule>(SHOW_ALL);
   const [savedViews, setSavedViews] = useState<SavedView[]>([]);
   const [nextSavedViewIndex, setNextSavedViewIndex] = useState<number>(1);
+  const [isExportingCsv, setIsExportingCsv] = useState<boolean>(false);
 
   // Every model follows the display rule, including one loaded after the rule was set
   useEffect(() => {
@@ -344,6 +352,61 @@ export default function App() {
     setSavedViews((prev) => prev.filter((view) => view.id !== id));
   }, []);
 
+  const handleExportCsv = useCallback(
+    async (groupBy: CsvGroupBy) => {
+      const visibleModels = models.filter((m) => m.visible);
+      const targetModels = visibleModels.length > 0 ? visibleModels : models;
+      if (targetModels.length === 0) return;
+
+      setIsExportingCsv(true);
+      setStatusText('Calculando mediciones para exportar CSV...');
+      try {
+        const entries = targetModels.flatMap((model) =>
+          extractSpatialElements(model.id, model.fileName, spatialTrees[model.id])
+        );
+        const rows: ElementQuantityRow[] = [];
+        for (const entry of entries) {
+          const ref: ElementRef = { modelId: entry.modelId, expressId: entry.expressId };
+          const [details, mesh] = await Promise.all([
+            kernel.getElementDetails(ref),
+            kernel.elementMesh(entry.modelId, entry.expressId)
+          ]);
+          const q = resolveElementQuantities(details, mesh);
+          rows.push({ ...entry, ...q });
+        }
+
+        const csv = buildMedicionesCsv(rows, groupBy);
+        const filename = `mediciones-por-${groupBy === 'class' ? 'clase' : 'planta'}.csv`;
+        if (typeof window !== 'undefined') {
+          (window as unknown as Record<string, unknown>).__gubim_last_csv__ = {
+            filename,
+            content: csv,
+            groupBy,
+            rowCount: rows.length
+          };
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        }
+        setStatusText(`Mediciones exportadas a ${filename} (${rows.length} elementos).`);
+      } catch (err) {
+        console.error('Error exporting CSV:', err);
+        setStatusText(
+          `Error al exportar CSV: ${err instanceof Error ? err.message : 'Error'}`
+        );
+      } finally {
+        setIsExportingCsv(false);
+      }
+    },
+    [models, spatialTrees]
+  );
+
   // Locate model on GIS map
   const handleLocateOnGis = useCallback((model: ModelRecord) => {
     setIsGisExpanded(true);
@@ -460,7 +523,11 @@ export default function App() {
                 onShowAll={() => setDisplayRule((prev) => ({ ...SHOW_ALL, ghost: prev.ghost }))}
               />
               <SectionBar section={section} bounds={bounds} onChange={setSection} />
-              <MeasureBar controller={measure} />
+              <MeasureBar
+                controller={measure}
+                onExportCsv={(groupBy) => void handleExportCsv(groupBy)}
+                isExportingCsv={isExportingCsv}
+              />
               <SavedViewsBar
                 views={savedViews}
                 nextIndex={nextSavedViewIndex}
