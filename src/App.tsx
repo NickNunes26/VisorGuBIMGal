@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { Header } from './ui/components/Header';
 import { ModelsPanel } from './ui/components/ModelsPanel';
 import { SpatialTreePanel } from './ui/components/SpatialTreePanel';
@@ -10,6 +10,7 @@ import { SectionBar } from './ui/components/SectionBar';
 import { SearchPanel } from './ui/components/SearchPanel';
 import { MeasureBar } from './ui/components/MeasureBar';
 import { SavedViewsBar } from './ui/components/SavedViewsBar';
+import { parseModelUrlParam } from './ui/viewer/urlModel';
 import { applySavedView, captureSavedView, savedViewWithoutModel, type SavedView } from './ui/viewer/savedViews';
 import { MeasureOverlay } from './ui/components/MeasureOverlay';
 import { MeasureController } from './ui/viewer/MeasureController';
@@ -212,6 +213,32 @@ export default function App() {
     },
     [loadIfcFile]
   );
+
+  // Load public model from ?model= or ?ifc= URL parameter once renderer is ready
+  const urlModelLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!activeBackend || urlModelLoadedRef.current || typeof window === 'undefined') return;
+    const target = parseModelUrlParam(window.location.search, window.location.href);
+    if (!target) return;
+    urlModelLoadedRef.current = true;
+    void (async () => {
+      try {
+        setIsWorking(true);
+        setStatusText(`Descargando ${target.fileName}...`);
+        const resp = await fetch(target.url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const blob = await resp.blob();
+        const file = new File([blob], target.fileName, { type: 'application/octet-stream' });
+        await loadIfcFile(file);
+      } catch (err) {
+        console.error(err);
+        setStatusText(
+          `Error al descargar ${target.fileName}: ${err instanceof Error ? err.message : 'Error'}`
+        );
+        setIsWorking(false);
+      }
+    })();
+  }, [activeBackend, loadIfcFile]);
 
   // Selection handler keyed by ElementRef
   const handleSelectElement = useCallback(
