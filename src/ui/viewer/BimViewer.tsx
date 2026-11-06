@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react';
-import { RefreshCw, Box, Compass, Eye, UploadCloud } from 'lucide-react';
+import { RefreshCw, Box, Compass, Eye, UploadCloud, Activity } from 'lucide-react';
+import { PerfMonitor } from '../components/PerfMonitor';
 import type { ElementRef } from '../../domain/models/ModelRecord';
 import type { RendererEventHandlers, RendererPort } from '../../domain/kernel/RendererPort';
 
@@ -35,6 +36,7 @@ export const BimViewer: React.FC<BimViewerProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
+  const [showPerfMonitor, setShowPerfMonitor] = useState(false);
 
   useEffect(() => {
     renderer.setHandlers({
@@ -126,7 +128,18 @@ export const BimViewer: React.FC<BimViewerProps> = ({
         >
           <RefreshCw size={14} />
         </button>
+        <div style={{ width: '1px', height: '16px', background: 'rgba(255,255,255,0.1)' }} />
+        <button
+          className={`btn btn-ghost btn-icon perf-toggle-btn ${showPerfMonitor ? 'active' : ''}`}
+          aria-pressed={showPerfMonitor}
+          onClick={() => setShowPerfMonitor((prev) => !prev)}
+          title="Monitor de rendimiento (GPU, lotes y fotogramas)"
+        >
+          <Activity size={14} />
+        </button>
       </div>
+
+      {showPerfMonitor && <PerfMonitor renderer={renderer} />}
 
       {/* Status toast */}
       {(statusText || isWorking) && (

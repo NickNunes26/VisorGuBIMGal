@@ -867,3 +867,44 @@ canvas.bim-viewport {
   background-color: rgba(239, 68, 68, 0.2);
   color: #f87171;
 }
+.perf-monitor-hud {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  min-width: 210px;
+  background: rgba(15, 23, 42, 0.9);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--text-main);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  z-index: 15;
+  pointer-events: none;
+}
+
+.perf-monitor-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #38bdf8;
+  margin-bottom: 4px;
+}
+
+.perf-monitor-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 1.5px 0;
+}
+
+.perf-monitor-label {
+  color: var(--text-muted);
+}
+
+.perf-monitor-val {
+  font-family: var(--font-mono);
+  color: var(--text-main);
+}

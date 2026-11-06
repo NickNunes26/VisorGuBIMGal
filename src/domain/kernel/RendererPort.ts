@@ -4,6 +4,17 @@ import type { Ray, Vec3 } from '../measure/geometry';
 
 export type ViewPreset = 'iso' | 'top' | 'front' | 'side';
 
+export interface RendererDebugStats {
+  modelCount: number;
+  batchCount: number;
+  recordCount: number;
+  liveGpuBuffers: number;
+  allocatedGpuBytes: number;
+  renderCount: number;
+  lastFrameCpuMs: number;
+  drawnBatches: number;
+  pickedBatches: number;
+}
 export interface CameraPose {
   target: readonly [number, number, number];
   distance: number;
@@ -83,6 +94,7 @@ export interface RendererPort {
   fitToView(): void;
   getCameraPose(): CameraPose | null;
   setCameraPose(pose: CameraPose): void;
+  getDebugStats(): RendererDebugStats;
 
   /** 'select' until changed. */
   setPointerMode(mode: PointerMode): void;
