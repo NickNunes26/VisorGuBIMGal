@@ -69,7 +69,7 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 | C16 | Minimapa de planta con la posición y el cono de la cámara | El panel GIS es un mapa exterior | M | G | Sí |
 | C17 | Aristas o contornos para leer mejor la geometría | No hay pase de aristas | M | C | Sí |
 | C18 | Interfaz en gallego e inglés además de castellano | Textos en castellano en el código | M | C | Sí |
-| C19 | Abrir un modelo público desde un parámetro de la URL, para compartir enlaces | Solo archivo local y muestra | S | C | Sí |
+| C19 | Abrir un modelo público desde un parámetro de la URL, para compartir enlaces | Solo archivo local y muestra | S | C | Sí. **Hecho en T-128** (2026-11-06): `parseModelUrlParam` lee `?model=<url>` o `?ifc=<url>` al iniciar el visor (restringido a `http:` y `https:`), deduce el nombre `.ifc` y descarga y carga el modelo una vez que el renderizador está listo |
 | C20 | Monitor de rendimiento: fotogramas, memoria GPU, lotes dibujados | `getDebugStats()` existe en ambos renderizadores y ningún componente lo usa | S | G | Sí. **Hecho en T-127** (2026-11-06): botón en la barra flotante del visor (`.perf-toggle-btn`) que abre y cierra un panel HUD (`PerfMonitor`) en la esquina superior derecha con ritmo de fotogramas (`FPS` o `En reposo`), tiempo de CPU del último fotograma (`ms`), lotes dibujados y de selección frente al total (`drawnBatches / batchCount`, `pickedBatches / batchCount`), memoria GPU reservada y número de búferes (`allocatedGpuBytes`, `liveGpuBuffers`), y mallas y modelos cargados (`recordCount / modelCount`) |
 
 ## D. Robustez y calidad
