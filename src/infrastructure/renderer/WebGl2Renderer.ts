@@ -27,7 +27,9 @@ import { SECTION_FLOATS, keptSectionPlanes, writeSectionPlanes } from './section
 import {
   FLAG_SELECTED,
   displayFlags,
+  effectiveRgba,
   refreshDisplayFlags,
+  setColors,
   setDisplay,
   type DisplayState
 } from './recordDisplay';
@@ -692,6 +694,8 @@ export class WebGl2Renderer implements RendererPort {
         visible: true,
         batches: [],
         recordWords: [],
+        baseRgba: [],
+        colorOverrides: new Map(),
         expressIdToRecords: new Map(),
         displayEntries: new Map(),
         displayOthers: 'default',
@@ -778,7 +782,8 @@ export class WebGl2Renderer implements RendererPort {
         0;
 
       const recIdxInModel = recordOffsetInModel + r;
-      model.recordWords.push(expressId, model.numericId >>> 0, rgba, stateFlags);
+      model.baseRgba!.push(rgba);
+      model.recordWords.push(expressId, model.numericId >>> 0, effectiveRgba(model, expressId, rgba), stateFlags);
 
       let list = model.expressIdToRecords.get(expressId);
       if (!list) {
@@ -961,6 +966,15 @@ export class WebGl2Renderer implements RendererPort {
     }
     // One upload of the whole table next frame, not one write per record.
     if (anyChanged) {
+      this.recordLayoutDirty = true;
+      this.requestRender();
+    }
+  }
+
+  setElementColors(modelId: ModelId, colors: ReadonlyMap<number, number>): void {
+    const model = this.models.get(modelId);
+    if (!model) return;
+    if (setColors(model, colors)) {
       this.recordLayoutDirty = true;
       this.requestRender();
     }

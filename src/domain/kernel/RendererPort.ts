@@ -83,6 +83,11 @@ export interface RendererPort {
     others: ElementDisplay,
     entries: ReadonlyMap<number, ElementDisplay>
   ): void;
+  /**
+   * Overrides the RGB color of the listed elements in `modelId` (preserving each mesh's alpha).
+   * An empty map restores every element's original IFC material color.
+   */
+  setElementColors(modelId: ModelId, colors: ReadonlyMap<number, number>): void;
   setSelection(ref: ElementRef | null): void;
   /**
    * Cuts every model: only points that all planes keep are drawn or picked, ghosts included.

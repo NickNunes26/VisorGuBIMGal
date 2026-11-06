@@ -11,6 +11,14 @@ import { SearchPanel } from './ui/components/SearchPanel';
 import { IdsPanel } from './ui/components/IdsPanel';
 import { MeasureBar } from './ui/components/MeasureBar';
 import { SavedViewsBar } from './ui/components/SavedViewsBar';
+import { ColorByBar } from './ui/components/ColorByBar';
+import {
+  buildColorScheme,
+  collectAvailablePropertyNames,
+  type ColorByMode,
+  type ColorLegendItem,
+  type ColorableElement
+} from './ui/viewer/colorByProperty';
 import { parseModelUrlParam } from './ui/viewer/urlModel';
 import {
   createFailedModelRecord,
@@ -67,6 +75,10 @@ export default function App() {
   const [savedViews, setSavedViews] = useState<SavedView[]>([]);
   const [nextSavedViewIndex, setNextSavedViewIndex] = useState<number>(1);
   const [isExportingCsv, setIsExportingCsv] = useState<boolean>(false);
+  const [colorByMode, setColorByMode] = useState<ColorByMode>('none');
+  const [colorByPropName, setColorByPropName] = useState<string>('Name');
+  const [colorLegend, setColorLegend] = useState<ColorLegendItem[]>([]);
+  const [availableColorProps, setAvailableColorProps] = useState<string[]>([]);
 
   // Every model follows the display rule, including one loaded after the rule was set
   useEffect(() => {
@@ -95,8 +107,45 @@ export default function App() {
       measure.clear();
       setSavedViews([]);
       setNextSavedViewIndex(1);
+      setColorByMode('none');
+      setColorLegend([]);
     }
   }, [models.length, measure]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (colorByMode === 'none' || models.length === 0) {
+      setColorLegend([]);
+      for (const m of models) {
+        renderer.setElementColors(m.id, new Map());
+      }
+      return;
+    }
+    void (async () => {
+      const readyModels = models.filter((m) => m.status === 'ready');
+      const elements: ColorableElement[] = readyModels.flatMap((m) =>
+        extractSpatialElements(m.id, m.fileName, spatialTrees[m.id])
+      );
+      if (colorByMode === 'material' || colorByMode === 'property') {
+        for (const el of elements) {
+          if (cancelled) return;
+          el.details = await kernel.getElementDetails({ modelId: el.modelId, expressId: el.expressId });
+        }
+        if (!cancelled) {
+          setAvailableColorProps(collectAvailablePropertyNames(elements));
+        }
+      }
+      if (cancelled) return;
+      const scheme = buildColorScheme(elements, colorByMode, colorByPropName);
+      setColorLegend(scheme.legend);
+      for (const m of models) {
+        renderer.setElementColors(m.id, scheme.colorsByModel.get(m.id) ?? new Map());
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [colorByMode, colorByPropName, models, spatialTrees]);
 
   const handleIsolate = useCallback((target: DisplayTarget) => {
     setDisplayRule((prev) => ({ ...prev, isolate: target }));
@@ -580,6 +629,14 @@ export default function App() {
                 controller={measure}
                 onExportCsv={(groupBy) => void handleExportCsv(groupBy)}
                 isExportingCsv={isExportingCsv}
+              />
+              <ColorByBar
+                mode={colorByMode}
+                propertyName={colorByPropName}
+                availableProperties={availableColorProps}
+                legend={colorLegend}
+                onChangeMode={setColorByMode}
+                onChangePropertyName={setColorByPropName}
               />
               <SavedViewsBar
                 views={savedViews}

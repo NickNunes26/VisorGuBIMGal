@@ -202,6 +202,14 @@ export class AutoRenderer implements RendererPort {
     }
   }
 
+  setElementColors(modelId: ModelId, colors: ReadonlyMap<number, number>): void {
+    if (this.activeRenderer) {
+      this.activeRenderer.setElementColors(modelId, colors);
+    } else {
+      this.preInitQueue.push((r) => r.setElementColors(modelId, colors));
+    }
+  }
+
   setSelection(ref: ElementRef | null): void {
     if (this.activeRenderer) {
       this.activeRenderer.setSelection(ref);

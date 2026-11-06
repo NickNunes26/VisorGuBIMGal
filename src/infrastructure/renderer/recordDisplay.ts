@@ -10,6 +10,10 @@ export const FLAG_GHOST = 32;
 export interface DisplayState {
   /** 4 u32 words per record: [expressId, modelNumericId, rgba, stateFlags]. */
   recordWords: number[];
+  /** Original kernel RGBA per record, so color overrides can be cleared cleanly. */
+  baseRgba?: number[];
+  /** Optional expressId -> packed u32 RGBA override for color-by-property mode. */
+  colorOverrides?: Map<number, number>;
   /** Set by setElementDisplay and setElementVisibility: listed elements, then the rest. */
   displayEntries: Map<number, ElementDisplay>;
   displayOthers: ElementDisplay;
@@ -49,4 +53,30 @@ export function refreshDisplayFlags(model: DisplayState, recordIndex: number): b
   if (nextFlags === prevFlags) return false;
   model.recordWords[wordIdx] = nextFlags;
   return true;
+}
+
+/** Computes the effective RGBA for a record, preserving its original alpha when overridden. */
+export function effectiveRgba(model: DisplayState, expressId: number, base: number): number {
+  const override = model.colorOverrides?.get(expressId);
+  if (override === undefined) return base >>> 0;
+  return (((override & 0xffffff00) | (base & 0xff)) >>> 0);
+}
+
+/** Replaces a model's per-element color overrides and updates `recordWords` in place; true if any changed. */
+export function setColors(model: DisplayState, colors: ReadonlyMap<number, number>): boolean {
+  model.colorOverrides = new Map(colors);
+  const recordCount = model.recordWords.length / 4;
+  let anyChanged = false;
+  for (let rIdx = 0; rIdx < recordCount; rIdx++) {
+    const expressId = model.recordWords[rIdx * 4];
+    const wordIdx = rIdx * 4 + 2;
+    const prevRgba = model.recordWords[wordIdx];
+    const base = model.baseRgba?.[rIdx] ?? prevRgba;
+    const nextRgba = effectiveRgba(model, expressId, base);
+    if (nextRgba !== prevRgba) {
+      model.recordWords[wordIdx] = nextRgba;
+      anyChanged = true;
+    }
+  }
+  return anyChanged;
 }
