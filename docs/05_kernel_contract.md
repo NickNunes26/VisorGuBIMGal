@@ -350,6 +350,15 @@ impl Sheet {
 
 Hay exactamente una copia y ninguna serialización. Los datos no geométricos, poco frecuentes (detalles, árbol, resumen, opciones), pueden viajar como JSON.
 
+### Caché de geometría en OPFS
+
+`kernel.worker.ts` y `geometryCache.ts` guardan el flujo evaluado en el sistema de archivos privado del origen (`navigator.storage.getDirectory()`, carpeta `gubim-geometry-cache`) mediante `FileSystemSyncAccessHandle`, sin cambiar `KernelPort`:
+
+- **Identidad:** cada entrada une la clave rápida de apertura (`cacheKey`: longitud del archivo en 8 bytes + primer MiB + último MiB, SHA-256) y la huella del binario WASM (`SHA-256(wasmBytes)`). La cabecera de 96 bytes (`GUBIMGC1`, `CACHE_FORMAT = 1`) guarda además el SHA-256 completo del archivo IFC (`identity.file`, 32 bytes) y el del kernel (`identity.kernel`, 32 bytes), la marca de último uso (`LAST_USED_AT`) y la longitud final (`LENGTH_AT`).
+- **Escritura en la segunda apertura:** la primera apertura de un archivo solo deja una marca `.seen` y no calcula el SHA-256 completo ni escribe `.gbc`, evitando penalizar los modelos que solo se abren una vez. En la segunda apertura se comprueba la marca, se calcula el SHA-256 completo del archivo y se escribe el `.gbc` (`Summary`, lotes `Batch`, `Complete`, `Tree` y `End`). La longitud total en la cabecera se escribe y vuelca (`flush`) al final: un archivo truncado o interrumpido nunca se da por válido, se descarta y se vuelve a generar desde WASM.
+- **Reproducción y apertura diferida de `Model`:** cuando `CacheReader.open` valida un `.gbc` (magia, versión, longitud exacta, SHA-256 completo del archivo y del kernel), `open` devuelve el `ModelSummary` guardado sin instanciar `Model` en WASM y conserva los bytes IFC en el Worker; `streamGeometry` y `getSpatialTree` se sirven desde el `.gbc`, y `Model.open(sourceBytes)` solo se ejecuta bajo demanda cuando se pide una operación que necesita el modelo vivo (`getElementDetails`, `findElements`, `elementMesh`, `start_drawing`).
+- **Limpieza:** al escribir o abrir la caché se eliminan entradas de otros kernels y marcas huérfanas, y se aplica un tope LRU de 2 GiB por fecha de último uso (`lastUsed`). El diálogo «Acerca de» (`GeometryCacheControl.tsx`) consulta y vacía la carpeta OPFS.
+
 ### Flujo de planos
 
 Un Worker por plano, con su propia instancia WASM, además del de cada modelo. Un plano sobrevive así a `closeModel`, y `discardDrawing` termina su Worker y devuelve toda su memoria.

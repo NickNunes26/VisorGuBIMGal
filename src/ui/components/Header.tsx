@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type { ViewPreset } from '../../domain/kernel/RendererPort';
 import noticeText from '../../../NOTICE.md?raw';
+import { GeometryCacheControl } from './GeometryCacheControl';
 
 interface HeaderProps {
   onOpenFile: (file: File) => void;
@@ -265,10 +266,13 @@ export const Header: React.FC<HeaderProps> = ({
                 padding: '10px 16px',
                 borderTop: '1px solid #1e293b',
                 display: 'flex',
-                justifyContent: 'flex-end',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                gap: '12px',
                 backgroundColor: '#0f172a'
               }}
             >
+              <GeometryCacheControl />
               <button className="btn btn-secondary" onClick={() => setShowAbout(false)}>
                 Cerrar
               </button>
