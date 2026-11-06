@@ -7,6 +7,7 @@ import {
 } from '../../domain/kernel/GeometryBatch';
 import {
   MAX_SECTION_PLANES,
+  type CameraPose,
   type ElementDisplay,
   type PointerMode,
   type RendererEventHandlers,
@@ -1107,6 +1108,15 @@ export class WebGl2Renderer implements RendererPort {
     if (bounds) {
       this.camera.fitToBounds(bounds);
     }
+    this.requestRender();
+  }
+
+  getCameraPose(): CameraPose {
+    return this.camera.getPose();
+  }
+
+  setCameraPose(pose: CameraPose): void {
+    this.camera.setPose(pose);
     this.requestRender();
   }
 

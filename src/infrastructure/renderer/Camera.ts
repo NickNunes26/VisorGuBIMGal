@@ -1,5 +1,5 @@
 import type { ModelBounds } from '../../domain/models/ModelRecord';
-import type { ViewPreset } from '../../domain/kernel/RendererPort';
+import type { CameraPose, ViewPreset } from '../../domain/kernel/RendererPort';
 import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import { WHOLE_VIEW, type Frustum, type ViewWindow } from './frustum';
 
@@ -51,6 +51,35 @@ export class Camera {
 
   getDistance(): number {
     return this.distance;
+  }
+
+  getPose(): CameraPose {
+    return {
+      target: [this.target[0], this.target[1], this.target[2]],
+      distance: this.distance,
+      azimuth: this.azimuth,
+      elevation: this.elevation
+    };
+  }
+
+  setPose(pose: CameraPose): void {
+    if (
+      !pose ||
+      !Array.isArray(pose.target) ||
+      pose.target.length !== 3 ||
+      !pose.target.every(Number.isFinite) ||
+      !Number.isFinite(pose.distance) ||
+      pose.distance <= 0 ||
+      !Number.isFinite(pose.azimuth) ||
+      !Number.isFinite(pose.elevation)
+    ) {
+      return;
+    }
+    this.target = [pose.target[0], pose.target[1], pose.target[2]];
+    this.distance = Math.max(0.05, Math.min(500000, pose.distance));
+    this.azimuth = pose.azimuth;
+    const maxElev = Math.PI / 2;
+    this.elevation = Math.max(-maxElev, Math.min(maxElev, pose.elevation));
   }
 
   orbit(dx: number, dy: number): void {

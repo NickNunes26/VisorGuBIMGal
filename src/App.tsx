@@ -9,6 +9,8 @@ import { DisplayBar } from './ui/components/DisplayBar';
 import { SectionBar } from './ui/components/SectionBar';
 import { SearchPanel } from './ui/components/SearchPanel';
 import { MeasureBar } from './ui/components/MeasureBar';
+import { SavedViewsBar } from './ui/components/SavedViewsBar';
+import { applySavedView, captureSavedView, savedViewWithoutModel, type SavedView } from './ui/viewer/savedViews';
 import { MeasureOverlay } from './ui/components/MeasureOverlay';
 import { MeasureController } from './ui/viewer/MeasureController';
 import { NO_SECTION, sceneBounds, sectionPlanes, type SectionState } from './ui/viewer/section';
@@ -47,6 +49,8 @@ export default function App() {
   const [, setRendererError] = useState<string | null>(null);
   const [activeBackend, setActiveBackend] = useState<'webgpu' | 'webgl2' | null>(null);
   const [displayRule, setDisplayRule] = useState<DisplayRule>(SHOW_ALL);
+  const [savedViews, setSavedViews] = useState<SavedView[]>([]);
+  const [nextSavedViewIndex, setNextSavedViewIndex] = useState<number>(1);
 
   // Every model follows the display rule, including one loaded after the rule was set
   useEffect(() => {
@@ -73,6 +77,8 @@ export default function App() {
     if (models.length === 0) {
       measure.setKind(null);
       measure.clear();
+      setSavedViews([]);
+      setNextSavedViewIndex(1);
     }
   }, [models.length, measure]);
 
@@ -263,8 +269,53 @@ export default function App() {
     });
     setSelectedElement((prev) => (prev?.modelId === id ? null : prev));
     setDisplayRule((prev) => withoutModel(prev, id));
+    setSavedViews((prev) => prev.map((view) => savedViewWithoutModel(view, id)));
     measure.forgetModel(id);
   }, [measure]);
+
+  const handleSaveView = useCallback(
+    (name: string) => {
+      const camera = renderer.getCameraPose();
+      if (!camera) return;
+      const view = captureSavedView({
+        id: `view-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name,
+        index: nextSavedViewIndex,
+        camera,
+        models,
+        displayRule,
+        section,
+        selectedRef
+      });
+      setSavedViews((prev) => [...prev, view]);
+      setNextSavedViewIndex((prev) => prev + 1);
+    },
+    [nextSavedViewIndex, models, displayRule, section, selectedRef]
+  );
+
+  const handleApplySavedView = useCallback(
+    (view: SavedView) => {
+      const applied = applySavedView(view, models);
+      renderer.setCameraPose(applied.camera);
+      setModels((prev) =>
+        prev.map((model) => {
+          const nextVisible = applied.modelVisibilities.get(model.id) ?? model.visible;
+          if (nextVisible !== model.visible) {
+            renderer.setModelVisibility(model.id, nextVisible);
+          }
+          return nextVisible === model.visible ? model : { ...model, visible: nextVisible };
+        })
+      );
+      setDisplayRule(applied.displayRule);
+      setSection(applied.section);
+      void handleSelectElement(applied.selectedRef);
+    },
+    [models, handleSelectElement]
+  );
+
+  const handleDeleteSavedView = useCallback((id: string) => {
+    setSavedViews((prev) => prev.filter((view) => view.id !== id));
+  }, []);
 
   // Locate model on GIS map
   const handleLocateOnGis = useCallback((model: ModelRecord) => {
@@ -383,6 +434,13 @@ export default function App() {
               />
               <SectionBar section={section} bounds={bounds} onChange={setSection} />
               <MeasureBar controller={measure} />
+              <SavedViewsBar
+                views={savedViews}
+                nextIndex={nextSavedViewIndex}
+                onSave={handleSaveView}
+                onApply={handleApplySavedView}
+                onDelete={handleDeleteSavedView}
+              />
             </div>
           )}
 

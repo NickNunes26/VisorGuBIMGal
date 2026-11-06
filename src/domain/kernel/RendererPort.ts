@@ -4,6 +4,13 @@ import type { Ray, Vec3 } from '../measure/geometry';
 
 export type ViewPreset = 'iso' | 'top' | 'front' | 'side';
 
+export interface CameraPose {
+  target: readonly [number, number, number];
+  distance: number;
+  azimuth: number;
+  elevation: number;
+}
+
 /**
  * How an element is drawn. 'default' is its own state: hidden if HiddenByDefault, else visible.
  * A ghost is drawn faint and cannot be picked; a HiddenByDefault element is never a ghost and
@@ -74,6 +81,8 @@ export interface RendererPort {
 
   setViewPreset(preset: ViewPreset): void;
   fitToView(): void;
+  getCameraPose(): CameraPose | null;
+  setCameraPose(pose: CameraPose): void;
 
   /** 'select' until changed. */
   setPointerMode(mode: PointerMode): void;

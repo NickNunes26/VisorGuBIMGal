@@ -2,6 +2,7 @@ import type { ElementRef, ModelBounds, ModelId } from '../../domain/models/Model
 import { findBatchError, type GeometryBatch } from '../../domain/kernel/GeometryBatch';
 import type { Ray, Vec3 } from '../../domain/measure/geometry';
 import type {
+  CameraPose,
   ElementDisplay,
   PointerMode,
   RendererEventHandlers,
@@ -230,6 +231,18 @@ export class AutoRenderer implements RendererPort {
       this.activeRenderer.fitToView();
     } else {
       this.preInitQueue.push((r) => r.fitToView());
+    }
+  }
+
+  getCameraPose(): CameraPose | null {
+    return this.activeRenderer?.getCameraPose() ?? null;
+  }
+
+  setCameraPose(pose: CameraPose): void {
+    if (this.activeRenderer) {
+      this.activeRenderer.setCameraPose(pose);
+    } else {
+      this.preInitQueue.push((r) => r.setCameraPose(pose));
     }
   }
 

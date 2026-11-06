@@ -6,6 +6,7 @@ import {
   type GeometryBatch
 } from '../../domain/kernel/GeometryBatch';
 import type {
+  CameraPose,
   ElementDisplay,
   PointerMode,
   RendererEventHandlers,
@@ -1031,6 +1032,15 @@ export class WebGpuRenderer implements RendererPort {
     if (bounds) {
       this.camera.fitToBounds(bounds);
     }
+    this.requestRender();
+  }
+
+  getCameraPose(): CameraPose {
+    return this.camera.getPose();
+  }
+
+  setCameraPose(pose: CameraPose): void {
+    this.camera.setPose(pose);
     this.requestRender();
   }
 

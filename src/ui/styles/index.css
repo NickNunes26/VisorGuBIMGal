@@ -430,7 +430,8 @@ canvas.bim-viewport {
 
 .display-bar,
 .section-bar,
-.measure-bar {
+.measure-bar,
+.saved-views-bar {
   background-color: rgba(15, 23, 42, 0.85);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -529,6 +530,42 @@ canvas.bim-viewport {
 
 .measure-value {
   font-variant-numeric: tabular-nums;
+}
+
+.saved-views-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 2px 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.saved-view-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 2px;
+}
+
+.saved-view-apply {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 2px 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-main);
+  font-size: 12px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.saved-view-apply:hover {
+  background-color: rgba(56, 189, 248, 0.15);
+  color: var(--accent-color);
 }
 
 /* Over the canvas, under the tool bars, and never in the way of the pointer. */
