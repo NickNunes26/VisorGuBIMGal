@@ -683,10 +683,10 @@ fn a_profile_segment_running_back_against_the_distance_is_left_to_the_polyline()
     close(placed.positions[0].z, height, 1e-3);
 }
 
-/// The authored road alignment's stations, as `(station, [x, y, z], [tolerance; 3])` from its
-/// expected values file, read without a JSON library: each station holds four values in order.
-fn authored_stations(json: &str) -> Vec<(f64, DVec3, DVec3)> {
-    let stations = &json[json.find("\"stations\"").expect("a stations list")..];
+/// The authored alignment's stations, as `(station, [x, y, z], [tolerance; 3])` from its
+/// expected values file, read without a JSON library: each station holds `fields` values in order.
+fn authored_stations(json: &str, fields: usize) -> Vec<(f64, DVec3, DVec3)> {
+    let stations = &json[json.rfind("\"stations\"").expect("a stations list")..];
     let numbers = |key: &str| -> Vec<f64> {
         stations
             .split(key)
@@ -696,23 +696,23 @@ fn authored_stations(json: &str) -> Vec<(f64, DVec3, DVec3)> {
     };
     let (values, tolerances) = (numbers("\"value\":"), numbers("\"tolerance\":"));
     values
-        .chunks(4)
-        .zip(tolerances.chunks(4))
+        .chunks(fields)
+        .zip(tolerances.chunks(fields))
         .map(|(value, tolerance)| {
             (value[0], DVec3::new(value[1], value[2], value[3]), DVec3::new(tolerance[1], tolerance[2], tolerance[3]))
         })
         .collect()
 }
 
-#[test]
-fn authored_road_stations_are_where_their_expected_values_say() {
-    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/authored");
-    let text = std::fs::read_to_string(folder.join("road-alignment.ifc")).unwrap();
-    let stations = authored_stations(&std::fs::read_to_string(folder.join("road-alignment.expected.json")).unwrap());
-    assert_eq!(stations.len(), 14);
-    let gradient = text.lines().find(|line| line.contains("=IFCGRADIENTCURVE(")).expect("a gradient curve");
-    let gradient = &gradient[..gradient.find('=').unwrap()];
-    // A 2 cm cube centred on each station, placed along the gradient curve.
+/// Places a 2 cm probe cube at each `(station, expected, tolerance)` along `curve_entity` in `text`,
+/// checks every probe's centre against `expected`, and returns the evaluator's diagnostics.
+fn check_authored_stations(
+    text: &str,
+    curve_entity: &str,
+    stations: &[(f64, DVec3, DVec3)],
+) -> Vec<Diagnostic> {
+    let curve = text.lines().find(|line| line.contains(curve_entity)).expect(curve_entity);
+    let curve = &curve[..curve.find('=').unwrap()];
     let mut probes = String::from(
         "#100000=IFCCARTESIANPOINT((-0.01,-0.01,-0.01));\n#100001=IFCAXIS2PLACEMENT3D(#100000,$,$);\n\
          #100002=IFCBLOCK(#100001,0.02,0.02,0.02);\n\
@@ -722,7 +722,7 @@ fn authored_road_stations_are_where_their_expected_values_say() {
     for (index, (station, _, _)) in stations.iter().enumerate() {
         let id = 100_010 + index * 4;
         probes += &format!(
-            "#{id}=IFCPOINTBYDISTANCEEXPRESSION(IFCLENGTHMEASURE({station:?}),$,$,$,{gradient});\n\
+            "#{id}=IFCPOINTBYDISTANCEEXPRESSION(IFCLENGTHMEASURE({station:?}),$,$,$,{curve});\n\
              #{}=IFCAXIS2PLACEMENTLINEAR(#{id},$,$);\n#{}=IFCLINEARPLACEMENT($,#{},$);\n\
              #{}=IFCBUILDINGELEMENTPROXY('probe{index}',$,$,$,$,#{},#100004,$,$);\n",
             id + 1,
@@ -743,6 +743,87 @@ fn authored_road_stations_are_where_their_expected_values_say() {
         let centre = (min + max) / 2.0;
         let off = (centre - *expected).abs();
         assert!(off.cmple(*tolerance).all(), "station {station}: {centre} against {expected}");
+    }
+    evaluator.diagnostics().to_vec()
+}
+
+#[test]
+fn authored_road_stations_are_where_their_expected_values_say() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/authored");
+    let text = std::fs::read_to_string(folder.join("road-alignment.ifc")).unwrap();
+    let stations = authored_stations(&std::fs::read_to_string(folder.join("road-alignment.expected.json")).unwrap(), 4);
+    assert_eq!(stations.len(), 14);
+    let diagnostics = check_authored_stations(&text, "=IFCGRADIENTCURVE(", &stations);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn authored_rail_cant_stations_follow_the_centreline_and_report_cant_ignored() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/authored");
+    let text = std::fs::read_to_string(folder.join("rail-cant.ifc")).unwrap();
+    let stations = authored_stations(&std::fs::read_to_string(folder.join("rail-cant.expected.json")).unwrap(), 6);
+    assert_eq!(stations.len(), 16);
+    let diagnostics = check_authored_stations(&text, "=IFCSEGMENTEDREFERENCECURVE(", &stations);
+    assert!(diagnostics.iter().any(|item| item.code == "cant-ignored"), "{diagnostics:?}");
+    assert!(diagnostics.iter().all(|item| item.code == "cant-ignored"), "{diagnostics:?}");
+}
+
+/// The `(value, tolerance)` reached by finding each key of `path` in turn in `json`.
+fn expected_quantity(json: &str, path: &[&str]) -> (f64, f64) {
+    let mut at = 0;
+    for key in path {
+        at += json[at..].find(key).unwrap_or_else(|| panic!("{key} of {path:?}")) + key.len();
+    }
+    let number = |key: &str| -> f64 {
+        let start = at + json[at..].find(key).unwrap() + key.len();
+        let rest = json[start..].trim_start();
+        rest[..rest.find([',', '\n', '}']).unwrap()].trim().parse().unwrap()
+    };
+    (number("\"value\":"), number("\"tolerance\":"))
+}
+
+#[test]
+fn authored_linear_placement_boxes_match_their_expected_values() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/authored");
+    let text = std::fs::read_to_string(folder.join("linear-placement.ifc")).unwrap();
+    let json = std::fs::read_to_string(folder.join("linear-placement.expected.json")).unwrap();
+    let file = index(text.as_bytes()).unwrap();
+    let mut evaluator = ModelEvaluator::new(&file).unwrap();
+    for box_index in 1..=10 {
+        let name = format!("BOX-{box_index:02}");
+        let tag = format!("'{name}'");
+        let line = text
+            .lines()
+            .find(|line| line.contains("=IFCBUILDINGELEMENTPROXY(") && line.contains(&tag))
+            .expect(&name);
+        let id: u32 = line[1..line.find('=').unwrap()].parse().unwrap();
+        let element = evaluator.evaluate(id).expect(&name);
+        let mesh = &element.meshes[0].mesh;
+        assert_eq!(mesh.open_edges(), 0, "{name}");
+        let box_key = format!("\"{name}\"");
+        let at = |field: &str| expected_quantity(&json, &["\"placements\":", &box_key, field]);
+        let (vol, vol_tol) = at("\"volume\":");
+        close(mesh.volume(), vol, vol_tol);
+        let (min, max) = bounds(mesh);
+        let centre = (min + max) / 2.0;
+        let size = max - min;
+        for (actual, field) in [
+            (centre.x, "\"centre_x\":"),
+            (centre.y, "\"centre_y\":"),
+            (centre.z, "\"centre_z\":"),
+            (size.x, "\"bbox_size_x\":"),
+            (size.y, "\"bbox_size_y\":"),
+            (size.z, "\"bbox_size_z\":"),
+            (min.x, "\"bbox_min_x\":"),
+            (max.x, "\"bbox_max_x\":"),
+            (min.y, "\"bbox_min_y\":"),
+            (max.y, "\"bbox_max_y\":"),
+            (min.z, "\"bbox_min_z\":"),
+            (max.z, "\"bbox_max_z\":"),
+        ] {
+            let (wanted, tol) = at(field);
+            assert!((actual - wanted).abs() <= tol, "{name} {field}: {actual} against {wanted} +- {tol}");
+        }
     }
     assert!(evaluator.diagnostics().is_empty(), "{:?}", evaluator.diagnostics());
 }
