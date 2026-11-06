@@ -70,7 +70,7 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 | C17 | Aristas o contornos para leer mejor la geometría | No hay pase de aristas | M | C | Sí |
 | C18 | Interfaz en gallego e inglés además de castellano | Textos en castellano en el código | M | C | Sí |
 | C19 | Abrir un modelo público desde un parámetro de la URL, para compartir enlaces | Solo archivo local y muestra | S | C | Sí |
-| C20 | Monitor de rendimiento: fotogramas, memoria GPU, lotes dibujados | `getDebugStats()` existe en ambos renderizadores y ningún componente lo usa | S | G | Sí |
+| C20 | Monitor de rendimiento: fotogramas, memoria GPU, lotes dibujados | `getDebugStats()` existe en ambos renderizadores y ningún componente lo usa | S | G | Sí. **Hecho en T-127** (2026-11-06): botón en la barra flotante del visor (`.perf-toggle-btn`) que abre y cierra un panel HUD (`PerfMonitor`) en la esquina superior derecha con ritmo de fotogramas (`FPS` o `En reposo`), tiempo de CPU del último fotograma (`ms`), lotes dibujados y de selección frente al total (`drawnBatches / batchCount`, `pickedBatches / batchCount`), memoria GPU reservada y número de búferes (`allocatedGpuBytes`, `liveGpuBuffers`), y mallas y modelos cargados (`recordCount / modelCount`) |
 
 ## D. Robustez y calidad
 
