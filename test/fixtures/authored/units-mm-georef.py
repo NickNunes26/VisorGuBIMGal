@@ -239,6 +239,8 @@ def build(path):
     relation(model, "IfcRelContainedInSpatialStructure",
              RelatedElements=products, RelatingStructure=storey)
 
+    map_unit = ifcopenshell.api.unit.add_si_unit(
+        model, unit_type="LENGTHUNIT", prefix=None)
     ifcopenshell.api.georeference.add_georeferencing(model)
     ifcopenshell.api.georeference.edit_georeferencing(
         model,
@@ -247,6 +249,7 @@ def build(path):
             "GeodeticDatum": "ETRS89",
             "MapProjection": "UTM zone 29N",
             "MapZone": "29N",
+            "MapUnit": map_unit,
         },
         coordinate_operation={
             "Eastings": EASTING,
