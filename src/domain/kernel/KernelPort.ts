@@ -210,4 +210,7 @@ export interface KernelPort {
 
   /** Frees everything held for the model. Calling it twice is harmless. */
   closeModel(modelId: ModelId): Promise<void>;
+
+  /** Notifies when an open model's Worker crashes or traps after or during evaluation. */
+  onModelCrash?(listener: (modelId: ModelId, error: KernelError) => void): () => void;
 }

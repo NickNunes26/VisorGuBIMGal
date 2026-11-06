@@ -79,7 +79,7 @@ Paralelismo: GitHub Pages no envía COOP/COEP y el `coi-serviceworker` se quitó
 | D1 | Pruebas de navegador en CI: TC-001..008 en WebGPU, WebGL2 y sin adaptador, con capturas comparadas | `package.json` no tiene script `test`; hoy son scripts sueltos | M | C+G | Sí |
 | D2 | Banco de rendimiento en CI con modelos públicos; falla si empeora | Ninguno | M | C | Sí |
 | D3 | Regresión visual de planos: SVG frente a referencias aprobadas | `check-drawing-request.mjs` solo comprueba el encuadre | M | G | Sí |
-| D4 | Reintentar un modelo cuyo Worker cayó. La caída ya queda aislada en su modelo; falta el botón | `kernel.worker.ts:38-49`, `WasmKernelAdapter.ts:47` | S | G | Corregido: el informe lo daba por ausente |
+| D4 | Reintentar un modelo cuyo Worker cayó. La caída ya queda aislada en su modelo; falta el botón | `kernel.worker.ts:38-49`, `WasmKernelAdapter.ts:47` | S | G | Corregido: el informe lo daba por ausente. **Hecho en T-132** (2026-11-06): `WasmKernelAdapter` detecta caídas fatales del Worker (`internal`, `out-of-memory`, `onerror`), cierra el Worker afectado y avisa por `onModelCrash`; `App.tsx` conserva el manejador `File`/`Blob` por `modelId` (sin retener el `ArrayBuffer` en memoria) y marca el modelo en estado `error` (también si falla al abrir o transmitir), y `ModelsPanel.tsx` muestra el botón «Reintentar» (`.model-retry-btn`) que reabre el modelo en su mismo puesto de la federación con un Worker nuevo |
 | D5 | Matriz de navegadores: Firefox ya, Safari cuando haya equipo | Solo Chrome probado | S | C | Sí |
 
 ## E. Aplicación de escritorio

@@ -12,6 +12,12 @@ import { MeasureBar } from './ui/components/MeasureBar';
 import { SavedViewsBar } from './ui/components/SavedViewsBar';
 import { parseModelUrlParam } from './ui/viewer/urlModel';
 import {
+  createFailedModelRecord,
+  markModelCrashed,
+  upsertModelRecord,
+  type ModelFileSource
+} from './ui/viewer/modelRetry';
+import {
   buildMedicionesCsv,
   extractSpatialElements,
   resolveElementQuantities,
@@ -109,20 +115,46 @@ export default function App() {
     return () => void stop();
   }, []);
 
+  // Keep lightweight File/Blob handles by modelId so a model whose Worker crashes can be retried
+  const modelSourcesRef = useRef<Map<ModelId, ModelFileSource>>(new Map());
+
+  // Subscribe to model Worker crashes and expose kernel for E2E crash recovery tests
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      (window as unknown as Record<string, unknown>).__gubim_kernel__ = kernel;
+    }
+    const stop = kernel.onModelCrash?.((modelId, error) => {
+      setModels((prev) => markModelCrashed(prev, modelId, error.message));
+      setStatusText(error.message);
+    });
+    return () => void stop?.();
+  }, []);
+
   // Tab state
   const [leftTab, setLeftTab] = useState<'models' | 'tree' | 'search'>('models');
   const [rightTab, setRightTab] = useState<'props' | 'dxf'>('props');
   const [isGisExpanded, setIsGisExpanded] = useState<boolean>(false);
 
-  // Load IFC file handler (local File or static fetch)
+  // Load IFC file handler (local File, static fetch, or retry of an existing modelId)
   const loadIfcFile = useCallback(
-    async (fileInput: File | { name: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> }) => {
-      const modelId: ModelId = `model-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    async (fileInput: ModelFileSource, existingModelId?: ModelId) => {
+      const modelId: ModelId =
+        existingModelId ?? `model-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      modelSourcesRef.current.set(modelId, fileInput);
       let opened = false;
       setIsWorking(true);
       setStatusText(`Cargando ${fileInput.name}...`);
 
       try {
+        if (existingModelId) {
+          renderer.removeModel(modelId);
+          try {
+            await kernel.closeModel(modelId);
+          } catch {
+            // ignore close error
+          }
+        }
+
         const buffer = await fileInput.arrayBuffer();
 
         // 1. Open model in kernel
@@ -179,10 +211,11 @@ export default function App() {
           meshCount,
           coordinateReference: summary.coordinateReference,
           bounds,
-          diagnostics: [...summary.diagnostics, ...streamDiagnostics]
+          diagnostics: [...summary.diagnostics, ...streamDiagnostics],
+          errorMessage: undefined
         };
 
-        setModels((prev) => [...prev, newModel]);
+        setModels((prev) => upsertModelRecord(prev, newModel));
         setStatusText(`${fileInput.name} cargado con ${meshCount} mallas.`);
       } catch (err) {
         if (opened) {
@@ -193,13 +226,28 @@ export default function App() {
             // ignore close error
           }
         }
+        const message = err instanceof Error ? err.message : 'Error';
         console.error('Error loading IFC:', err);
-        setStatusText(`Error al cargar ${fileInput.name}: ${err instanceof Error ? err.message : 'Error'}`);
+        setModels((prev) => {
+          const existing = prev.find((m) => m.id === modelId);
+          const failed = createFailedModelRecord(modelId, fileInput, message, existing);
+          return upsertModelRecord(prev, failed);
+        });
+        setStatusText(`Error al cargar ${fileInput.name}: ${message}`);
       } finally {
         setIsWorking(false);
       }
     },
     [activeBackend]
+  );
+
+  const handleRetryModel = useCallback(
+    (modelId: ModelId) => {
+      const source = modelSourcesRef.current.get(modelId);
+      if (!source) return;
+      void loadIfcFile(source, modelId);
+    },
+    [loadIfcFile]
   );
 
   // Sample model loader
@@ -287,6 +335,7 @@ export default function App() {
 
   // Remove model
   const handleRemoveModel = useCallback((id: ModelId) => {
+    modelSourcesRef.current.delete(id);
     renderer.removeModel(id);
     void kernel.closeModel(id);
     setModels((prev) => prev.filter((m) => m.id !== id));
@@ -467,6 +516,7 @@ export default function App() {
                 onRemoveModel={handleRemoveModel}
                 onLocateOnGis={handleLocateOnGis}
                 onSelectElement={(ref) => void handleSelectElement(ref)}
+                onRetryModel={handleRetryModel}
               />
             )}
             {leftTab === 'tree' && (

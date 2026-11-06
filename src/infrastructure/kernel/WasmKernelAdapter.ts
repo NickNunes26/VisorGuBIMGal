@@ -17,6 +17,7 @@ import {
 } from '../../domain/kernel/KernelPort';
 import { mapToLatLng } from '../../domain/coordinates/Coordinates';
 import type { CoordinateReference } from '../../domain/models/ModelRecord';
+import { isFatalWorkerErrorCode } from '../../ui/viewer/modelRetry';
 import { drawingRequest, frameExcludesAll, frameModels } from './drawingRequest';
 import type { SheetDiagnostic, StreamStep, WorkerRequest, WorkerResponse } from './protocol';
 
@@ -38,16 +39,27 @@ class ModelWorker {
   private pending = new Map<number, Pending>();
   private closed = false;
 
-  constructor() {
+  constructor(private readonly onFatalError?: (error: KernelError) => void) {
     this.worker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
       const pending = this.pending.get(data.id);
       if (!pending) return;
       this.pending.delete(data.id);
-      if (data.ok) pending.resolve(data.value);
-      else pending.reject(new KernelError(data.code, data.message, data.offset));
+      if (data.ok) {
+        pending.resolve(data.value);
+      } else {
+        const error = new KernelError(data.code, data.message, data.offset);
+        pending.reject(error);
+        if (!this.closed && isFatalWorkerErrorCode(data.code)) {
+          this.onFatalError?.(error);
+        }
+      }
     };
     this.worker.onerror = (event) => {
-      this.rejectAll(new KernelError('internal', event.message || 'El kernel se ha detenido.'));
+      const error = new KernelError('internal', event.message || 'El kernel se ha detenido.');
+      this.rejectAll(error);
+      if (!this.closed) {
+        this.onFatalError?.(error);
+      }
     };
   }
 
@@ -66,6 +78,14 @@ class ModelWorker {
       this.pending.set(id, { resolve: resolve as Pending['resolve'], reject });
       this.worker.postMessage({ id, request }, transfer);
     });
+  }
+
+  /** Simulates or propagates a fatal Worker crash, rejecting pending calls and notifying listeners. */
+  crash(error: KernelError): void {
+    this.rejectAll(error);
+    if (!this.closed) {
+      this.onFatalError?.(error);
+    }
   }
 
   /** Stops at once, even in the middle of evaluating an element. */
@@ -96,8 +116,38 @@ export class WasmKernelAdapter implements KernelPort {
   private workers = new Map<ModelId, ModelWorker>();
   private references = new Map<ModelId, CoordinateReference>();
   private sheets = new Map<DrawingId, ModelWorker>();
+  private crashListeners = new Set<(modelId: ModelId, error: KernelError) => void>();
   private nextDrawing = 0;
   private drawings: Promise<unknown> = Promise.resolve();
+
+  onModelCrash(listener: (modelId: ModelId, error: KernelError) => void): () => void {
+    this.crashListeners.add(listener);
+    return () => this.crashListeners.delete(listener);
+  }
+
+  private handleWorkerCrash(modelId: ModelId, worker: ModelWorker, error: KernelError): void {
+    if (this.workers.get(modelId) !== worker) return;
+    worker.terminate();
+    this.workers.delete(modelId);
+    this.references.delete(modelId);
+    for (const listener of this.crashListeners) {
+      try {
+        listener(modelId, error);
+      } catch (err) {
+        console.error('Error in model crash listener:', err);
+      }
+    }
+  }
+
+  /** Terminates a model's Worker as if it crashed, for E2E verification of Worker crash recovery. */
+  crashModelForTest(
+    modelId: ModelId,
+    message = 'El kernel se ha detenido: fallo inesperado en Worker.'
+  ): void {
+    const worker = this.workers.get(modelId);
+    if (!worker) return;
+    worker.crash(new KernelError('internal', message));
+  }
 
   private workerOf(modelId: ModelId): ModelWorker {
     const worker = this.workers.get(modelId);
@@ -113,7 +163,9 @@ export class WasmKernelAdapter implements KernelPort {
     if (this.workers.has(modelId)) {
       throw new KernelError('internal', `El modelo ${modelId} ya está abierto.`);
     }
-    const worker = new ModelWorker();
+    const worker: ModelWorker = new ModelWorker((error) => {
+      this.handleWorkerCrash(modelId, worker, error);
+    });
     this.workers.set(modelId, worker);
     onProgress?.('Analizando IFC', 0);
     try {
