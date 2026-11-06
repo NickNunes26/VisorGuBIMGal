@@ -8,6 +8,7 @@ import { GisMapPanel } from './ui/components/GisMapPanel';
 import { DisplayBar } from './ui/components/DisplayBar';
 import { SectionBar } from './ui/components/SectionBar';
 import { SearchPanel } from './ui/components/SearchPanel';
+import { IdsPanel } from './ui/components/IdsPanel';
 import { MeasureBar } from './ui/components/MeasureBar';
 import { SavedViewsBar } from './ui/components/SavedViewsBar';
 import { parseModelUrlParam } from './ui/viewer/urlModel';
@@ -50,7 +51,7 @@ import type { KernelDiagnostic, SpatialTree } from './domain/kernel/KernelPort';
 import { kernel, renderer } from './infrastructure/composition';
 import { leafletService } from './infrastructure/gis/LeafletService';
 
-import { Layers, FolderTree, Sliders, Scissors, Search } from 'lucide-react';
+import { Layers, FolderTree, Sliders, Scissors, Search, ShieldCheck } from 'lucide-react';
 
 export default function App() {
   const [models, setModels] = useState<ModelRecord[]>([]);
@@ -132,7 +133,7 @@ export default function App() {
 
   // Tab state
   const [leftTab, setLeftTab] = useState<'models' | 'tree' | 'search'>('models');
-  const [rightTab, setRightTab] = useState<'props' | 'dxf'>('props');
+  const [rightTab, setRightTab] = useState<'props' | 'dxf' | 'ids'>('props');
   const [isGisExpanded, setIsGisExpanded] = useState<boolean>(false);
 
   // Load IFC file handler (local File, static fetch, or retry of an existing modelId)
@@ -298,7 +299,7 @@ export default function App() {
 
   // Selection handler keyed by ElementRef
   const handleSelectElement = useCallback(
-    async (ref: ElementRef | null) => {
+    async (ref: ElementRef | null, keepRightTab = false) => {
       setSelectedRef(ref);
       renderer.setSelection(ref);
 
@@ -314,7 +315,9 @@ export default function App() {
       const details = await kernel.getElementDetails(resolvedRef);
 
       setSelectedElement(details ? { ...details, modelName: model.fileName } : null);
-      setRightTab('props');
+      if (!keepRightTab) {
+        setRightTab('props');
+      }
     },
     [models]
   );
@@ -614,14 +617,28 @@ export default function App() {
               <Scissors size={13} />
               <span>Planos y DXF</span>
             </button>
+            <button
+              className={`tab-btn tab-ids ${rightTab === 'ids' ? 'active' : ''}`}
+              onClick={() => setRightTab('ids')}
+            >
+              <ShieldCheck size={13} />
+              <span>IDS</span>
+            </button>
           </div>
 
           <div className="panel-body">
-            {rightTab === 'props' ? (
-              <PropertiesPanel element={selectedElement} />
-            ) : (
-              <SectionDxfPanel models={models} kernel={kernel} />
-            )}
+            {rightTab === 'props' && <PropertiesPanel element={selectedElement} />}
+            {rightTab === 'dxf' && <SectionDxfPanel models={models} kernel={kernel} />}
+            <div style={{ display: rightTab === 'ids' ? 'block' : 'none' }}>
+              <IdsPanel
+                models={models}
+                spatialTrees={spatialTrees}
+                kernel={kernel}
+                selectedRef={selectedRef}
+                onSelectElement={(ref) => void handleSelectElement(ref, true)}
+                onIsolate={handleIsolate}
+              />
+            </div>
           </div>
         </aside>
       </div>
