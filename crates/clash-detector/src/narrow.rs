@@ -271,11 +271,23 @@ fn detect_hard_clash(a: &ClashMesh, b: &ClashMesh) -> Option<ClashOutcome> {
         if vol > MIN_CLASH_VOLUME {
             let ib = Aabb3::from_points(inter.positions.iter().copied())
                 .unwrap_or_else(|| a.bounds.union(&b.bounds));
-            let penetration = ib.extent().min_element().max(EPS);
+            let has_surface_crossings = proper_count > 0 || one_sided_count > 0;
+            let (point, penetration) = if has_surface_crossings {
+                if let Some((deep_pt, deep_depth)) =
+                    max_penetration_point_from_csg(a, b, &inter)
+                {
+                    (deep_pt, deep_depth.max(EPS))
+                } else {
+                    (ib.center(), ib.extent().min_element().max(EPS))
+                }
+            } else {
+                // Full containment (no surface crossings): center of the inner solid.
+                (ib.center(), ib.extent().min_element().max(EPS))
+            };
             return Some(ClashOutcome::Hard {
                 penetration_m: penetration,
                 volume_m3: Some(vol),
-                point: ib.center(),
+                point,
             });
         }
         // Two closed solids whose CSG intersection has zero volume only graze/touch.
@@ -296,17 +308,21 @@ fn detect_hard_clash(a: &ClashMesh, b: &ClashMesh) -> Option<ClashOutcome> {
     }
 
     let (point, penetration_m) = if cross_pts > 0 {
-        let overlap_min = a.bounds.min.max(b.bounds.min);
-        let overlap_max = a.bounds.max.min(b.bounds.max);
-        let aabb_depth = (overlap_max - overlap_min).min_element().max(0.0);
-        let cross_ext = (cross_max - cross_min).max(DVec3::ZERO);
-        // Use the smaller of crossing extent (if 3D) or AABB overlap minimum axis.
-        let est = if cross_ext.min_element() > EPS {
-            cross_ext.min_element().min(aabb_depth)
+        if let Some((deep_pt, deep_depth)) = max_penetration_point_fallback(a, b) {
+            (deep_pt, deep_depth.max(EPS))
         } else {
-            aabb_depth
-        };
-        (cross_sum / cross_pts as f64, est.max(EPS))
+            let overlap_min = a.bounds.min.max(b.bounds.min);
+            let overlap_max = a.bounds.max.min(b.bounds.max);
+            let aabb_depth = (overlap_max - overlap_min).min_element().max(0.0);
+            let cross_ext = (cross_max - cross_min).max(DVec3::ZERO);
+            // Use the smaller of crossing extent (if 3D) or AABB overlap minimum axis.
+            let est = if cross_ext.min_element() > EPS {
+                cross_ext.min_element().min(aabb_depth)
+            } else {
+                aabb_depth
+            };
+            (cross_sum / cross_pts as f64, est.max(EPS))
+        }
     } else {
         let p = contained_point.unwrap_or_else(|| {
             let overlap_min = a.bounds.min.max(b.bounds.min);
@@ -324,6 +340,181 @@ fn detect_hard_clash(a: &ClashMesh, b: &ClashMesh) -> Option<ClashOutcome> {
         volume_m3: None,
         point,
     })
+}
+
+/// Exact closest point and Euclidean distance from `p` to any triangle surface of `mesh`.
+fn closest_point_on_mesh(mesh: &ClashMesh, p: DVec3) -> Option<(f64, DVec3)> {
+    let mut best_pt = DVec3::ZERO;
+    let mut found = false;
+    let best_sq = mesh
+        .bvh
+        .visit_closest_to_point(p, f64::INFINITY, |tri_idx, best| {
+            let Some(corners) = mesh.tri_corners(tri_idx) else {
+                return;
+            };
+            if mesh.tri_boxes[tri_idx as usize].point_dist_sq(p) >= *best {
+                return;
+            }
+            let c = closest_point_on_triangle(p, corners);
+            let d2 = p.distance_squared(c);
+            if d2 < *best {
+                *best = d2;
+                best_pt = c;
+                found = true;
+            }
+        });
+    found.then(|| (best_sq.sqrt(), best_pt))
+}
+
+/// Finds the maximum-penetration representative point from a CSG intersection mesh `inter`.
+///
+/// Each vertex (and triangle centroid) of `inter` lies on the surface of `a`, on the surface of
+/// `b`, or along their intersection seam. Its distance to the opposing mesh surface measures the
+/// exact local penetration depth at that point. Averaging the penetration-chord midpoints of all
+/// candidates tied within `SURFACE_EPS` of `max_depth` yields the exact center for symmetric
+/// overlaps while pinpointing the deepest section for asymmetric, curved, or wedged clashes (F2).
+fn max_penetration_point_from_csg(
+    a: &ClashMesh,
+    b: &ClashMesh,
+    inter: &Mesh,
+) -> Option<(DVec3, f64)> {
+    const MAX_SAMPLES: usize = 256;
+    const TIE_EPS: f64 = 1e-5;
+
+    // Each sample is (sample_point, optional_triangle_corners) so flat faces tied at max_depth
+    // contribute their full face span rather than a triangulation-biased centroid average.
+    let mut samples: Vec<(DVec3, Option<[DVec3; 3]>)> = Vec::new();
+    let v_step = (inter.positions.len() / MAX_SAMPLES).max(1);
+    for (i, &p) in inter.positions.iter().enumerate() {
+        if i % v_step == 0 && p.is_finite() {
+            samples.push((p, None));
+        }
+    }
+    let t_step = (inter.triangles.len() / MAX_SAMPLES).max(1);
+    for (i, tri) in inter.triangles.iter().enumerate() {
+        if i % t_step == 0
+            && let Some(c) = triangle_corners(inter, *tri)
+        {
+            samples.push(((c[0] + c[1] + c[2]) / 3.0, Some(c)));
+        }
+    }
+
+    let mut max_depth = 0.0f64;
+    let mut chords: Vec<(f64, DVec3, DVec3, Option<[DVec3; 3]>)> = Vec::with_capacity(samples.len());
+    for (p, tri_opt) in samples {
+        let (da, ca) = closest_point_on_mesh(a, p).unwrap_or((0.0, p));
+        let (db, cb) = closest_point_on_mesh(b, p).unwrap_or((0.0, p));
+        let (depth, shift, midpoint) = if da >= db {
+            (da, (ca - p) * 0.5, (p + ca) * 0.5)
+        } else {
+            (db, (cb - p) * 0.5, (p + cb) * 0.5)
+        };
+        if depth > EPS {
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            chords.push((depth, midpoint, shift, tri_opt));
+        }
+    }
+
+    if max_depth <= EPS {
+        return None;
+    }
+
+    let threshold = (max_depth - TIE_EPS).max(0.0);
+    let mut tied_box = Aabb3::EMPTY;
+    let mut any = false;
+    for (d, mid, shift, tri_opt) in chords {
+        if d >= threshold {
+            if let Some(corners) = tri_opt {
+                for v in corners {
+                    let pt = v + shift;
+                    tied_box = tied_box.union(&Aabb3::from_min_max(pt, pt));
+                }
+            } else {
+                tied_box = tied_box.union(&Aabb3::from_min_max(mid, mid));
+            }
+            any = true;
+        }
+    }
+    any.then(|| (tied_box.center(), max_depth))
+}
+
+/// Non-CSG fallback (open or dense meshes > `MAX_CSG_TRIANGLES`): inspects vertices and triangle
+/// centroids of `a` inside `b` and `b` inside `a` within the AABB overlap to locate the deepest
+/// penetration chord rather than an arbitrary average of early BVH crossings (F2).
+fn max_penetration_point_fallback(a: &ClashMesh, b: &ClashMesh) -> Option<(DVec3, f64)> {
+    const MAX_PER_SIDE: usize = 128;
+    const TIE_EPS: f64 = 1e-5;
+
+    let overlap = Aabb3::from_min_max(a.bounds.min.max(b.bounds.min), a.bounds.max.min(b.bounds.max));
+    if !overlap.is_valid() {
+        return None;
+    }
+
+    let mut max_depth = 0.0f64;
+    let mut chords: Vec<(f64, DVec3)> = Vec::new();
+
+    let mut scan_side = |src: &ClashMesh, target: &ClashMesh| {
+        let mut candidates: Vec<DVec3> = Vec::new();
+        for &p in &src.mesh.positions {
+            if p.is_finite() && overlap.overlaps(&Aabb3::from_min_max(p, p), 0.0) {
+                candidates.push(p);
+            }
+        }
+        for (idx, tb) in src.tri_boxes.iter().enumerate() {
+            if tb.overlaps(&overlap, 0.0)
+                && let Some(c) = src.tri_corners(idx as u32)
+            {
+                let centroid = (c[0] + c[1] + c[2]) / 3.0;
+                if overlap.overlaps(&Aabb3::from_min_max(centroid, centroid), 0.0) {
+                    candidates.push(centroid);
+                }
+                for edge_mid in [
+                    (c[0] + c[1]) * 0.5,
+                    (c[1] + c[2]) * 0.5,
+                    (c[2] + c[0]) * 0.5,
+                ] {
+                    if overlap.overlaps(&Aabb3::from_min_max(edge_mid, edge_mid), 0.0) {
+                        candidates.push(edge_mid);
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let step = (candidates.len() / MAX_PER_SIDE).max(1);
+        for (i, &v) in candidates.iter().enumerate() {
+            if i % step != 0 {
+                continue;
+            }
+            if point_strictly_inside(target, v)
+                && let Some((depth, closest)) = closest_point_on_mesh(target, v)
+                && depth > EPS
+            {
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+                chords.push((depth, (v + closest) * 0.5));
+            }
+        }
+    };
+
+    scan_side(a, b);
+    scan_side(b, a);
+
+    if max_depth <= EPS {
+        return None;
+    }
+
+    let threshold = (max_depth - TIE_EPS).max(0.0);
+    let tied_box = Aabb3::from_points(
+        chords
+            .into_iter()
+            .filter_map(|(d, mid)| (d >= threshold).then_some(mid)),
+    );
+    tied_box.map(|b| (b.center(), max_depth))
 }
 
 /// Classifies the plane-intersection overlap between two non-coplanar triangles in relative `f64`.

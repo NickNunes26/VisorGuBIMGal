@@ -92,7 +92,7 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 
 /// `[id, part, layer length, layer, hatch rows, (angle, spacing, offset) f64 per row, vertex
 /// count, triangle count, positions, triangles]`, little-endian.
-fn write_element(
+pub(crate) fn write_element(
     out: &mut Vec<u8>,
     express_id: u32,
     part: u32,
@@ -256,6 +256,19 @@ fn reaches_sheet(mesh: &Mesh, frame: &Frame, options: &DrawingOptions) -> bool {
         return false;
     }
     options.include_projection || near <= 0.0
+}
+
+/// Decodes all element meshes packed by `write_element` inside one chunk.
+pub(crate) fn decode_element_chunk(model_index: u32, chunk: &[u8]) -> Option<Vec<DrawingMesh>> {
+    let mut reader = Reader { bytes: chunk };
+    let mut out = Vec::new();
+    while !reader.bytes.is_empty() {
+        match reader.record(model_index)? {
+            ChunkRecord::Element(item) => out.push(item.mesh),
+            ChunkRecord::Space(_) => {}
+        }
+    }
+    Some(out)
 }
 
 /// One model's way through a drawing, on an evaluator of its own.

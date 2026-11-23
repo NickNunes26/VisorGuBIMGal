@@ -8,7 +8,7 @@ import type {
 } from '../../domain/kernel/KernelPort';
 import type { StreamStep, WorkerRequest, WorkerResponse } from './protocol';
 import { batchTransfer, readBatchView } from './batchView';
-import init, { allocationFailed, ClashSession, Model, Sheet } from './pkg/wasm_api';
+import init, { allocationFailed, ClashBatchSlicer, ClashSession, Model, Sheet } from './pkg/wasm_api';
 import {
   CACHE_FORMAT,
   CacheCorrupt,
@@ -69,6 +69,7 @@ const ready = (async () => {
 let open: { modelId: ModelId; model: Model | null; bytes: Uint8Array | null } | null = null;
 let sheet: Sheet | null = null;
 let clashSession: ClashSession | null = null;
+let clashBatch: ClashBatchSlicer | null = null;
 let sequence = 0;
 /** The cache being replayed, until its stream ends. */
 let replay: { reader: CacheReader; handle: SyncAccessHandle; folder: FileSystemDirectoryHandle; name: string } | null =
@@ -347,6 +348,11 @@ function currentClash(): ClashSession {
   return clashSession;
 }
 
+function currentClashBatch(): ClashBatchSlicer {
+  if (!clashBatch) throw new RequestError('internal', 'El generador de planos de choques no existe.');
+  return clashBatch;
+}
+
 function rawElementMesh(expressId: number): { value: { positions: Float64Array; indices: Uint32Array } | null; transfer: Transferable[] } {
   const view = current().model.rawElementMesh(expressId);
   if (!view) return { value: null, transfer: [] };
@@ -484,6 +490,99 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
       );
       if (!hit) return { value: { status: 'none' as const }, transfer: [] };
       return { value: { status: 'hit' as const, data: hit }, transfer: [hit.buffer as ArrayBuffer] };
+    }
+    case 'clash-cull-slab': {
+      const ids = current().model.cullElementsBySlab(
+        request.tx,
+        request.ty,
+        request.sMin,
+        request.sMax,
+        request.eps
+      );
+      return { value: ids, transfer: [ids.buffer as ArrayBuffer] };
+    }
+    case 'clash-slab-chunk': {
+      const xf = request.transform ? new Float64Array(request.transform) : undefined;
+      const chunk = current().model.slabChunkForElements(request.expressIds, xf);
+      return { value: chunk.buffer, transfer: [chunk.buffer as ArrayBuffer] };
+    }
+    case 'clash-batch-new':
+      clashBatch?.free();
+      clashBatch = new ClashBatchSlicer();
+      return { value: undefined, transfer: [] };
+    case 'clash-batch-add': {
+      const ok = currentClashBatch().addSectionChunk(request.modelIndex, new Uint8Array(request.chunk));
+      return { value: ok, transfer: [] };
+    }
+    case 'clash-batch-finish': {
+      const out = currentClashBatch().finishSection(
+        request.origin[0],
+        request.origin[1],
+        request.origin[2],
+        request.normal[0],
+        request.normal[1],
+        request.normal[2],
+        request.depthM,
+        request.clashAModelIndices,
+        request.clashAIds,
+        request.clashAGuids,
+        request.clashBModelIndices,
+        request.clashBIds,
+        request.clashPointsFlat,
+        request.alignmentPoint[0],
+        request.alignmentPoint[1],
+        request.alignmentPoint[2],
+        request.modelId,
+        request.pkM,
+        request.pkLabel,
+        request.sMin,
+        request.sMax,
+        request.annotations
+      );
+      try {
+        const dxfBytes = out.dxfBytes();
+        const svg = out.svg();
+        const widthM = out.widthM();
+        const heightM = out.heightM();
+        return {
+          value: { dxfBytes, svg, widthM, heightM },
+          transfer: [dxfBytes.buffer as ArrayBuffer]
+        };
+      } finally {
+        out.free();
+      }
+    }
+    case 'clash-batch-merge': {
+      const dxfBytes = currentClashBatch().mergeMasterDxf(request.columns, request.marginM);
+      return { value: dxfBytes, transfer: [dxfBytes.buffer as ArrayBuffer] };
+    }
+    case 'clash-roundtrip-apply': {
+      const out = current().model.applyClashDxf(request.dxfBytes);
+      try {
+        const patchedIfcBytes = out.patchedIfcBytes();
+        const diffJson = out.diffJson();
+        return {
+          value: { patchedIfcBytes, diffJson },
+          transfer: [patchedIfcBytes.buffer as ArrayBuffer]
+        };
+      } finally {
+        out.free();
+      }
+    }
+    case 'clash-element-slab': {
+      const span = current().model.elementSlabSpan(
+        request.expressId,
+        request.tx,
+        request.ty,
+        request.px,
+        request.py,
+        request.pz,
+        request.longMinExtentM,
+        request.longAspectRatio,
+        request.maxTransverseSlabM
+      );
+      if (!span) return { value: null, transfer: [] };
+      return { value: span, transfer: [span.buffer as ArrayBuffer] };
     }
   }
 }

@@ -1,5 +1,18 @@
 import type { ElementRef, ModelId } from '../../domain/models/ModelRecord';
-import type { ClashReport, ClashRequest, ClashResultItem } from '../../domain/clash/ClashTypes';
+import type {
+  ClashAlignmentDxfBatch,
+  ClashAlignmentDxfRequest,
+  ClashAlignmentDxfSectionOutput,
+  ClashDxfRoundTripResult,
+  ClashReport,
+  ClashRequest,
+  ClashResultItem
+} from '../../domain/clash/ClashTypes';
+import {
+  buildRoundTripAuditCsv,
+  extractMetaModelIdFromDxf,
+  type DxfRoundTripDiffResult
+} from '../../ui/viewer/clashRoundTrip';
 import type { ElementSnapshot } from '../../domain/compare/modelDiff';
 import type { DrawingExportConfig, DrawingOptions } from '../../domain/drawings/DrawingTypes';
 import {
@@ -20,7 +33,13 @@ import {
 import { mapToLatLng } from '../../domain/coordinates/Coordinates';
 import type { CoordinateReference } from '../../domain/models/ModelRecord';
 import { isFatalWorkerErrorCode } from '../../ui/viewer/modelRetry';
-import { drawingRequest, frameExcludesAll, frameModels } from './drawingRequest';
+import {
+  drawingRequest,
+  frameExcludesAll,
+  frameModels,
+  relativeModelTransform,
+  transformSlabQueryToSource
+} from './drawingRequest';
 import type { SheetDiagnostic, StreamStep, WorkerRequest, WorkerResponse } from './protocol';
 
 interface Pending {
@@ -40,8 +59,10 @@ class ModelWorker {
   private nextRequest = 0;
   private pending = new Map<number, Pending>();
   private closed = false;
+  private readonly onFatalError?: (error: KernelError) => void;
 
-  constructor(private readonly onFatalError?: (error: KernelError) => void) {
+  constructor(onFatalError?: (error: KernelError) => void) {
+    this.onFatalError = onFatalError;
     this.worker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
       const pending = this.pending.get(data.id);
       if (!pending) return;
@@ -767,6 +788,262 @@ export class WasmKernelAdapter implements KernelPort {
       };
     } finally {
       clashWorker.terminate();
+    }
+  }
+
+  async exportClashAlignmentDxf(
+    request: ClashAlignmentDxfRequest,
+    onProgress?: ProgressHandler,
+    signal?: AbortSignal
+  ): Promise<ClashAlignmentDxfBatch> {
+    const activeModelIds = request.modelIds.filter((id) => this.workers.has(id));
+    if (activeModelIds.length === 0 || request.sections.length === 0) {
+      return { sections: [] };
+    }
+
+    const slicerWorker = new ModelWorker();
+    const onAbort = () => slicerWorker.terminate();
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      if (signal?.aborted) {
+        throw new DOMException('Exportación cancelada.', 'AbortError');
+      }
+
+      await slicerWorker.call({ op: 'clash-batch-new' });
+      const outputs: ClashAlignmentDxfSectionOutput[] = [];
+      const total = request.sections.length;
+      const cullEps = 0.05;
+      const modelIndexById = new Map<ModelId, number>();
+      activeModelIds.forEach((id, idx) => modelIndexById.set(id, idx));
+
+      for (let i = 0; i < total; i++) {
+        if (signal?.aborted) {
+          throw new DOMException('Exportación cancelada.', 'AbortError');
+        }
+        const sec = request.sections[i];
+        const targetRef = this.references.get(sec.modelId);
+        onProgress?.(`Cortando sección ${i + 1}/${total} (PK ${sec.pkLabel})`, Math.round((i / total) * 90));
+
+        for (let mIdx = 0; mIdx < activeModelIds.length; mIdx++) {
+          const modelId = activeModelIds[mIdx];
+          const modelWorker = this.workers.get(modelId);
+          if (!modelWorker) continue;
+
+          const relTransform =
+            modelId === sec.modelId
+              ? undefined
+              : relativeModelTransform(this.references.get(modelId), targetRef);
+          const cullQuery = relTransform
+            ? transformSlabQueryToSource(
+                sec.normal[0],
+                sec.normal[1],
+                sec.sMin,
+                sec.sMax,
+                cullEps,
+                relTransform
+              )
+            : {
+                tx: sec.normal[0],
+                ty: sec.normal[1],
+                sMin: sec.sMin,
+                sMax: sec.sMax,
+                eps: cullEps
+              };
+
+          let culledIds: Uint32Array;
+          try {
+            culledIds = await modelWorker.call<Uint32Array>({
+              op: 'clash-cull-slab',
+              tx: cullQuery.tx,
+              ty: cullQuery.ty,
+              sMin: cullQuery.sMin,
+              sMax: cullQuery.sMax,
+              eps: cullQuery.eps
+            });
+          } catch (err) {
+            if (isClosed(err)) continue;
+            throw err;
+          }
+          if (culledIds.length === 0) continue;
+
+          let chunk: ArrayBuffer;
+          try {
+            chunk = await modelWorker.call<ArrayBuffer>(
+              { op: 'clash-slab-chunk', expressIds: culledIds, transform: relTransform },
+              [culledIds.buffer as ArrayBuffer]
+            );
+          } catch (err) {
+            if (isClosed(err)) continue;
+            throw err;
+          }
+          if (chunk.byteLength === 0) continue;
+
+          await slicerWorker.call(
+            { op: 'clash-batch-add', modelIndex: mIdx, chunk },
+            [chunk]
+          );
+        }
+
+        const defaultModelIdx = modelIndexById.get(sec.modelId) ?? 0;
+        const clashAModelIndices = new Uint32Array(
+          sec.clashAIds.map((_, idx) => {
+            const mid = sec.clashAModelIds?.[idx] ?? sec.modelId;
+            return modelIndexById.get(mid) ?? defaultModelIdx;
+          })
+        );
+        const clashAIds = new Uint32Array(sec.clashAIds);
+        const clashBModelIndices = new Uint32Array(
+          sec.clashBIds.map((_, idx) => {
+            const mid = sec.clashBModelIds?.[idx] ?? sec.modelId;
+            return modelIndexById.get(mid) ?? defaultModelIdx;
+          })
+        );
+        const clashBIds = new Uint32Array(sec.clashBIds);
+        const clashPointsFlat = new Float64Array(sec.clashPoints.length * 3);
+        for (let p = 0; p < sec.clashPoints.length; p++) {
+          clashPointsFlat[p * 3] = sec.clashPoints[p][0];
+          clashPointsFlat[p * 3 + 1] = sec.clashPoints[p][1];
+          clashPointsFlat[p * 3 + 2] = sec.clashPoints[p][2];
+        }
+
+        const res = await slicerWorker.call<{
+          dxfBytes: Uint8Array;
+          svg: string;
+          widthM: number;
+          heightM: number;
+        }>(
+          {
+            op: 'clash-batch-finish',
+            origin: sec.origin,
+            normal: sec.normal,
+            depthM: sec.depthM,
+            clashAModelIndices,
+            clashAIds,
+            clashAGuids: [...sec.clashAGuids],
+            clashBModelIndices,
+            clashBIds,
+            clashPointsFlat,
+            alignmentPoint: sec.alignmentPoint,
+            modelId: sec.modelId,
+            pkM: sec.pkM,
+            pkLabel: sec.pkLabel,
+            sMin: sec.sMin,
+            sMax: sec.sMax,
+            annotations: [...sec.annotations]
+          },
+          [
+            clashAModelIndices.buffer as ArrayBuffer,
+            clashAIds.buffer as ArrayBuffer,
+            clashBModelIndices.buffer as ArrayBuffer,
+            clashBIds.buffer as ArrayBuffer,
+            clashPointsFlat.buffer as ArrayBuffer
+          ]
+        );
+
+        outputs.push({
+          fileName: sec.fileName,
+          pkM: sec.pkM,
+          pkLabel: sec.pkLabel,
+          dxfBytes: res.dxfBytes,
+          svg: res.svg,
+          widthM: res.widthM,
+          heightM: res.heightM
+        });
+      }
+
+      let masterDxfBytes: Uint8Array | undefined;
+      if (request.includeMasterGrid !== false && outputs.length > 0) {
+        if (signal?.aborted) {
+          throw new DOMException('Exportación cancelada.', 'AbortError');
+        }
+        onProgress?.('Generando DXF maestro combinado', 94);
+        masterDxfBytes = await slicerWorker.call<Uint8Array>({
+          op: 'clash-batch-merge',
+          columns: request.gridColumns ?? 0,
+          marginM: request.gridMarginM ?? 1.0
+        });
+      }
+
+      onProgress?.('Planos DXF listos', 100);
+      return { sections: outputs, masterDxfBytes };
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      slicerWorker.terminate();
+    }
+  }
+
+  async applyClashDxfRoundTrip(
+    modelId: ModelId,
+    dxfBytes: Uint8Array
+  ): Promise<ClashDxfRoundTripResult> {
+    const metaModelId = extractMetaModelIdFromDxf(dxfBytes);
+    const targetModelId =
+      metaModelId && this.workers.has(metaModelId) ? metaModelId : modelId;
+    const worker = this.workerOf(targetModelId);
+    const payload = new Uint8Array(dxfBytes);
+    const res = await worker.call<{
+      patchedIfcBytes: Uint8Array;
+      diffJson: string;
+    }>({ op: 'clash-roundtrip-apply', dxfBytes: payload }, [payload.buffer as ArrayBuffer]);
+
+    const parsed = JSON.parse(res.diffJson) as DxfRoundTripDiffResult;
+    const resolvedDiff: DxfRoundTripDiffResult = {
+      ...parsed,
+      modelId: targetModelId
+    };
+    const auditCsv = buildRoundTripAuditCsv(resolvedDiff);
+    return {
+      modelId: targetModelId,
+      pkM: parsed.pkM,
+      applied: parsed.applied ?? parsed.edits.length,
+      skipped: parsed.skipped ?? 0,
+      edits: parsed.edits,
+      patchedIfcBytes: res.patchedIfcBytes,
+      auditCsv
+    };
+  }
+
+  async elementSlabSpan(
+    modelId: ModelId,
+    expressId: number,
+    tangentXY: readonly [number, number],
+    clashPoint: readonly [number, number, number],
+    config?: {
+      longitudinalMinExtentM?: number;
+      longitudinalAspectRatio?: number;
+      maxTransverseSlabM?: number;
+    }
+  ) {
+    const worker = this.workers.get(modelId);
+    if (!worker) return null;
+    try {
+      const arr = await worker.call<Float64Array | null>({
+        op: 'clash-element-slab',
+        expressId,
+        tx: tangentXY[0],
+        ty: tangentXY[1],
+        px: clashPoint[0],
+        py: clashPoint[1],
+        pz: clashPoint[2],
+        longMinExtentM: config?.longitudinalMinExtentM ?? 0.15,
+        longAspectRatio: config?.longitudinalAspectRatio ?? 2.5,
+        maxTransverseSlabM: config?.maxTransverseSlabM ?? 0.25
+      });
+      if (!arr || arr.length < 7) return null;
+      return {
+        orientation: (arr[0] === 1 ? 'longitudinal' : 'transverse') as 'transverse' | 'longitudinal',
+        sMin: arr[1],
+        sMax: arr[2],
+        sClash: arr[3],
+        depthM: Math.max(0, arr[2] - arr[1]),
+        deltaSA: arr[4],
+        widthPerpM: arr[5],
+        heightPerpM: arr[6]
+      };
+    } catch (err) {
+      if (isClosed(err)) return null;
+      throw err;
     }
   }
 }

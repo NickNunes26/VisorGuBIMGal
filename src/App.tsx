@@ -476,7 +476,10 @@ export default function App() {
 
   // Load IFC file handler (local File, static fetch, or retry of an existing modelId)
   const loadIfcFile = useCallback(
-    async (fileInput: ModelFileSource, existingModelId?: ModelId) => {
+    async (
+      fileInput: ModelFileSource,
+      existingModelId?: ModelId
+    ): Promise<{ model: ModelRecord; tree: SpatialTree | null } | null> => {
       const modelId: ModelId =
         existingModelId ?? `model-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       modelSourcesRef.current.set(modelId, fileInput);
@@ -532,7 +535,7 @@ export default function App() {
 
         if (!completed) {
           renderer.removeModel(modelId);
-          return;
+          return null;
         }
 
         elementBatchMetaByModelRef.current.set(modelId, batchMetaMap);
@@ -563,6 +566,7 @@ export default function App() {
 
         setModels((prev) => upsertModelRecord(prev, newModel));
         setStatusText(t('app.statusModelLoaded', { fileName: fileInput.name, count: meshCount }));
+        return { model: newModel, tree };
       } catch (err) {
         if (opened) {
           renderer.removeModel(modelId);
@@ -580,6 +584,7 @@ export default function App() {
           return upsertModelRecord(prev, failed);
         });
         setStatusText(t('app.statusLoadError', { fileName: fileInput.name, message }));
+        return null;
       } finally {
         setIsWorking(false);
       }
@@ -1231,6 +1236,18 @@ export default function App() {
     handleClearCompareColors();
   }, [handleClearCompareColors]);
 
+  const handleReloadPatchedModel = useCallback(
+    async (modelId: ModelId, patchedBytes: Uint8Array) => {
+      const existing = models.find((m) => m.id === modelId);
+      const baseName = existing?.fileName ?? `${modelId}.ifc`;
+      const file = new File([patchedBytes as Uint8Array<ArrayBuffer>], baseName, {
+        type: 'application/octet-stream'
+      });
+      return await loadIfcFile(file, modelId);
+    },
+    [models, loadIfcFile]
+  );
+
   const handleSaveClashAsBcf = useCallback(
     async (entry: ClashDisplayEntry) => {
       handleInspectClashPair(entry);
@@ -1404,9 +1421,11 @@ export default function App() {
                 models={models}
                 spatialTrees={spatialTrees}
                 kernel={kernel}
+                filePort={filePort}
                 onInspectPair={handleInspectClashPair}
                 onClearClashView={handleClearClashView}
                 onSaveAsBcf={handleSaveClashAsBcf}
+                onReloadPatchedModel={handleReloadPatchedModel}
               />
             </div>
           </div>

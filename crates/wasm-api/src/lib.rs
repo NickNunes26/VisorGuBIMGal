@@ -2,6 +2,7 @@
 
 pub mod batches;
 pub mod clash;
+pub mod clash_dxf;
 pub mod drawing;
 mod encode;
 mod json;
@@ -169,6 +170,63 @@ impl Model {
             .map(|mesh| RawMeshView { mesh })
     }
 
+    /// Computes Element A's slab span `[orientation, s_min, s_max, s_clash, delta_s_a, width_perp_m,
+    /// height_perp_m]` inside the Worker via `clash_detector::compute_element_a_slab` (F2/F4).
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = elementSlabSpan)]
+    pub fn element_slab_span(
+        &mut self,
+        express_id: u32,
+        tx: f64,
+        ty: f64,
+        px: f64,
+        py: f64,
+        pz: f64,
+        long_min_extent_m: f64,
+        long_aspect_ratio: f64,
+        max_transverse_slab_m: f64,
+    ) -> Option<Vec<f64>> {
+        self.inner
+            .element_slab_span(
+                express_id,
+                tx,
+                ty,
+                px,
+                py,
+                pz,
+                long_min_extent_m,
+                long_aspect_ratio,
+                max_transverse_slab_m,
+            )
+            .map(|arr| arr.to_vec())
+    }
+
+    /// 3D slab-vs-AABB culling along horizontal tangent `(tx, ty, 0)` (F3).
+    #[wasm_bindgen(js_name = cullElementsBySlab)]
+    pub fn cull_elements_by_slab(
+        &mut self,
+        tx: f64,
+        ty: f64,
+        s_min: f64,
+        s_max: f64,
+        eps: f64,
+    ) -> Vec<u32> {
+        self.inner.cull_elements_by_slab(tx, ty, s_min, s_max, eps)
+    }
+
+    /// Evaluates only the given culled `express_ids` into a drawing chunk for slab slicing (F3).
+    #[wasm_bindgen(js_name = slabChunkForElements)]
+    pub fn slab_chunk_for_elements(
+        &mut self,
+        express_ids: Vec<u32>,
+        transform: Option<Vec<f64>>,
+    ) -> Vec<u8> {
+        let xf = transform
+            .and_then(|v| <[f64; 16]>::try_from(v.as_slice()).ok())
+            .map(|arr| glam::DMat4::from_cols_array(&arr));
+        self.inner.slab_chunk_for_elements(&express_ids, xf)
+    }
+
     #[wasm_bindgen(js_name = startStream)]
     pub fn start_stream(&mut self) {
         self.inner.start_stream();
@@ -214,10 +272,296 @@ impl Model {
     pub fn finish_drawing(&mut self) -> String {
         self.inner.finish_drawing()
     }
+
+    /// Parses an edited clash DXF and surgically patches this open model's STEP bytes (F5).
+    #[wasm_bindgen(js_name = applyClashDxf)]
+    pub fn apply_clash_dxf(&self, dxf_bytes: Vec<u8>) -> Result<ClashRoundTripOutput, JsError> {
+        let (patched_ifc, diff_json) = self
+            .inner
+            .apply_clash_dxf(&dxf_bytes)
+            .map_err(|msg| JsError::new(&format!("parse||{msg}")))?;
+        Ok(ClashRoundTripOutput {
+            patched_ifc,
+            diff_json,
+        })
+    }
+}
+
+#[wasm_bindgen]
+pub struct ClashRoundTripOutput {
+    patched_ifc: Vec<u8>,
+    diff_json: String,
+}
+
+#[wasm_bindgen]
+impl ClashRoundTripOutput {
+    #[wasm_bindgen(js_name = patchedIfcBytes)]
+    pub fn patched_ifc_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.patched_ifc)
+    }
+
+    #[wasm_bindgen(js_name = diffJson)]
+    pub fn diff_json(&self) -> String {
+        self.diff_json.clone()
+    }
 }
 
 fn bad_request() -> JsError {
     JsError::new("internal||malformed drawing request")
+}
+
+/// Sequential clash cross-section batch slicer and master DXF grid combiner (F3/F4).
+#[wasm_bindgen]
+pub struct ClashBatchSlicer {
+    inner: clash_dxf::ClashBatchStore,
+}
+
+#[wasm_bindgen]
+pub struct ClashSectionOutput {
+    dxf: Vec<u8>,
+    svg: String,
+    width_m: f64,
+    height_m: f64,
+}
+
+#[wasm_bindgen]
+impl ClashSectionOutput {
+    #[wasm_bindgen(js_name = dxfBytes)]
+    pub fn dxf_bytes(&self) -> Vec<u8> {
+        self.dxf.clone()
+    }
+
+    pub fn svg(&self) -> String {
+        self.svg.clone()
+    }
+
+    #[wasm_bindgen(js_name = widthM)]
+    pub fn width_m(&self) -> f64 {
+        self.width_m
+    }
+
+    #[wasm_bindgen(js_name = heightM)]
+    pub fn height_m(&self) -> f64 {
+        self.height_m
+    }
+}
+
+#[wasm_bindgen]
+impl ClashBatchSlicer {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> ClashBatchSlicer {
+        ClashBatchSlicer {
+            inner: clash_dxf::ClashBatchStore::new(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = addSectionChunk)]
+    pub fn add_section_chunk(&mut self, model_index: u32, chunk: Vec<u8>) -> bool {
+        self.inner.add_section_chunk(model_index, &chunk)
+    }
+
+    #[wasm_bindgen(js_name = clearCurrentSection)]
+    pub fn clear_current_section(&mut self) {
+        self.inner.clear_current_section();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = finishSection)]
+    pub fn finish_section(
+        &mut self,
+        ox: f64,
+        oy: f64,
+        oz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        depth_m: f64,
+        clash_a_model_indices: Vec<u32>,
+        clash_a_ids: Vec<u32>,
+        clash_a_guids: Vec<String>,
+        clash_b_model_indices: Vec<u32>,
+        clash_b_ids: Vec<u32>,
+        clash_points_flat: Vec<f64>,
+        align_x: f64,
+        align_y: f64,
+        align_z: f64,
+        model_id: String,
+        pk_m: f64,
+        pk_label: String,
+        s_min: f64,
+        s_max: f64,
+        annotations: Vec<String>,
+    ) -> ClashSectionOutput {
+        let a_refs: Vec<(u32, u32, String)> = clash_a_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    clash_a_model_indices.get(i).copied().unwrap_or(0),
+                    id,
+                    clash_a_guids.get(i).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let b_refs: Vec<(u32, u32)> = clash_b_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| (clash_b_model_indices.get(i).copied().unwrap_or(0), id))
+            .collect();
+        let pts: Vec<[f64; 3]> = clash_points_flat.as_chunks::<3>().0.to_vec();
+        let align_pt = (align_x.is_finite() && align_y.is_finite() && align_z.is_finite())
+            .then_some([align_x, align_y, align_z]);
+        let res = self.inner.finish_section(
+            [ox, oy, oz],
+            [nx, ny, nz],
+            depth_m,
+            a_refs,
+            b_refs,
+            pts,
+            align_pt,
+            model_id,
+            pk_m,
+            pk_label,
+            s_min,
+            s_max,
+            annotations,
+        );
+        ClashSectionOutput {
+            dxf: res.dxf_bytes,
+            svg: res.svg,
+            width_m: res.width_m,
+            height_m: res.height_m,
+        }
+    }
+
+    #[wasm_bindgen(js_name = mergeMasterDxf)]
+    pub fn merge_master_dxf(&self, columns: u32, margin_m: f64) -> Vec<u8> {
+        let cols = (columns > 0).then_some(columns as usize);
+        self.inner.merge_master_dxf(cols, margin_m)
+    }
+
+    #[wasm_bindgen(js_name = sectionCount)]
+    pub fn section_count(&self) -> u32 {
+        self.inner.section_count() as u32
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+}
+
+impl Default for ClashBatchSlicer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Standalone F2 slab classification using `clash_detector::compute_element_a_slab` directly.
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen(js_name = computeElementASlab)]
+pub fn compute_element_a_slab_wasm(
+    vertices_flat: Vec<f64>,
+    tx: f64,
+    ty: f64,
+    px: f64,
+    py: f64,
+    pz: f64,
+    long_min_extent_m: f64,
+    long_aspect_ratio: f64,
+    max_transverse_slab_m: f64,
+) -> Vec<f64> {
+    let verts: Vec<glam::DVec3> = vertices_flat
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| glam::DVec3::from_array(*c))
+        .collect();
+    let cfg = clash_detector::SlabConfig {
+        longitudinal_min_extent_m: if long_min_extent_m.is_finite() && long_min_extent_m > 0.0 {
+            long_min_extent_m
+        } else {
+            clash_detector::DEFAULT_LONGITUDINAL_MIN_EXTENT_M
+        },
+        longitudinal_aspect_ratio: if long_aspect_ratio.is_finite() && long_aspect_ratio > 0.0 {
+            long_aspect_ratio
+        } else {
+            clash_detector::DEFAULT_LONGITUDINAL_ASPECT_RATIO
+        },
+        max_transverse_slab_m: if max_transverse_slab_m.is_finite() && max_transverse_slab_m > 0.0 {
+            max_transverse_slab_m
+        } else {
+            clash_detector::DEFAULT_MAX_TRANSVERSE_SLAB_M
+        },
+        ..clash_detector::SlabConfig::default()
+    };
+    let span = clash_detector::compute_element_a_slab(
+        &verts,
+        [tx, ty],
+        glam::DVec3::new(px, py, pz),
+        &cfg,
+    );
+    let orient = match span.orientation {
+        clash_detector::ElementOrientation::Transverse => 0.0,
+        clash_detector::ElementOrientation::Longitudinal => 1.0,
+    };
+    vec![
+        orient,
+        span.s_min,
+        span.s_max,
+        span.s_clash,
+        span.delta_s_a,
+        span.width_perp_m,
+        span.height_perp_m,
+    ]
+}
+
+/// Parses an edited clash DXF and returns detected Level 1 (`Move`) and Level 2 (`Rebend`)
+/// edits as JSON (F5, `docs/12_clash_alignment_dxf.md` §3.5).
+#[wasm_bindgen(js_name = diffClashDxfJson)]
+pub fn diff_clash_dxf_json(dxf_bytes: Vec<u8>) -> Result<String, JsError> {
+    let diff = cad_slicer::parse_clash_dxf_edits(&dxf_bytes)
+        .map_err(|msg| JsError::new(&format!("parse||{msg}")))?;
+    Ok(clash_dxf::format_roundtrip_json(
+        &diff,
+        diff.edits.len(),
+        0,
+    ))
+}
+
+/// Applies surgical Level 1 (`MovePlacement`) STEP patches encoded as flat `[expressId, dx, dy, dz, ...]`
+/// in file length units, returning the patched IFC bytes (F5).
+#[wasm_bindgen(js_name = patchIfcStepMoves)]
+pub fn patch_ifc_step_moves(
+    original_ifc: Vec<u8>,
+    moves_flat: Vec<f64>,
+) -> Result<Vec<u8>, JsError> {
+    let mut patches = Vec::new();
+    for chunk in moves_flat.as_chunks::<4>().0 {
+        patches.push(step_parser::StepPatch::MovePlacement {
+            express_id: chunk[0] as u32,
+            delta_file_units: [chunk[1], chunk[2], chunk[3]],
+        });
+    }
+    let (patched, _) = step_parser::patch_step_file(&original_ifc, &patches)
+        .map_err(|msg| JsError::new(&format!("internal||{msg}")))?;
+    Ok(patched)
+}
+
+/// Standalone F5 round-trip helper: diffs `dxf_bytes` and applies both Level 1 (`Move`) and
+/// Level 2 (`Rebend`) surgical STEP patches to `original_ifc` given `length_unit_scale` (metres/unit).
+#[wasm_bindgen(js_name = patchIfcStepFromDxf)]
+pub fn patch_ifc_step_from_dxf(
+    original_ifc: Vec<u8>,
+    dxf_bytes: Vec<u8>,
+    length_unit_scale: f64,
+) -> Result<ClashRoundTripOutput, JsError> {
+    let (patched_ifc, diff_json) =
+        clash_dxf::apply_clash_dxf_to_step(&original_ifc, length_unit_scale, &dxf_bytes)
+            .map_err(|msg| JsError::new(&format!("parse||{msg}")))?;
+    Ok(ClashRoundTripOutput {
+        patched_ifc,
+        diff_json,
+    })
 }
 
 /// One drawing, in a Worker of its own. See `docs/05` section 6.

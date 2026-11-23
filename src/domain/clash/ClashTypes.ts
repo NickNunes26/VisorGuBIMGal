@@ -64,3 +64,81 @@ export interface ClashRule {
   /** Clearance in millimetres (0 = hard clashes only). */
   clearanceMm: number;
 }
+
+/** One planned cross-section request for F4 batch clash DXF slicing. */
+export interface ClashAlignmentSectionSpec {
+  fileName: string;
+  pkM: number;
+  pkLabel: string;
+  origin: readonly [number, number, number];
+  normal: readonly [number, number, number];
+  alignmentPoint: readonly [number, number, number];
+  sMin: number;
+  sMax: number;
+  depthM: number;
+  modelId: ModelId;
+  /** Parallel to `clashAIds`: owning model for each Element A (defaults to `modelId` when omitted). */
+  clashAModelIds?: readonly ModelId[];
+  clashAIds: readonly number[];
+  clashAGuids: readonly string[];
+  /** Parallel to `clashBIds`: owning model for each Element B (defaults to `modelId` when omitted). */
+  clashBModelIds?: readonly ModelId[];
+  clashBIds: readonly number[];
+  clashPoints: readonly (readonly [number, number, number])[];
+  annotations: readonly string[];
+}
+
+export interface ClashAlignmentDxfRequest {
+  modelIds: readonly ModelId[];
+  sections: readonly ClashAlignmentSectionSpec[];
+  /** Include the non-overlapping master grid `clashes_all.dxf` (default true). */
+  includeMasterGrid?: boolean;
+  /** Fixed grid columns (0 = auto ceil(sqrt(n))). */
+  gridColumns?: number;
+  /** Gap between grid cells in metres (default 1.0). */
+  gridMarginM?: number;
+}
+
+export interface ClashAlignmentDxfSectionOutput {
+  fileName: string;
+  pkM: number;
+  pkLabel: string;
+  dxfBytes: Uint8Array;
+  svg: string;
+  widthM: number;
+  heightM: number;
+}
+
+export interface ClashAlignmentDxfBatch {
+  sections: ClashAlignmentDxfSectionOutput[];
+  masterDxfBytes?: Uint8Array;
+}
+
+/** Level 1 CAD MOVE edit detected on an exported `INSERT` (`GUBIM_A_<expressId>_<GlobalId>`). */
+export interface ClashDxfMoveEdit {
+  kind: 'move';
+  expressId: number;
+  blockName: string;
+  delta2d: [number, number];
+  delta3d: [number, number, number];
+}
+
+/** Level 2 CAD polyline edit detected on an `EDIT_A_<expressId>` centerline layer. */
+export interface ClashDxfRebendEdit {
+  kind: 'rebend';
+  expressId: number;
+  points3d: [number, number, number][];
+}
+
+export type ClashDxfEditItem = ClashDxfMoveEdit | ClashDxfRebendEdit;
+
+/** Result of applying an edited clash DXF to an open IFC model's STEP file (F5). */
+export interface ClashDxfRoundTripResult {
+  modelId: ModelId;
+  pkM: number;
+  applied: number;
+  skipped: number;
+  edits: ClashDxfEditItem[];
+  patchedIfcBytes: Uint8Array;
+  auditCsv: string;
+}

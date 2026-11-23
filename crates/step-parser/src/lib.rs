@@ -10,6 +10,9 @@
 
 mod index;
 mod parser;
+pub mod patch;
+
+pub use patch::{StepPatch, StepPatchReport, patch_step_file};
 
 use std::collections::HashMap;
 use std::fmt;

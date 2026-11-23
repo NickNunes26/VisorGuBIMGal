@@ -499,4 +499,62 @@ impl Bvh3 {
             }
         }
     }
+
+    /// Branch-and-bound traversal finding the closest leaf item(s) to point `p`.
+    /// Calls `leaf_dist_sq(item, best_sq)` which may tighten `best_sq`.
+    pub fn visit_closest_to_point(
+        &self,
+        p: DVec3,
+        max_dist_sq: f64,
+        mut leaf_dist_sq: impl FnMut(u32, &mut f64),
+    ) -> f64 {
+        if self.nodes.is_empty() {
+            return max_dist_sq;
+        }
+        let mut best_sq = max_dist_sq;
+        let root_d = self.nodes[0].bounds.point_dist_sq(p);
+        if root_d >= best_sq {
+            return best_sq;
+        }
+        let mut stack = Vec::with_capacity(64);
+        stack.push((0usize, root_d));
+
+        while let Some((idx, lower_bound)) = stack.pop() {
+            if lower_bound >= best_sq {
+                continue;
+            }
+            let node = self.nodes[idx];
+            if node.count > 0 {
+                let start = node.start as usize;
+                let end = start + node.count as usize;
+                for &item in &self.items[start..end] {
+                    leaf_dist_sq(item, &mut best_sq);
+                    if best_sq == 0.0 {
+                        return 0.0;
+                    }
+                }
+            } else {
+                let l = node.start as usize;
+                let r = l + 1;
+                let dl = self.nodes[l].bounds.point_dist_sq(p);
+                let dr = self.nodes[r].bounds.point_dist_sq(p);
+                if dl <= dr {
+                    if dr < best_sq {
+                        stack.push((r, dr));
+                    }
+                    if dl < best_sq {
+                        stack.push((l, dl));
+                    }
+                } else {
+                    if dl < best_sq {
+                        stack.push((l, dl));
+                    }
+                    if dr < best_sq {
+                        stack.push((r, dr));
+                    }
+                }
+            }
+        }
+        best_sq
+    }
 }

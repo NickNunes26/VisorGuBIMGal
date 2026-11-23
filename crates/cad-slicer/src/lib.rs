@@ -4,6 +4,7 @@
 //! and a layer, and never parses IFC. Every failure stays local to its element: it becomes a
 //! [`Diagnostic`] and the rest of the drawing carries on.
 
+mod clash_dxf;
 mod cut;
 mod dimension;
 mod dxf;
@@ -11,15 +12,21 @@ mod fixed;
 mod geom;
 mod hatch;
 mod project;
+mod roundtrip;
 mod space;
 mod svg;
 mod text;
 
+pub use clash_dxf::{
+    ClashBlockA, ClashDxfMeta, ClashMarker2D, ClashSectionSheet, GridLayoutCell, GridMergeOptions,
+    GridMergeResult, build_clash_section_sheet, merge_drawings_grid, to_clash_dxf,
+};
 pub use cut::{Axis, Cut, Frame, Look};
 pub use dimension::OverallDimensions;
 pub use dxf::{DxfOptions, to_dxf, to_dxf_with};
 pub use geom::{Loop, Segment};
 pub use hatch::HatchStyle;
+pub use roundtrip::{DxfRoundTripDiff, DxfRoundTripEdit, ParsedClashMeta, parse_clash_dxf_edits};
 pub use space::{AreaSource, SpaceInput, SpaceLabel};
 pub use svg::{SvgOptions, to_svg, to_svg_with};
 
@@ -134,6 +141,171 @@ impl Drawing {
             dims.max *= factor;
         }
         scaled
+    }
+
+    /// Exact 2D bounding box `(min, max)` across all geometry layers, space labels, and dimensions.
+    pub fn bounds_2d(&self) -> Option<(glam::DVec2, glam::DVec2)> {
+        let mut low = glam::DVec2::splat(f64::INFINITY);
+        let mut high = glam::DVec2::splat(f64::NEG_INFINITY);
+        let mut take = |p: glam::DVec2| {
+            if p.is_finite() {
+                low = low.min(p);
+                high = high.max(p);
+            }
+        };
+        for layer in &self.layers {
+            for ring in &layer.loops {
+                for &p in &ring.points {
+                    take(p);
+                }
+            }
+            for seg in layer
+                .visible
+                .iter()
+                .chain(&layer.hidden)
+                .chain(&layer.hatch)
+            {
+                take(seg.a);
+                take(seg.b);
+            }
+        }
+        for space in &self.spaces {
+            take(space.position);
+        }
+        if let Some(dims) = self.dimensions {
+            take(dims.min);
+            take(dims.max);
+        }
+        (low.x <= high.x && low.y <= high.y).then_some((low, high))
+    }
+
+    /// Translates every 2D coordinate in the drawing by `delta`.
+    pub fn translated(&self, delta: glam::DVec2) -> Self {
+        let mut moved = self.clone();
+        for layer in &mut moved.layers {
+            for ring in &mut layer.loops {
+                for p in &mut ring.points {
+                    *p += delta;
+                }
+            }
+            for seg in layer
+                .visible
+                .iter_mut()
+                .chain(&mut layer.hidden)
+                .chain(&mut layer.hatch)
+            {
+                seg.a += delta;
+                seg.b += delta;
+            }
+        }
+        for space in &mut moved.spaces {
+            space.position += delta;
+        }
+        if let Some(dims) = &mut moved.dimensions {
+            dims.min += delta;
+            dims.max += delta;
+        }
+        moved
+    }
+
+    /// Normalizes the drawing so its 2D bounding box starts at `(0, 0)` in metres.
+    /// Returns `(normalized_drawing, original_min_corner)`.
+    pub fn normalized_to_origin(&self) -> (Self, glam::DVec2) {
+        match self.bounds_2d() {
+            Some((low, _)) => (self.translated(-low), low),
+            None => (self.clone(), glam::DVec2::ZERO),
+        }
+    }
+}
+
+/// Fast slab slice without hidden-line occlusion (F3, `docs/12_clash_alignment_dxf.md` §3.4):
+/// - When `depth <= 0.0`: cut loops only (`cut::cut_mesh`), zero projection.
+/// - When `depth > 0.0`: cut loops at the front plane + unoccluded feature edges clipped to
+///   `[0, depth]`, skipping occluder BVH construction and queries (~80–90% faster, nothing hidden).
+pub fn draw_slab_unoccluded(meshes: &[DrawingMesh], cut: Cut, depth: f64) -> Drawing {
+    let mut diagnostics = Diagnostics::new();
+    let Some(frame) = Frame::of(cut) else {
+        diagnostics.add(0, 0, "bad-cut", "the cut position is not finite".into());
+        return Drawing {
+            frame: Frame::of(Cut::Plan { z: 0.0 }).expect("an identity frame is finite"),
+            depth: Some(0.0),
+            layers: Vec::new(),
+            spaces: Vec::new(),
+            dimensions: None,
+            diagnostics: diagnostics.entries,
+        };
+    };
+
+    let clean_depth = if depth.is_finite() && depth > 0.0 {
+        depth
+    } else {
+        0.0
+    };
+    let project_slab = clean_depth > 0.0;
+    let mut scratch = project::FeatureScratch::default();
+    let mut layers: std::collections::BTreeMap<String, Layer> = std::collections::BTreeMap::new();
+
+    for item in meshes {
+        let layer = layers
+            .entry(item.layer.clone())
+            .or_insert_with(|| Layer {
+                name: item.layer.clone(),
+                ..Layer::default()
+            });
+        let mut loops = Vec::new();
+        let report = cut::cut_mesh(&item.mesh, &frame, &mut loops);
+        if report.non_finite > 0 {
+            diagnostics.add(
+                item.model_id,
+                item.element_id,
+                "non-finite-coordinate",
+                "the cut skipped triangles with a coordinate that is not finite".into(),
+            );
+        }
+        if report.truncated {
+            diagnostics.add(
+                item.model_id,
+                item.element_id,
+                "cut-truncated",
+                "the cut reached its segment limit and stopped".into(),
+            );
+        }
+        if report.open_loops > 0 {
+            diagnostics.add(
+                item.model_id,
+                item.element_id,
+                "open-cut-loop",
+                "the cut could not close a loop, which a watertight mesh would".into(),
+            );
+        }
+        layer.loops.extend(loops);
+
+        if project_slab {
+            let report = project::project_mesh_unoccluded(
+                &item.mesh,
+                &frame,
+                Some(clean_depth),
+                &mut scratch,
+                &mut layer.visible,
+            );
+            note_projection(&mut diagnostics, item, &report);
+        }
+    }
+
+    if project_slab {
+        let mut empty_hidden = Vec::new();
+        for layer in layers.values_mut() {
+            project::merge_lines(&mut layer.visible, &mut empty_hidden);
+        }
+    }
+
+    Drawing {
+        frame,
+        depth: Some(clean_depth),
+        layers: layers.into_values().collect(),
+        spaces: Vec::new(),
+        dimensions: None,
+        diagnostics: diagnostics.entries,
     }
 }
 

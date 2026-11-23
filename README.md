@@ -15,7 +15,7 @@ Visor BIM y GIS de código abierto ejecutado íntegramente en local (client-side
   - **BCF 3.0 / 2.1:** importar y exportar temas, comentarios y puntos de vista 3D con miniatura PNG.
   - **IDS 1.0:** validación de especificaciones `.ids` de buildingSMART con aislamiento de incumplimientos.
   - **Comparación de modelos:** diferencias por `GlobalId` (añadidos, eliminados, cambiados por tipo/nombre/propiedades/geometría) y vista coloreada.
-  - **Detección de interferencias (Clash Detection):** choques duros y blandos (con holgura en mm) dentro de un modelo o entre modelos federados, reglas por clase IFC/planta, profundidad y volumen CSG, aislamiento de pares y guardado directo como incidencia BCF de tipo `Clash`.
+  - **Detección de interferencias (Clash Detection) y planos DXF por alineación LandXML (F1–F5):** choques duros y blandos (con holgura en mm) dentro de un modelo o entre modelos federados, reglas por clase IFC/planta, punto de máxima penetración y volumen CSG, aislamiento de pares, guardado como incidencia BCF (`Clash`), exportación por lotes a `.zip` de secciones transversales DXF perpendiculares a ejes LandXML (`individual/` + `clashes_all.dxf` + `summary.csv` + vista previa SVG) y reimportación round-trip DXF → parcheo quirúrgico STEP IFC.
   - **Exportación glTF/GLB:** exportación de la escena visible a `.glb` 2.0.
 - **Contexto GIS 2D:** Mapa Leaflet con capas IGN PNOA (WMS) y OpenStreetMap, transformación geodésica con Proj4js (`IfcMapConversion` / UTM 29N `EPSG:25829` y otros CRS) y estado explícito sin conexión.
 - **Interfaz en castellano con capa i18n:** Todos los textos salen del catálogo `src/ui/i18n/es.ts`, listo para añadir gallego e inglés.
@@ -51,8 +51,8 @@ npm run typecheck     # Verificación de tipos TypeScript
 ### Batería de pruebas
 
 ```bash
-npm run test:unit                                    # 16 suites unitarias en Node
-npm run test:drawings                                # 32 pruebas de regresión visual y geométrica 2D (SVG/DXF/PDF)
+npm run test:unit                                    # 18 suites unitarias en Node
+npm run test:drawings                                # 31 pruebas de regresión visual y geométrica 2D (SVG/DXF/PDF)
 npm run test:e2e                                     # 24 suites E2E en navegador (WebGPU, WebGL2 y sin adaptador)
 npm run bench                                        # Banco de rendimiento del kernel (D2)
 cargo clippy --workspace --all-targets -- -D warnings
@@ -75,12 +75,15 @@ La documentación técnica completa se organiza en [`docs/`](./docs/00_index.md)
 - [02 — Análisis de riesgos técnicos y mitigaciones](./docs/02_technical_risks.md)
 - [03 — Especificación del kernel BIM/CAD soberano (Rust/WASM)](./docs/03_sovereign_kernel_spec.md)
 - [04 — Plan de trabajo paralelo](./docs/04_team_distribution.md)
-- [05 — Contrato del kernel y del renderizador](./docs/05_kernel_contract.md) (v2, revisión 12)
+- [05 — Contrato del kernel y del renderizador](./docs/05_kernel_contract.md) (v2, revisión 13)
 - [06 — Hoja de mejoras y estado del sprint](./docs/06_mejoras.md)
 - [08 — Estudio de modelos reales](./docs/08_model_survey.md)
 - [09 — Compresión de vértices e instanciación](./docs/09_propuesta_instancias_compresion.md)
 - [10 — Niveles de detalle (A14)](./docs/10_lod.md)
 - [11 — Detección de interferencias (C22)](./docs/11_clash.md)
+- [12 — Planos DXF de choques por alineación LandXML (F1–F5)](./docs/12_clash_alignment_dxf.md)
+- [13 — Rediseño UI/UX y migración a SolidJS (U0–U2)](./docs/13_ui_redesign_solidjs.md)
+- [14 — Planificación y backlog del siguiente sprint](./docs/14_next_sprint_backlog.md)
 
 ## Hoja de ruta
 

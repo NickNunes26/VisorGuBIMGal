@@ -1,8 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, BookmarkPlus, Play, X } from 'lucide-react';
-import type { ClashReport, ClashRule } from '../../domain/clash/ClashTypes';
+import { AlertTriangle, BookmarkPlus, Download, Eye, FileUp, Play, RefreshCw, X } from 'lucide-react';
+import {
+  bindAlignmentToModel,
+  parseLandXml,
+  type HorizontalAlignment
+} from '../../domain/alignment/landXml';
+import type {
+  ClashDxfRoundTripResult,
+  ClashReport,
+  ClashRule
+} from '../../domain/clash/ClashTypes';
+import type { FilePort, SaveFileOptions } from '../../domain/files/FilePort';
 import type { KernelPort, SpatialTree } from '../../domain/kernel/KernelPort';
 import type { ModelId, ModelRecord } from '../../domain/models/ModelRecord';
+import {
+  exportClashAlignmentZip,
+  previewSingleClashSectionSvg
+} from '../viewer/clashAlignmentExport';
 import {
   buildClashDisplayEntries,
   buildClashRequest,
@@ -19,10 +33,46 @@ import { formatNumber, t } from '../i18n';
 interface ClashPanelProps {
   models: ModelRecord[];
   spatialTrees: Record<ModelId, SpatialTree>;
-  kernel: Pick<KernelPort, 'detectClashes'>;
+  kernel: Pick<
+    KernelPort,
+    | 'detectClashes'
+    | 'elementMesh'
+    | 'getElementDetails'
+    | 'exportClashAlignmentDxf'
+    | 'applyClashDxfRoundTrip'
+    | 'elementSlabSpan'
+  >;
+  filePort?: Pick<FilePort, 'saveFile'>;
   onInspectPair: (entry: ClashDisplayEntry) => void;
   onClearClashView: () => void;
   onSaveAsBcf: (entry: ClashDisplayEntry) => Promise<void>;
+  onReloadPatchedModel?: (
+    modelId: ModelId,
+    patchedBytes: Uint8Array
+  ) => Promise<{ model: ModelRecord; tree: SpatialTree | null } | null>;
+}
+
+async function saveOutputWithFallback(
+  filePort: Pick<FilePort, 'saveFile'> | undefined,
+  options: SaveFileOptions
+): Promise<void> {
+  if (filePort) {
+    await filePort.saveFile(options);
+    return;
+  }
+  const blobPart =
+    typeof options.content === 'string'
+      ? options.content
+      : (options.content as Uint8Array<ArrayBuffer>);
+  const blob = new Blob([blobPart], { type: options.mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = options.defaultName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 const MAX_DISPLAY_ROWS = 200;
@@ -33,9 +83,11 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
   models,
   spatialTrees,
   kernel,
+  filePort,
   onInspectPair,
   onClearClashView,
-  onSaveAsBcf
+  onSaveAsBcf,
+  onReloadPatchedModel
 }) => {
   const readyModels = useMemo(() => models.filter((m) => m.status === 'ready'), [models]);
   const catalog = useMemo(
@@ -62,6 +114,42 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
   const [error, setError] = useState<string | null>(null);
   const latestRun = useRef(0);
   const initializedModelsCountRef = useRef(0);
+
+  // F4 & F5: LandXML alignment, batch DXF export & DXF -> STEP round-trip state
+  const landXmlInputRef = useRef<HTMLInputElement | null>(null);
+  const roundTripDxfInputRef = useRef<HTMLInputElement | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
+  const [landXmlFileName, setLandXmlFileName] = useState<string | null>(null);
+  const [alignments, setAlignments] = useState<HorizontalAlignment[]>([]);
+  const [selectedAlignmentIdx, setSelectedAlignmentIdx] = useState<number>(0);
+  const [mergeToleranceText, setMergeToleranceText] = useState<string>('20');
+  const [exportBusy, setExportBusy] = useState(false);
+  const [roundTripBusy, setRoundTripBusy] = useState(false);
+  const [exportProgressText, setExportProgressText] = useState<string>('');
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [roundTripResult, setRoundTripResult] = useState<ClashDxfRoundTripResult | null>(null);
+  const [previewBusyId, setPreviewBusyId] = useState<string | null>(null);
+  const [svgPreview, setSvgPreview] = useState<{
+    svg: string;
+    pkLabel: string;
+    depthMm: number;
+    orientation: 'transverse' | 'longitudinal';
+  } | null>(null);
+
+  const selectedAlignment = alignments[selectedAlignmentIdx] ?? null;
+  const primaryModel = useMemo(
+    () => readyModels.find((m) => m.id === modelA) ?? readyModels[0] ?? null,
+    [readyModels, modelA]
+  );
+  const boundAlignment = useMemo(() => {
+    if (!selectedAlignment) return null;
+    return bindAlignmentToModel(
+      selectedAlignment,
+      primaryModel?.coordinateReference,
+      primaryModel?.bounds
+    );
+  }, [selectedAlignment, primaryModel]);
 
   // Sync sensible default pair when models are loaded or removed.
   useEffect(() => {
@@ -113,17 +201,20 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
     return [val];
   };
 
-  const handleRun = async (event: React.FormEvent) => {
-    event.preventDefault();
+  const executeClashDetection = async (
+    activeReadyModels: ModelRecord[],
+    activeSpatialTrees: Record<ModelId, SpatialTree>
+  ): Promise<ClashDisplayEntry[] | null> => {
     if (!kernel.detectClashes) {
       setError(t('clash.unsupportedKernel'));
-      return;
+      return null;
     }
     const ticket = ++latestRun.current;
     setBusy(true);
     setError(null);
     setProgressText('');
     try {
+      const activeCatalog = collectClashCatalog(activeReadyModels, activeSpatialTrees);
       const parsedClearance = Number(clearanceText.replace(',', '.'));
       const clearanceMm = Number.isFinite(parsedClearance) && parsedClearance > 0 ? parsedClearance : 0;
       const rule: ClashRule = {
@@ -140,27 +231,34 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
         },
         clearanceMm
       };
-      const request = buildClashRequest(rule, readyModels, catalog);
+      const request = buildClashRequest(rule, activeReadyModels, activeCatalog);
       const result = await kernel.detectClashes(request, (phase, pct) => {
         if (ticket === latestRun.current) {
           setProgressText(t('app.statusPhaseProgress', { phase, pct }));
         }
       });
-      if (ticket !== latestRun.current) return;
-      const built = buildClashDisplayEntries(result, catalog);
+      if (ticket !== latestRun.current) return null;
+      const built = buildClashDisplayEntries(result, activeCatalog);
       setReport(result);
       setEntries(built);
       setActiveId(null);
       setKindFilter('all');
+      return built;
     } catch (err) {
-      if (ticket !== latestRun.current) return;
+      if (ticket !== latestRun.current) return null;
       setError(err instanceof Error ? err.message : t('clash.errorFallback'));
+      return null;
     } finally {
       if (ticket === latestRun.current) {
         setBusy(false);
         setProgressText('');
       }
     }
+  };
+
+  const handleRun = async (event: React.FormEvent) => {
+    event.preventDefault();
+    await executeClashDetection(readyModels, spatialTrees);
   };
 
   const handleClear = () => {
@@ -188,6 +286,170 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
       await onSaveAsBcf(entry);
     } finally {
       setSavingBcfId(null);
+    }
+  };
+
+  const handleLoadLandXml = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setExportError(null);
+    setExportStatus(null);
+    try {
+      const text = await file.text();
+      const doc = parseLandXml(text);
+      if (doc.alignments.length === 0) {
+        setExportError(t('clash.landXmlEmptyError'));
+        return;
+      }
+      setLandXmlFileName(file.name);
+      setAlignments(doc.alignments);
+      setSelectedAlignmentIdx(0);
+      setSvgPreview(null);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : t('clash.landXmlParseError'));
+    }
+  };
+
+  const handleExportDxfZip = async () => {
+    if (!boundAlignment || filteredEntries.length === 0) return;
+    const abort = new AbortController();
+    exportAbortRef.current = abort;
+    setExportBusy(true);
+    setExportError(null);
+    setExportStatus(null);
+    setExportProgressText('');
+    try {
+      const parsedTol = Number(mergeToleranceText.replace(',', '.'));
+      const mergeToleranceMm = Number.isFinite(parsedTol) && parsedTol >= 0 ? parsedTol : 20;
+      const result = await exportClashAlignmentZip(
+        filteredEntries,
+        readyModels.map((m) => m.id),
+        boundAlignment,
+        kernel,
+        {
+          mergeToleranceMm,
+          signal: abort.signal,
+          onProgress: (phase, pct) => {
+            setExportProgressText(t('app.statusPhaseProgress', { phase, pct }));
+          }
+        }
+      );
+      await saveOutputWithFallback(filePort, {
+        defaultName: result.fileName,
+        content: result.zipBytes,
+        mimeType: 'application/zip',
+        filterName: 'ZIP',
+        extensions: ['zip']
+      });
+      setExportStatus(t('clash.exportDoneStatus', { count: result.sections.length }));
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setExportStatus(t('clash.exportCancelledStatus'));
+      } else {
+        setExportError(err instanceof Error ? err.message : t('clash.exportErrorFallback'));
+      }
+    } finally {
+      exportAbortRef.current = null;
+      setExportBusy(false);
+      setExportProgressText('');
+    }
+  };
+
+  const handleCancelExport = () => {
+    exportAbortRef.current?.abort();
+  };
+
+  const handleReimportDxf = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !kernel.applyClashDxfRoundTrip || !primaryModel) return;
+
+    setRoundTripBusy(true);
+    setExportError(null);
+    setExportStatus(t('clash.roundTripBusyStatus'));
+    try {
+      const dxfBytes = new Uint8Array(await file.arrayBuffer());
+      const rtResult = await kernel.applyClashDxfRoundTrip(primaryModel.id, dxfBytes);
+      if (rtResult.applied === 0 || rtResult.edits.length === 0) {
+        setRoundTripResult(null);
+        setExportStatus(t('clash.roundTripNoEdits'));
+        return;
+      }
+      setRoundTripResult(rtResult);
+
+      let nextModels = readyModels;
+      let nextTrees = spatialTrees;
+      if (onReloadPatchedModel) {
+        const reloaded = await onReloadPatchedModel(rtResult.modelId, rtResult.patchedIfcBytes);
+        if (reloaded) {
+          nextModels = readyModels.map((m) => (m.id === reloaded.model.id ? reloaded.model : m));
+          if (reloaded.tree) {
+            nextTrees = { ...spatialTrees, [reloaded.model.id]: reloaded.tree };
+          }
+        }
+      }
+
+      const newEntries = await executeClashDetection(nextModels, nextTrees);
+      const remaining = newEntries ? newEntries.length : entries.length;
+      setExportStatus(
+        t('clash.roundTripDoneStatus', {
+          applied: rtResult.applied,
+          remaining
+        })
+      );
+    } catch (err) {
+      setExportStatus(null);
+      setExportError(err instanceof Error ? err.message : t('clash.roundTripErrorFallback'));
+    } finally {
+      setRoundTripBusy(false);
+    }
+  };
+
+  const handleDownloadPatchedIfc = async () => {
+    if (!roundTripResult) return;
+    const targetModel = readyModels.find((m) => m.id === roundTripResult.modelId) ?? primaryModel;
+    const origName = targetModel?.fileName ?? 'model.ifc';
+    const patchedName = origName.replace(/\.ifc$/i, '') + '_patched.ifc';
+    await saveOutputWithFallback(filePort, {
+      defaultName: patchedName,
+      content: roundTripResult.patchedIfcBytes,
+      mimeType: 'application/x-step',
+      filterName: 'IFC',
+      extensions: ['ifc']
+    });
+  };
+
+  const handleDownloadRoundTripCsv = async () => {
+    if (!roundTripResult) return;
+    const targetModel = readyModels.find((m) => m.id === roundTripResult.modelId) ?? primaryModel;
+    const origName = (targetModel?.fileName ?? 'model').replace(/\.ifc$/i, '');
+    await saveOutputWithFallback(filePort, {
+      defaultName: `${origName}_roundtrip_changes.csv`,
+      content: roundTripResult.auditCsv,
+      mimeType: 'text/csv;charset=utf-8',
+      filterName: 'CSV',
+      extensions: ['csv']
+    });
+  };
+
+  const handlePreviewSvg = async (event: React.MouseEvent, entry: ClashDisplayEntry) => {
+    event.stopPropagation();
+    if (!boundAlignment) return;
+    setPreviewBusyId(entry.id);
+    setExportError(null);
+    try {
+      const preview = await previewSingleClashSectionSvg(
+        entry,
+        readyModels.map((m) => m.id),
+        boundAlignment,
+        kernel
+      );
+      setSvgPreview(preview);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : t('clash.exportErrorFallback'));
+    } finally {
+      setPreviewBusyId(null);
     }
   };
 
@@ -424,6 +686,177 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
             </div>
           )}
 
+          {(filteredEntries.length > 0 || boundAlignment !== null || roundTripResult !== null) &&
+            (kernel.exportClashAlignmentDxf || kernel.applyClashDxfRoundTrip) && (
+              <div className="clash-alignment-box" data-testid="clash-alignment-dxf">
+                <div className="clash-alignment-header">
+                  <span>{t('clash.dxfTitle')}</span>
+                  <div className="clash-alignment-actions">
+                    {kernel.exportClashAlignmentDxf && (
+                      <>
+                        <input
+                          ref={landXmlInputRef}
+                          type="file"
+                          accept=".xml,.landxml"
+                          style={{ display: 'none' }}
+                          onChange={(e) => void handleLoadLandXml(e)}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-xs"
+                          onClick={() => landXmlInputRef.current?.click()}
+                          title={t('clash.loadLandXmlTitle')}
+                        >
+                          <FileUp size={12} />
+                          <span>
+                            {landXmlFileName ? t('clash.changeLandXmlBtn') : t('clash.loadLandXmlBtn')}
+                          </span>
+                        </button>
+                      </>
+                    )}
+                    {kernel.applyClashDxfRoundTrip && (
+                      <>
+                        <input
+                          ref={roundTripDxfInputRef}
+                          type="file"
+                          accept=".dxf"
+                          style={{ display: 'none' }}
+                          onChange={(e) => void handleReimportDxf(e)}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-xs"
+                          data-testid="clash-reimport-dxf-btn"
+                          disabled={roundTripBusy}
+                          onClick={() => roundTripDxfInputRef.current?.click()}
+                          title={t('clash.reimportDxfTitle')}
+                        >
+                          <RefreshCw size={12} />
+                          <span>{t('clash.reimportDxfBtn')}</span>
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+              {boundAlignment && (
+                <div className="clash-alignment-controls">
+                  {alignments.length > 1 && (
+                    <label className="clash-inline-field">
+                      <span>{t('clash.alignmentSelectLabel')}</span>
+                      <select
+                        value={selectedAlignmentIdx}
+                        onChange={(e) => setSelectedAlignmentIdx(Number(e.target.value))}
+                        title={t('clash.alignmentSelectTitle')}
+                      >
+                        {alignments.map((al, i) => (
+                          <option key={`${al.name}-${i}`} value={i}>
+                            {al.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+
+                  <label className="clash-inline-field">
+                    <span>{t('clash.mergeTolLabel')}</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="5"
+                      value={mergeToleranceText}
+                      onChange={(e) => setMergeToleranceText(e.target.value)}
+                      title={t('clash.mergeTolTitle')}
+                    />
+                  </label>
+
+                  <div className="clash-alignment-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-xs"
+                      disabled={exportBusy}
+                      onClick={() => void handleExportDxfZip()}
+                      title={t('clash.exportDxfZipTitle')}
+                    >
+                      <Download size={12} />
+                      <span>{t('clash.exportDxfZipBtn')}</span>
+                    </button>
+                    {exportBusy && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-xs"
+                        onClick={handleCancelExport}
+                        title={t('clash.cancelExportTitle')}
+                      >
+                        <X size={12} />
+                        <span>{t('clash.cancelExportBtn')}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {boundAlignment?.warnings.some((w) => w.code === 'no-map-conversion-disjoint-bounds') && (
+                <div className="clash-notice">{t('clash.landXmlDisjointWarning')}</div>
+              )}
+              {exportProgressText && <div className="clash-progress">{exportProgressText}</div>}
+              {exportStatus && <div className="clash-notice">{exportStatus}</div>}
+              {roundTripResult && (
+                <div className="clash-alignment-actions" data-testid="clash-roundtrip-downloads">
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-xs"
+                    onClick={() => void handleDownloadPatchedIfc()}
+                    title={t('clash.downloadPatchedIfcTitle')}
+                  >
+                    <Download size={12} />
+                    <span>{t('clash.downloadPatchedIfcBtn')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-xs"
+                    onClick={() => void handleDownloadRoundTripCsv()}
+                    title={t('clash.downloadRoundTripCsvTitle')}
+                  >
+                    <Download size={12} />
+                    <span>{t('clash.downloadRoundTripCsvBtn')}</span>
+                  </button>
+                </div>
+              )}
+              {exportError && <div className="clash-error">{exportError}</div>}
+
+              {svgPreview && (
+                <div className="clash-svg-preview" data-testid="clash-svg-preview">
+                  <div className="clash-svg-preview-bar">
+                    <span>
+                      {t('clash.previewHeader', {
+                        pk: svgPreview.pkLabel,
+                        mode:
+                          svgPreview.orientation === 'transverse'
+                            ? t('clash.previewModeTransverse', {
+                                mm: formatNumber(svgPreview.depthMm, { maximumFractionDigits: 1 })
+                              })
+                            : t('clash.previewModeLongitudinal')
+                      })}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      onClick={() => setSvgPreview(null)}
+                      title={t('clash.previewCloseBtn')}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                  <div
+                    className="clash-svg-preview-stage"
+                    dangerouslySetInnerHTML={{ __html: svgPreview.svg }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
           {filteredEntries.length === 0 ? (
             <div className="clash-empty">{t('clash.noClashes')}</div>
           ) : (
@@ -455,6 +888,18 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
                           ? t('clash.penetrationLabel', { mm: mmVal })
                           : t('clash.gapLabel', { mm: mmVal })}
                       </span>
+                      {boundAlignment && kernel.exportClashAlignmentDxf && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-xs"
+                          disabled={previewBusyId === entry.id}
+                          onClick={(e) => void handlePreviewSvg(e, entry)}
+                          title={t('clash.previewSvgTitle')}
+                        >
+                          <Eye size={12} />
+                          <span>{t('clash.previewSvgBtn')}</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="btn btn-secondary btn-xs clash-bcf-btn"

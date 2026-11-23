@@ -5,9 +5,16 @@
 
 pub mod bvh;
 pub mod narrow;
+pub mod slab;
 
 pub use bvh::{Aabb3, Bvh3};
 pub use narrow::{ClashMesh, ClashOutcome, MAX_CSG_TRIANGLES, test_pair};
+pub use slab::{
+    ClashSlabGroup, ClashSlabInput, DEFAULT_LONGITUDINAL_ASPECT_RATIO,
+    DEFAULT_LONGITUDINAL_MIN_EXTENT_M, DEFAULT_MAX_TRANSVERSE_SLAB_M, DEFAULT_MERGE_TOLERANCE_M,
+    ElementOrientation, SlabConfig, SlabSpan, compute_element_a_slab, group_clash_slabs,
+    normalize_horizontal_tangent,
+};
 
 use std::collections::HashSet;
 

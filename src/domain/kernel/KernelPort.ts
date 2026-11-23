@@ -8,7 +8,13 @@ import type {
   SelectedElementDetails
 } from '../models/ModelRecord';
 import type { DrawingExportConfig, DrawingFrame, DrawingOptions } from '../drawings/DrawingTypes';
-import type { ClashReport, ClashRequest } from '../clash/ClashTypes';
+import type {
+  ClashAlignmentDxfBatch,
+  ClashAlignmentDxfRequest,
+  ClashDxfRoundTripResult,
+  ClashReport,
+  ClashRequest
+} from '../clash/ClashTypes';
 import type { ElementSnapshot } from '../compare/modelDiff';
 import type { GeometryBatch } from './GeometryBatch';
 
@@ -44,14 +50,15 @@ export type KernelErrorCode =
 
 /** Thrown for failures of a whole operation. Per-element problems are diagnostics instead. */
 export class KernelError extends Error {
-  constructor(
-    readonly code: KernelErrorCode,
-    message: string,
-    /** Byte offset in the IFC file, for 'parse'. */
-    readonly offset?: number
-  ) {
+  readonly code: KernelErrorCode;
+  /** Byte offset in the IFC file, for 'parse'. */
+  readonly offset?: number;
+
+  constructor(code: KernelErrorCode, message: string, offset?: number) {
     super(message);
     this.name = 'KernelError';
+    this.code = code;
+    this.offset = offset;
   }
 }
 
@@ -232,4 +239,49 @@ export interface KernelPort {
    * holding full meshes on the main thread (C22, docs/11_clash.md).
    */
   detectClashes?(request: ClashRequest, onProgress?: ProgressHandler): Promise<ClashReport>;
+
+  /**
+   * Sequentially slices culled 3D slabs into normalized `(0,0)` clash DXF sections + SVG previews
+   * + non-overlapping master grid DXF in a single Worker (F4, docs/12_clash_alignment_dxf.md).
+   */
+  exportClashAlignmentDxf?(
+    request: ClashAlignmentDxfRequest,
+    onProgress?: ProgressHandler,
+    signal?: AbortSignal
+  ): Promise<ClashAlignmentDxfBatch>;
+
+  /**
+   * Parses an edited clash DXF (Level 1 `MOVE` and Level 2 `EDIT_A_*` polyline rebend),
+   * surgically patches the open model's STEP bytes in the Worker, and returns the patched IFC
+   * bytes plus the audit CSV log (F5, docs/12_clash_alignment_dxf.md).
+   */
+  applyClashDxfRoundTrip?(
+    modelId: ModelId,
+    dxfBytes: Uint8Array
+  ): Promise<ClashDxfRoundTripResult>;
+
+  /**
+   * Computes Element A's slab span inside the ModelWorker using `clash_detector::compute_element_a_slab`
+   * without transferring Element A's vertex buffer to the main thread (F2/F4).
+   */
+  elementSlabSpan?(
+    modelId: ModelId,
+    expressId: number,
+    tangentXY: readonly [number, number],
+    clashPoint: readonly [number, number, number],
+    config?: {
+      longitudinalMinExtentM?: number;
+      longitudinalAspectRatio?: number;
+      maxTransverseSlabM?: number;
+    }
+  ): Promise<{
+    orientation: 'transverse' | 'longitudinal';
+    sMin: number;
+    sMax: number;
+    sClash: number;
+    depthM: number;
+    deltaSA: number;
+    widthPerpM: number;
+    heightPerpM: number;
+  } | null>;
 }

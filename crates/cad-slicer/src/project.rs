@@ -80,7 +80,7 @@ struct Flat {
 }
 
 #[derive(Default)]
-struct FeatureScratch {
+pub(crate) struct FeatureScratch {
     pos_to_welded: Vec<u32>,
     table_slots: Vec<u32>,
     point_keys: Vec<[u64; 3]>,
@@ -846,6 +846,69 @@ pub(crate) fn project_mesh(
         push_run(edge.a, edge.b, cursor, 1.0, true, visible, hidden);
     }
     occluders.scratch = scratch;
+    report
+}
+
+/// Projects feature edges clipped to `[0, limit]` directly onto `visible` without building or
+/// querying an occlusion BVH (F3: slab mode with all elements visible / nothing hidden).
+pub(crate) fn project_mesh_unoccluded(
+    mesh: &Mesh,
+    frame: &Frame,
+    limit: Option<f64>,
+    scratch: &mut FeatureScratch,
+    visible: &mut Vec<Segment>,
+) -> ProjectReport {
+    let mut report = ProjectReport::default();
+    if mesh.triangles.len() > MAX_ELEMENT_TRIANGLES {
+        report.too_large = true;
+        return report;
+    }
+    let (skipped, too_many) = feature_edges_into(mesh, frame.look, scratch);
+    report.non_finite += skipped;
+    report.truncated = too_many;
+
+    for &(from, to) in &scratch.edges {
+        let (depth_from, depth_to) = (frame.depth(from), frame.depth(to));
+        if !depth_from.is_finite() || !depth_to.is_finite() {
+            report.non_finite += 1;
+            continue;
+        }
+        let run = depth_to - depth_from;
+        let (mut start, mut end) = (0.0_f64, 1.0_f64);
+        if run.abs() <= f64::MIN_POSITIVE {
+            if depth_from < 0.0 || limit.is_some_and(|limit| depth_from > limit) {
+                continue;
+            }
+        } else {
+            let zero = -depth_from / run;
+            if run > 0.0 {
+                start = start.max(zero);
+            } else {
+                end = end.min(zero);
+            }
+            if let Some(limit) = limit {
+                let reach = (limit - depth_from) / run;
+                if run > 0.0 {
+                    end = end.min(reach);
+                } else {
+                    start = start.max(reach);
+                }
+            }
+        }
+        if end - start <= 1e-9 {
+            continue;
+        }
+        let a = frame.project(from.lerp(to, start));
+        let b = frame.project(from.lerp(to, end));
+        if !(a.is_finite() && b.is_finite()) {
+            report.non_finite += 1;
+            continue;
+        }
+        if a.distance(b) <= SEGMENT_EPSILON {
+            continue;
+        }
+        visible.push(Segment::new(a, b));
+    }
     report
 }
 fn push_run(
