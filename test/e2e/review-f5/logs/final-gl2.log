@@ -1,0 +1,134 @@
+PASS [gl2] r12-utm 4 clashes, 4 sections {"cards":4,"names":["individual/PK_0+105.00_001.dxf","individual/PK_0+110.00_002.dxf","individual/PK_0+115.00_003.dxf","individual/PK_0+125.00_004.dxf","clashes_all.dxf","summary.csv"]}
+PASS [gl2] r12-utm every DXF line <= 255 chars (UTM) {"longest":229}
+PASS [gl2] r12-utm GUBIM_META v=2 split over records, all 19 keys present {"records":[229,65],"missing":[]}
+PASS [gl2] r12-utm GUBIM_ORIG carries the full GlobalId ["GUBIM_ORIG id=99 guid=3UtmRevD00000000000000 block=GUBIM_A_99_3UtmRevD000000000000 x=2.000000 y=0.500000"]
+PASS [gl2] r12-utm section frame from kerb: up=+Z, 1 sheet m = 1 world m {"kerbDx":-1.4,"kerbDy":0.8999999999999999,"sign":-1}
+PASS [gl2] r12-utm UTM move bar10 lands at expected world position {"n1":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"got":[540010,4699999.8,0.8],"want":[540010,4699999.8,0.8]}
+PASS [gl2] r12-utm UTM rebend bar5: mesh follows the drawn V {"n2":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 2."],"lo":[540004.99,4699998.198356,0.189862],"hi":[540005.01,4700001.801644,0.509864],"wantPts":[[540005,4700001.8,0.5],[540005,4700000,0.2],[540005,4699998.2,0.5]]}
+PASS [gl2] r12-utm UTM: clashes left 2 after both edits ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 2."]
+PASS [gl2] r12-utm no console errors []
+PASS [gl2] rebend-IFC2X3 4 clashes 4
+PASS [gl2] rebend-IFC2X3 EDIT_A polyline exported for bar5 (2 pts spanning the bar) [[0.2,0.5],[3.8,0.5]]
+PASS [gl2] rebend-IFC2X3 rebend applied, live mesh follows the V {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864],"want":[[1005,2001.8,0.5],[1005,2000,0.2],[1005,1998.2,0.5]]}
+PASS [gl2] rebend-IFC2X3 clashes left 3 ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."]
+PASS [gl2] rebend-IFC2X3 new Body representation uses the Body subcontext (not Axis) {"ctx":"8","body":8,"axis":7}
+PASS [gl2] rebend-IFC2X3 schema-specific entities for IFC2X3 {"sds":"#139,0.010000,$,0.,2.","list3d":false,"idx":false}
+PASS [gl2] rebend-IFC2X3 radius from the bar (0.01 m) "#139,0.010000,$,0.,2."
+PASS [gl2] rebend-IFC2X3 only the bar5 record changed; GlobalIds identical {"changed":[84]}
+PASS [gl2] rebend-IFC2X3 patched file re-read in Node: bar5 has a mesh with the V, others untouched, no diagnostics {"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864],"diag":[]}
+FAIL [gl2] rebend-IFC2X3 [observation] bar5 Axis representation kept after rebend {"pds":"#142=IFCPRODUCTDEFINITIONSHAPE($,$,(#141));"}
+PASS [gl2] rebend-IFC2X3 no console errors []
+PASS [gl2] rebend-IFC4 4 clashes 4
+PASS [gl2] rebend-IFC4 EDIT_A polyline exported for bar5 (2 pts spanning the bar) [[0.2,0.5],[3.8,0.5]]
+PASS [gl2] rebend-IFC4 rebend applied, live mesh follows the V {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864],"want":[[1005,2001.8,0.5],[1005,2000,0.2],[1005,1998.2,0.5]]}
+PASS [gl2] rebend-IFC4 clashes left 3 ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."]
+PASS [gl2] rebend-IFC4 new Body representation uses the Body subcontext (not Axis) {"ctx":"8","body":8,"axis":7}
+PASS [gl2] rebend-IFC4 schema-specific entities for IFC4 {"sds":"#137,0.010000,$,$,$","list3d":true,"idx":true}
+PASS [gl2] rebend-IFC4 radius from the bar (0.01 m) "#137,0.010000,$,$,$"
+PASS [gl2] rebend-IFC4 only the bar5 record changed; GlobalIds identical {"changed":[84]}
+PASS [gl2] rebend-IFC4 patched file re-read in Node: bar5 has a mesh with the V, others untouched, no diagnostics {"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864],"diag":[]}
+FAIL [gl2] rebend-IFC4 [observation] bar5 Axis representation kept after rebend {"pds":"#140=IFCPRODUCTDEFINITIONSHAPE($,$,(#139));"}
+PASS [gl2] rebend-IFC4 no console errors []
+PASS [gl2] rebend-IFC4X3_ADD2 4 clashes 4
+PASS [gl2] rebend-IFC4X3_ADD2 EDIT_A polyline exported for bar5 (2 pts spanning the bar) [[0.2,0.5],[3.8,0.5]]
+PASS [gl2] rebend-IFC4X3_ADD2 rebend applied, live mesh follows the V {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864],"want":[[1005,2001.8,0.5],[1005,2000,0.2],[1005,1998.2,0.5]]}
+PASS [gl2] rebend-IFC4X3_ADD2 clashes left 3 ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."]
+PASS [gl2] rebend-IFC4X3_ADD2 new Body representation uses the Body subcontext (not Axis) {"ctx":"8","body":8,"axis":7}
+PASS [gl2] rebend-IFC4X3_ADD2 schema-specific entities for IFC4X3_ADD2 {"sds":"#137,0.010000,$,$,$","list3d":true,"idx":true}
+PASS [gl2] rebend-IFC4X3_ADD2 radius from the bar (0.01 m) "#137,0.010000,$,$,$"
+PASS [gl2] rebend-IFC4X3_ADD2 only the bar5 record changed; GlobalIds identical {"changed":[84]}
+PASS [gl2] rebend-IFC4X3_ADD2 patched file re-read in Node: bar5 has a mesh with the V, others untouched, no diagnostics {"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864],"diag":[]}
+FAIL [gl2] rebend-IFC4X3_ADD2 [observation] bar5 Axis representation kept after rebend {"pds":"#140=IFCPRODUCTDEFINITIONSHAPE($,$,(#139));"}
+PASS [gl2] rebend-IFC4X3_ADD2 no console errors []
+PASS [gl2] placements mm model: 4 clashes 4
+PASS [gl2] placements bar10: sheet in metres for a mm file (kerb offsets) {"kerbDx":-1.4,"kerbDy":0.8999999999999999}
+PASS [gl2] placements mm bar10 (rotated parent) moved by the drawn vector {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"got":[1010,1999.8,0.8],"want":[1010,1999.8,0.8]}
+PASS [gl2] placements bar15: sheet in metres for a mm file (kerb offsets) {"kerbDx":-1.4,"kerbDy":0.8999999999999999}
+PASS [gl2] placements mm bar15 (rotated parent) moved by the drawn vector {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 2."],"got":[1015,2000.15,0.75],"want":[1015,2000.15,0.75]}
+PASS [gl2] placements mm patched file re-read in Node: both moves present {"c10":[1010,1999.8,0.8],"c15":[1015,2000.15,0.75]}
+PASS [gl2] placements grid IFC4X3_ADD2: 1 clash ["DuroPenetración: 25,8 mmGuardar BCFStirrup on grid (IfcReinforcingBar)grid_IFC4X3_ADD2.ifc · DeckTendon T1 (IfcTendon)grid_IFC4X3_ADD2.ifc · DeckVol.: 23,3 cm³"]
+PASS [gl2] placements IfcGridPlacement (IFC4X3_ADD2) moved by the drawn vector {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 0."],"got":[1008,1999.8,0.8],"want":[1008,1999.8,0.8],"ins":{"block":"GUBIM_A_68_0Grd11B0000000000000","x":2,"y":0.5,"layer":"CLASH_A"}}
+PASS [gl2] placements grid IFC4: 1 clash ["DuroPenetración: 25,8 mmGuardar BCFStirrup on grid (IfcReinforcingBar)grid_IFC4.ifc · DeckTendon T1 (IfcTendon)grid_IFC4.ifc · DeckVol.: 23,3 cm³"]
+PASS [gl2] placements IfcGridPlacement (IFC4) moved by the drawn vector {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 0."],"got":[1008,1999.8,0.8],"want":[1008,1999.8,0.8],"ins":{"block":"GUBIM_A_68_0Grd4B00000000000000","x":2,"y":0.5,"layer":"CLASH_A"}}
+PASS [gl2] placements linear: 2 clashes ["DuroPenetración: 25,8 mmGuardar BCFStirrup LP s=420 (IfcReinforcingBar)linear.ifcTendon LP arc (IfcTendon)linear.ifcVol.: 24,6 cm³","DuroPenetración: 25,8 mmGuardar BCFStirrup LP s=45 (IfcReinforcingBar)linear.ifcTendon LP (IfcTendon)linear.ifcVol.: 23,3 cm³"]
+PASS [gl2] placements IfcLinearPlacement lp45 moved by the drawn vector {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 1."],"got":[45,-0.2,0.8],"want":[45,-0.2,0.8],"section":"individual/PK_0+045.00_001.dxf"}
+PASS [gl2] placements IfcLinearPlacement lp420 moved by the drawn vector {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 0."],"got":[417.254492,26.381674,0.8],"want":[417.254492,26.381674,0.8],"section":"individual/PK_0+417.25_002.dxf"}
+PASS [gl2] placements no console errors []
+PASS [gl2] idempotence move +0.30 applied ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."]
+PASS [gl2] idempotence same DXF again: "ya aplicado", no change ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+FAIL [gl2] idempotence [ux] patched-IFC download still offered after a "ya aplicado" import {}
+PASS [gl2] idempotence further edit to +0.50: only +0.20 applied (total +0.50) {"n3":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"z":1}
+FAIL [gl2] idempotence edit reverted to the exported position: bar back at +0.00 {"n4":["notice: El archivo DXF no contiene desplazamientos (MOVE) ni cambios en polilíneas EDIT_A_* respecto al original."],"z":1}
+PASS [gl2] idempotence rebend V applied ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 2."]
+PASS [gl2] idempotence same rebend again: "ya aplicado" ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+FAIL [gl2] idempotence rebend reverted to the exported polyline: bar straight again {"n7":["notice: El archivo DXF no contiene desplazamientos (MOVE) ni cambios en polilíneas EDIT_A_* respecto al original."],"zlo":0.189862062449503}
+PASS [gl2] idempotence no console errors []
+(node:11856) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 exit listeners added to [process]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS [gl2] move-rebend one import of move+rebend: bar ends on the drawn V (not shifted twice) {"n":["notice: Parche STEP aplicado (2 elementos actualizados). Choques restantes: 3."],"lo":[1004.99,1998.198356,0.189862],"hi":[1005.01,2001.801644,0.509864]}
+PASS [gl2] move-rebend move+rebend with the V drawn at the moved place: bar on that V {"n2":["notice: Parche STEP aplicado (2 elementos actualizados). Choques restantes: 4."],"lo":[1004.99,1998.198356,0.489862],"hi":[1005.01,2001.801644,0.809864]}
+FAIL [gl2] move-rebend V then V+move (same final DXF) ends where the single import ends {"n1":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"n2":["notice: Parche STEP aplicado (1 elementos actualizados, 1 omitidos: 1 ya aplicado). Choques restantes: 4."],"lo":[1004.99,1998.198356,0.489862],"hi":[1005.01,2001.801644,0.809864],"singleLo":[1004.99,1998.198356,0.189862],"singleHi":[1005.01,2001.801644,0.509864]}
+PASS [gl2] move-rebend no console errors []
+PASS [gl2] legacy-v1 v1 META line is really clipped (>=255 chars before clipping) {"full":284,"lost":"x=-4700002.000000 ny=0.000000"}
+PASS [gl2] legacy-v1 v1: move applied, rebend refused with the re-export reason {"n":["notice: Parche STEP aplicado (1 elementos actualizados, 1 omitidos: 1 metadatos del DXF incompletos, vuelva a exportar el ZIP). Choques restantes: 3."],"c":[540010,4700000,0.7]}
+PASS [gl2] legacy-v1 v1 stale-session DXF: bridge moved by block-name GlobalId prefix, decoy untouched {"n2":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 4."],"decoy":[540010,4700000,0.5],"bridge":[540010,4700000,0.7]}
+PASS [gl2] legacy-v1 no console errors []
+PASS [gl2] guid-safety GlobalId of another model: refused "GlobalId distinto", nothing moves {"n":["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 GlobalId distinto)."],"bridge":[1010,2000,0.5],"decoy":[1010,2000,0.5]}
+PASS [gl2] guid-safety earlier-session DXF with the decoy as primary: bridge bar moved, decoy untouched {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 4."],"bridge":[1010,2000,0.8],"decoy":[1010,2000,0.5]}
+FAIL [gl2] guid-safety earlier-session DXF again: reported "ya aplicado" (decoy primary) ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 GlobalId distinto)."]
+PASS [gl2] guid-safety earlier-session DXF with only the decoy open: all refused, decoy untouched {"n":["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 GlobalId distinto)."]}
+PASS [gl2] guid-safety earlier-session DXF without any GlobalId: refused "sin GlobalId", decoy untouched {"n3":["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 sin GlobalId)."]}
+PASS [gl2] guid-safety no console errors []
+PASS [gl2] reasons-csv mixed import: 1 applied, NaN rebend skipped "geometría no válida" (Spanish) ["notice: Parche STEP aplicado (1 elementos actualizados, 1 omitidos: 1 geometría no válida). Choques restantes: 3."]
+PASS [gl2] reasons-csv CSV has status, reason, global_id; rows match {"hdr":"model_id,pk_m,kind,express_id,dx_mm,dy_mm,dz_mm,detail,status,reason,global_id","rows":["model-1795560544925-id9m,110.000,move,99,0.00,0.00,300.00,GUBIM_A_99_1RsnRevD000000000000,applied,,1RsnRevD00000000000000","model-1795560544925-id9m,110.000,rebend,99,0.00,0.00,0.00,3 vertices,skipped,invalid-points,1RsnRevD00000000000000"]}
+PASS [gl2] reasons-csv all-skipped import shows "No se aplicó ningún cambio ... GlobalId distinto" ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 GlobalId distinto)."]
+FAIL [gl2] reasons-csv [ux] CSV of the all-skipped import is downloadable {}
+PASS [gl2] reasons-csv unchanged DXF: "no contiene desplazamientos" ["notice: El archivo DXF no contiene desplazamientos (MOVE) ni cambios en polilíneas EDIT_A_* respecto al original."]
+PASS [gl2] reasons-csv no console errors []
+PASS [gl2] federated 8 clashes over both decks 8
+PASS [gl2] federated PK 0+105 holds both decks' bar5 (same expressId, two INSERTs) {"ins":[{"block":"GUBIM_A_84_1LftDeckC00000000000","x":8,"y":0.5,"layer":"CLASH_A"},{"block":"GUBIM_A_84_2RgtDeckC00000000000","x":2,"y":0.5,"layer":"CLASH_A"}],"orig":["GUBIM_ORIG id=84 guid=1LftDeckC0000000000000 block=GUBIM_A_84_1LftDeckC00000000000 x=8.000000 y=0.500000","GUBIM_ORIG id=84 guid=2RgtDeckC0000000000000 block=GUBIM_A_84_2RgtDeckC00000000000 x=2.000000 y=0.500000"]}
+PASS [gl2] federated [info] section metadata names one model {"modelInMeta":"model-1795560558574-xsu2","lid":"model-1795560558574-xsu2","rid":"model-1795560559673-hajf"}
+FAIL [gl2] federated (a) move of the left INSERT: applied to the left bar or skipped with a reason, never silently dropped, right untouched {"na":["notice: El archivo DXF no contiene desplazamientos (MOVE) ni cambios en polilíneas EDIT_A_* respecto al original."],"z":[0.5,0.5]}
+PASS [gl2] federated (b) move of the right INSERT: never lands on the left bar {"nb":["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 GlobalId distinto)."],"z":[0.5,0.5]}
+PASS [gl2] federated (c) left moved + right INSERT deleted: right bar not moved, left bar not moved by a bogus vector {"nc":["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 GlobalId distinto)."],"left":[1005,2000,0.5],"right":[1005,2006,0.5]}
+FAIL [gl2] federated (d) later session, DXF (c): right bar not moved by the left bar's edit {"nd":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 7."],"left":[1005,2000,0.5],"right":[1005,2000,0.8]}
+PASS [gl2] federated no console errors []
+PASS [gl2] cad-resave LF + padded group codes: move applied ["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."]
+PASS [gl2] cad-resave reversed entity order: same edit -> "ya aplicado" ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+PASS [gl2] cad-resave exponent number format: "ya aplicado" ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+PASS [gl2] cad-resave 999 comments stripped: "ya aplicado" ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+PASS [gl2] cad-resave geometry deleted + LWPOLYLINE: "ya aplicado", no rebend ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+FAIL [gl2] cad-resave unparseable INSERT x ("1,5"): refused, bar15 not moved sideways {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 2."],"c":[1015,2002,0.8]}
+FAIL [gl2] cad-resave copied INSERT (original left in place): bar5 not moved, or refused as ambiguous {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 1."],"c":[1005,1998,0.5]}
+FAIL [gl2] cad-resave zero-length edit polyline: refused, bar15 keeps a mesh {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 1."],"mesh":null}
+PASS [gl2] cad-resave no console errors []
+PASS [gl2] tendon-two-sections tendons vs bars: 4 clashes 4
+PASS [gl2] tendon-two-sections transverse tendon T2 has an EDIT_A polyline {"poly":[[0.2,0.3],[3.8,0.3]],"secs":["individual/PK_0+105.00_001.dxf","individual/PK_0+110.00_002.dxf","individual/PK_0+115.00_003.dxf","individual/PK_0+125.00_004.dxf"]}
+PASS [gl2] tendon-two-sections tendon rebend applied, radius 0.04 kept {"n":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 3."],"lo":[1024.96,1998.196678,0.260138],"hi":[1025.04,2001.803322,0.490139]}
+PASS [gl2] tendon-two-sections T1 appears as CLASH_A in 3 sections ["individual/PK_0+105.00_001.dxf","individual/PK_0+110.00_002.dxf","individual/PK_0+115.00_003.dxf"]
+PASS [gl2] tendon-two-sections [observation] T1 edited +0.10 in PK105 and +0.20 in PK110 {"n1":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 0."],"n2":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 1."],"z":0.8,"note":"conflicting edits of one element from two sections"}
+FAIL [gl2] tendon-two-sections two sections editing T1 differently: not silently summed (+0.30) {"z":0.8}
+PASS [gl2] tendon-two-sections no console errors []
+PASS [gl2] patched-fresh STEP diff: only bar5 and bar10 records changed (one attribute each), new ids appended {"changedIds":[84,99],"removedNonEntity":[]}
+PASS [gl2] patched-fresh reopened patched IFC: bar10 +0.30, bar5 bent {"c10":[1010,2000,0.8],"b5lo":[1004.99,1998.198356,0.189862]}
+PASS [gl2] patched-fresh reopened patched IFC: 2 clashes (bar15, L1) ["DuroPenetración: 25,8 mmGuardar BCFLongitudinal L1 (IfcReinforcingBar)reopen_patched.ifc · DeckTendon T2 transverse (IfcTendon)reopen_patched.ifc · DeckVol.: 23,3 cm³","DuroPenetración: 25,8 mmGuardar BCFStirrup x15 rotZ (IfcReinforcingBar)reopen_patched.ifc · DeckTendon T1 (IfcTendon)reopen_patched.ifc · DeckVol.: 23,3 cm³"]
+PASS [gl2] patched-fresh old DXF into the reopened patched file: "ya aplicado" ["error: No se aplicó ningún cambio del DXF: 1 omitidos (1 ya aplicado)."]
+PASS [gl2] patched-fresh new export from the patched file, bar15 moved: applied, 1 clash left {"n2":["notice: Parche STEP aplicado (1 elementos actualizados). Choques restantes: 1."],"c15":[1015,2000,0.8]}
+PASS [gl2] patched-fresh no console errors []
+
+=== gl2 summary
+PASS r12-utm (9/9, 11s)
+FAIL rebend-IFC2X3 (10/11, 12s)
+FAIL rebend-IFC4 (10/11, 12s)
+FAIL rebend-IFC4X3_ADD2 (10/11, 9s)
+PASS placements (14/14, 57s)
+FAIL idempotence (6/9, 15s)
+FAIL move-rebend (3/4, 41s)
+PASS legacy-v1 (4/4, 23s)
+FAIL guid-safety (5/6, 28s)
+FAIL reasons-csv (5/6, 14s)
+FAIL federated (6/8, 23s)
+FAIL cad-resave (6/9, 15s)
+FAIL tendon-two-sections (6/7, 14s)
+PASS patched-fresh (6/6, 23s)
+EXIT 1
