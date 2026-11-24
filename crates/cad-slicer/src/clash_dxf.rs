@@ -30,6 +30,10 @@ pub struct ClashBlockA {
     pub model_id: u32,
     pub express_id: u32,
     pub global_id: String,
+    /// Session id of the model the element belongs to (`GUBIM_ORIG model=`), so a section
+    /// holding elements of several federated models routes each edit to its own model. Empty
+    /// when unknown; the reader then falls back to the section's `GUBIM_META model=`.
+    pub owner: String,
     /// R12-safe block name (`<= 31` chars), e.g. `GUBIM_A_101_2O2Fr$t4X7Zf`.
     pub block_name: String,
     /// Insertion point in normalized `(0, 0)` sheet coordinates (metres).
@@ -187,6 +191,7 @@ pub fn build_clash_section_sheet(
             model_id: m_id,
             express_id,
             global_id,
+            owner: String::new(),
             block_name,
             insert_point,
             loops,
@@ -233,8 +238,10 @@ pub fn build_clash_section_sheet(
 /// Writes one normalized `(0, 0)` clash cross-section to valid DXF R12 bytes in metres.
 pub fn to_clash_dxf(sheet: &ClashSectionSheet) -> Vec<u8> {
     let mut out = DxfWriter::default();
-    let meta_line = format_meta_line(&sheet.meta);
-    out.text(999, &meta_line);
+    let meta_lines = format_meta_lines(&sheet.meta);
+    for line in &meta_lines {
+        out.text(999, line);
+    }
 
     let (ext_min, ext_max) = sheet_extents(sheet);
     out.header(ext_min, ext_max);
@@ -329,38 +336,82 @@ pub fn to_clash_dxf(sheet: &ClashSectionSheet) -> Vec<u8> {
 
     // Locked GUBIM_META text entities for CAD tools that strip 999 comments on save.
     let meta_b = dxf_bytes(&meta_layer, MAX_VALUE);
-    let mut meta_row = 1usize;
-    out.left_text(&meta_b, DVec2::new(0.0, -0.001 * meta_row as f64), 0.001, &meta_line);
-    for block in &sheet.blocks_a {
+    // Every value stays within the R12 255-character limit: long records are split into
+    // several entities that the reader joins again.
+    let mut meta_row = 0usize;
+    let mut meta_text = |out: &mut DxfWriter, line: &str| {
         meta_row += 1;
-        let orig_line = format!(
-            "GUBIM_ORIG id={} block={} x={:.6} y={:.6}",
-            block.express_id, block.block_name, block.insert_point.x, block.insert_point.y
-        );
-        out.left_text(
-            &meta_b,
-            DVec2::new(0.0, -0.001 * meta_row as f64),
-            0.001,
-            &orig_line,
-        );
+        out.left_text(&meta_b, DVec2::new(0.0, -0.001 * meta_row as f64), 0.001, line);
+    };
+    for line in &meta_lines {
+        meta_text(&mut out, line);
+    }
+    for (block, edit_layer) in sheet.blocks_a.iter().zip(&edit_layers) {
+        // Each record names its block (unique in the file) and its edit layer, so the reader
+        // pairs an INSERT or an edit polyline with its own element even when two federated
+        // models share an expressId.
+        let mut tokens = vec![format!("id={}", block.express_id)];
+        let guid = meta_token(&block.global_id);
+        if !guid.is_empty() {
+            tokens.push(format!("guid={guid}"));
+        }
+        tokens.push(format!("block={}", block.block_name));
+        if let Some(layer) = edit_layer {
+            tokens.push(format!("layer={layer}"));
+        }
+        tokens.push(format!("x={:.6}", block.insert_point.x));
+        tokens.push(format!("y={:.6}", block.insert_point.y));
+        let owner = meta_token(&block.owner);
+        if !owner.is_empty() {
+            let owner_token = format!("model={owner}");
+            let len: usize = "GUBIM_ORIG".len() + tokens.iter().map(|t| t.len() + 1).sum::<usize>();
+            if len + 1 + owner_token.len() <= META_LINE_BUDGET {
+                tokens.insert(1, owner_token);
+            }
+        }
+        let orig_line = format!("GUBIM_ORIG {}", tokens.join(" "));
+        meta_text(&mut out, &orig_line);
         if block.edit_polyline.len() >= 2 {
-            meta_row += 1;
-            let pts_str: String = block
+            let points: Vec<String> = block
                 .edit_polyline
                 .iter()
                 .map(|p| {
                     let pt = *p + block.insert_point;
                     format!("{:.6},{:.6}", pt.x, pt.y)
                 })
-                .collect::<Vec<_>>()
-                .join(";");
-            let poly_line = format!("GUBIM_POLY id={} pts={pts_str}", block.express_id);
-            out.left_text(
-                &meta_b,
-                DVec2::new(0.0, -0.001 * meta_row as f64),
-                0.001,
-                &poly_line,
-            );
+                .collect();
+            let mut part = 0usize;
+            let mut current: Vec<&str> = Vec::new();
+            let prefix_len = format!(
+                "GUBIM_POLY id={} block={} part=9999 pts=",
+                block.express_id, block.block_name
+            )
+            .len();
+            let mut flush = |out: &mut DxfWriter, current: &mut Vec<&str>, part: &mut usize| {
+                if current.is_empty() {
+                    return;
+                }
+                let line = format!(
+                    "GUBIM_POLY id={} block={} part={} pts={}",
+                    block.express_id,
+                    block.block_name,
+                    part,
+                    current.join(";")
+                );
+                meta_text(out, &line);
+                *part += 1;
+                current.clear();
+            };
+            let mut len = prefix_len;
+            for p in &points {
+                if !current.is_empty() && len + 1 + p.len() > META_LINE_BUDGET {
+                    flush(&mut out, &mut current, &mut part);
+                    len = prefix_len;
+                }
+                len += p.len() + 1;
+                current.push(p);
+            }
+            flush(&mut out, &mut current, &mut part);
         }
     }
 
@@ -607,28 +658,57 @@ fn make_block_name(express_id: u32, global_id: &str, used: &mut BTreeSet<String>
     clean_r12_name(&raw, used)
 }
 
-fn format_meta_line(meta: &ClashDxfMeta) -> String {
-    format!(
-        "GUBIM_META v=1 model={} pk={:.6} sMin={:.6} sMax={:.6} ox={:.6} oy={:.6} oz={:.6} rx={:.6} ry={:.6} rz={:.6} ux={:.6} uy={:.6} uz={:.6} lx={:.6} ly={:.6} lz={:.6} nx={:.6} ny={:.6}",
-        meta.model_id,
-        meta.pk_m,
-        meta.s_min,
-        meta.s_max,
-        meta.frame.origin.x,
-        meta.frame.origin.y,
-        meta.frame.origin.z,
-        meta.frame.right.x,
-        meta.frame.right.y,
-        meta.frame.right.z,
-        meta.frame.up.x,
-        meta.frame.up.y,
-        meta.frame.up.z,
-        meta.frame.look.x,
-        meta.frame.look.y,
-        meta.frame.look.z,
-        meta.norm_offset.x,
-        meta.norm_offset.y,
-    )
+/// Longest metadata value written, safely under the DXF R12 limit of 255 characters.
+const META_LINE_BUDGET: usize = 240;
+
+/// A metadata value without whitespace or `=`, so `key=value` tokens split back cleanly.
+fn meta_token(raw: &str) -> String {
+    raw.chars()
+        .take(120)
+        .map(|c| if c.is_ascii_graphic() && c != '=' { c } else { '_' })
+        .collect()
+}
+
+/// `GUBIM_META v=2 ...` records, each at most [`META_LINE_BUDGET`] characters. The reader merges
+/// the `key=value` tokens of every `GUBIM_META` record in the file.
+fn format_meta_lines(meta: &ClashDxfMeta) -> Vec<String> {
+    let f = &meta.frame;
+    let mut tokens = vec![
+        "v=2".to_string(),
+        format!("model={}", meta_token(&meta.model_id)),
+        format!("pk={:.6}", meta.pk_m),
+        format!("sMin={:.6}", meta.s_min),
+        format!("sMax={:.6}", meta.s_max),
+    ];
+    for (key, value) in [
+        ("ox", f.origin.x),
+        ("oy", f.origin.y),
+        ("oz", f.origin.z),
+        ("rx", f.right.x),
+        ("ry", f.right.y),
+        ("rz", f.right.z),
+        ("ux", f.up.x),
+        ("uy", f.up.y),
+        ("uz", f.up.z),
+        ("lx", f.look.x),
+        ("ly", f.look.y),
+        ("lz", f.look.z),
+        ("nx", meta.norm_offset.x),
+        ("ny", meta.norm_offset.y),
+    ] {
+        tokens.push(format!("{key}={value:.6}"));
+    }
+    let mut lines = Vec::new();
+    let mut line = String::from("GUBIM_META");
+    for token in tokens {
+        if line.len() + 1 + token.len() > META_LINE_BUDGET && line != "GUBIM_META" {
+            lines.push(std::mem::replace(&mut line, String::from("GUBIM_META")));
+        }
+        line.push(' ');
+        line.push_str(&token);
+    }
+    lines.push(line);
+    lines
 }
 
 fn sheet_extents(sheet: &ClashSectionSheet) -> (DVec2, DVec2) {

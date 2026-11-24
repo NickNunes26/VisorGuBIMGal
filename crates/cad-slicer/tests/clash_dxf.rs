@@ -94,7 +94,9 @@ fn clash_dxf_normalizes_to_origin_in_metres_and_writes_layers_blocks_and_metadat
     assert!(text.contains("$ACADVER\r\n1\r\nAC1009\r\n"));
     assert!(text.contains("$INSUNITS\r\n70\r\n6\r\n"));
     assert!(text.contains("$EXTMIN\r\n10\r\n0.000000\r\n20\r\n0.000000\r\n"));
-    assert!(text.contains("999\r\nGUBIM_META v=1 model=bridge-model pk=124.500000"));
+    assert!(text.contains("999\r\nGUBIM_META v=2 model=bridge-model pk=124.500000"));
+    // Every value fits the DXF R12 limit of 255 characters (metadata split over records).
+    assert!(text.split("\r\n").all(|line| line.len() <= 255));
     assert!(text.contains("CLASH_A"));
     assert!(text.contains("CLASH_B"));
     assert!(text.contains("CLASH_MARKER"));

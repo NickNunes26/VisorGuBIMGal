@@ -74,6 +74,8 @@ export type WorkerRequest =
       clashAModelIndices: Uint32Array;
       clashAIds: Uint32Array;
       clashAGuids: string[];
+      /** Session model id of each Element A, written per element for routing re-imports. */
+      clashAOwners: string[];
       clashBModelIndices: Uint32Array;
       clashBIds: Uint32Array;
       clashPointsFlat: Float64Array;
@@ -86,7 +88,15 @@ export type WorkerRequest =
       annotations: string[];
     }
   | { op: 'clash-batch-merge'; columns: number; marginM: number }
-  | { op: 'clash-roundtrip-apply'; dxfBytes: Uint8Array }
+  | {
+      op: 'clash-roundtrip-apply';
+      dxfBytes: Uint8Array;
+      /** This worker's model id, and every open model's: see `applyClashDxf` in wasm-api. */
+      selfModelId: string;
+      openModelIds: string[];
+      /** Edit indices already applied to another model in this import. */
+      exclude: Uint32Array;
+    }
   | {
       op: 'clash-element-slab';
       expressId: number;

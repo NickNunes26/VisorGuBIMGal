@@ -217,6 +217,7 @@ await test('packages individual DXFs, clashes_all.dxf master grid, and summary.c
               new Uint32Array(s.clashAIds.map(() => 0)),
               new Uint32Array(s.clashAIds),
               [...s.clashAGuids],
+              s.clashAIds.map(() => s.modelId),
               new Uint32Array(s.clashBIds.map(() => 0)),
               new Uint32Array(s.clashBIds),
               pts,
@@ -371,6 +372,7 @@ await test('F5 round-trip: Model.applyClashDxf patches STEP on Level 1 MOVE and 
       new Uint32Array([0]),
       new Uint32Array([100]),
       ['2O2Fr$t4X7Zf8NOew3FLOH'],
+      ['bridge-m1'],
       new Uint32Array([0]),
       new Uint32Array([200]),
       new Float64Array([1.0, 0.025, 0.025]),
@@ -390,7 +392,7 @@ await test('F5 round-trip: Model.applyClashDxf patches STEP on Level 1 MOVE and 
     assert.ok(dxfText.includes('EDIT_A_100'), 'exported DXF must include EDIT_A_100 layer');
 
     // 3. Level 1 MOVE edit in DXF: shift INSERT GUBIM_A_100 by (+0.05, +0.03) m
-    const origMatch = /GUBIM_ORIG id=100 block=([^\s]+) x=([0-9.-]+) y=([0-9.-]+)/.exec(dxfText);
+    const origMatch = /GUBIM_ORIG id=100 (?:model=\S+ )?(?:guid=\S+ )?block=([^\s]+) (?:layer=\S+ )?x=([0-9.-]+) y=([0-9.-]+)/.exec(dxfText);
     assert.ok(origMatch, 'DXF must contain GUBIM_ORIG for #100');
     const [, blockName, origXStr, origYStr] = origMatch;
     const movedX = (Number(origXStr) + 0.05).toFixed(6);
@@ -399,7 +401,7 @@ await test('F5 round-trip: Model.applyClashDxf patches STEP on Level 1 MOVE and 
     const replacement = `0\r\nINSERT\r\n8\r\nCLASH_A\r\n2\r\n${blockName}\r\n10\r\n${movedX}\r\n20\r\n${movedY}\r\n`;
     const movedDxfBytes = encoder.encode(dxfText.replace(needle, replacement));
 
-    const rtOut = model.applyClashDxf(movedDxfBytes);
+    const rtOut = model.applyClashDxf(movedDxfBytes, 'bridge-m1', ['bridge-m1'], new Uint32Array());
     const patchedIfcBytes = rtOut.patchedIfcBytes();
     const diff = JSON.parse(rtOut.diffJson());
     rtOut.free();
@@ -585,6 +587,7 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
                 request.clashAModelIndices,
                 request.clashAIds,
                 request.clashAGuids,
+                request.clashAOwners,
                 request.clashBModelIndices,
                 request.clashBIds,
                 request.clashPointsFlat,
@@ -613,7 +616,12 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
               break;
             }
             case 'clash-roundtrip-apply': {
-              const out = this.model.applyClashDxf(request.dxfBytes);
+              const out = this.model.applyClashDxf(
+                request.dxfBytes,
+                request.selfModelId,
+                request.openModelIds,
+                request.exclude
+              );
               try {
                 value = {
                   patchedIfcBytes: out.patchedIfcBytes(),
@@ -730,7 +738,7 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
 
     // Edit INSERT in exported DXF and round-trip through adapter.applyClashDxfRoundTrip!
     const dxfText = new TextDecoder('utf-8').decode(batch.sections[0].dxfBytes);
-    const origMatch = /GUBIM_ORIG id=100 block=([^\s]+) x=([0-9.-]+) y=([0-9.-]+)/.exec(dxfText);
+    const origMatch = /GUBIM_ORIG id=100 (?:model=\S+ )?(?:guid=\S+ )?block=([^\s]+) (?:layer=\S+ )?x=([0-9.-]+) y=([0-9.-]+)/.exec(dxfText);
     assert.ok(origMatch);
     const [, blockName, origXStr, origYStr] = origMatch;
     const movedX = (Number(origXStr) + 0.05).toFixed(6);

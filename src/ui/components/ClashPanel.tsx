@@ -28,7 +28,8 @@ import {
   type ClashDisplayEntry,
   type ClashPresetId
 } from '../viewer/clashDetector';
-import { formatNumber, t } from '../i18n';
+import { formatNumber, t, type I18nKey } from '../i18n';
+import { skippedReasons } from '../viewer/clashRoundTrip';
 
 interface ClashPanelProps {
   models: ModelRecord[];
@@ -76,6 +77,37 @@ async function saveOutputWithFallback(
 }
 
 const MAX_DISPLAY_ROWS = 200;
+
+const SKIP_REASONS = new Set([
+  'guid-mismatch',
+  'guid-missing',
+  'not-found',
+  'not-a-product',
+  'unsupported-placement',
+  'no-representation-context',
+  'invalid-points',
+  'invalid-radius',
+  'duplicate-edit',
+  'already-applied',
+  'metadata-incomplete',
+  'invalid-number',
+  'unsupported-transform',
+  'duplicate-insert',
+  'duplicate-polyline',
+  'ambiguous-element',
+  'out-of-range',
+  'other-model'
+]);
+
+/** «2 GlobalId distinto, 1 ya aplicado» from the skipped edits of a round trip. */
+function describeSkippedReasons(edits: Parameters<typeof skippedReasons>[0]): string {
+  return Object.entries(skippedReasons(edits))
+    .map(([reason, count]) => {
+      const code = SKIP_REASONS.has(reason) ? reason : 'unknown';
+      return `${count} ${t(`clash.roundTripReasons.${code}` as I18nKey)}`;
+    })
+    .join(', ');
+}
 const PRESET_PIPES_SENTINEL = '__preset_pipes__';
 const PRESET_STRUCTURE_SENTINEL = '__preset_structure__';
 
@@ -371,21 +403,39 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
     try {
       const dxfBytes = new Uint8Array(await file.arrayBuffer());
       const rtResult = await kernel.applyClashDxfRoundTrip(primaryModel.id, dxfBytes);
-      if (rtResult.applied === 0 || rtResult.edits.length === 0) {
-        setRoundTripResult(null);
+      const reasons = describeSkippedReasons(rtResult.edits);
+      if (rtResult.edits.length === 0) {
         setExportStatus(t('clash.roundTripNoEdits'));
         return;
       }
-      setRoundTripResult(rtResult);
+      const patchedNow =
+        rtResult.patchedModels ??
+        (rtResult.applied > 0
+          ? [{ modelId: rtResult.modelId, patchedIfcBytes: rtResult.patchedIfcBytes, applied: rtResult.applied }]
+          : []);
+      // The change log stays downloadable after an import that applied nothing, and so does a
+      // model an earlier import patched: what is in memory is still that patched file.
+      setRoundTripResult((prev) => {
+        const byModel = new Map((prev?.patchedModels ?? []).map((m) => [m.modelId, m]));
+        for (const m of patchedNow) byModel.set(m.modelId, m);
+        return { ...rtResult, patchedModels: [...byModel.values()] };
+      });
+      if (rtResult.applied === 0) {
+        setExportStatus(null);
+        setExportError(t('clash.roundTripAllSkipped', { skipped: rtResult.skipped, reasons }));
+        return;
+      }
 
       let nextModels = readyModels;
       let nextTrees = spatialTrees;
       if (onReloadPatchedModel) {
-        const reloaded = await onReloadPatchedModel(rtResult.modelId, rtResult.patchedIfcBytes);
-        if (reloaded) {
-          nextModels = readyModels.map((m) => (m.id === reloaded.model.id ? reloaded.model : m));
-          if (reloaded.tree) {
-            nextTrees = { ...spatialTrees, [reloaded.model.id]: reloaded.tree };
+        for (const patched of patchedNow) {
+          const reloaded = await onReloadPatchedModel(patched.modelId, patched.patchedIfcBytes);
+          if (reloaded) {
+            nextModels = nextModels.map((m) => (m.id === reloaded.model.id ? reloaded.model : m));
+            if (reloaded.tree) {
+              nextTrees = { ...nextTrees, [reloaded.model.id]: reloaded.tree };
+            }
           }
         }
       }
@@ -393,10 +443,17 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
       const newEntries = await executeClashDetection(nextModels, nextTrees);
       const remaining = newEntries ? newEntries.length : entries.length;
       setExportStatus(
-        t('clash.roundTripDoneStatus', {
-          applied: rtResult.applied,
-          remaining
-        })
+        rtResult.skipped > 0
+          ? t('clash.roundTripDoneWithSkipped', {
+              applied: rtResult.applied,
+              skipped: rtResult.skipped,
+              reasons,
+              remaining
+            })
+          : t('clash.roundTripDoneStatus', {
+              applied: rtResult.applied,
+              remaining
+            })
       );
     } catch (err) {
       setExportStatus(null);
@@ -408,16 +465,18 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
 
   const handleDownloadPatchedIfc = async () => {
     if (!roundTripResult) return;
-    const targetModel = readyModels.find((m) => m.id === roundTripResult.modelId) ?? primaryModel;
-    const origName = targetModel?.fileName ?? 'model.ifc';
-    const patchedName = origName.replace(/\.ifc$/i, '') + '_patched.ifc';
-    await saveOutputWithFallback(filePort, {
-      defaultName: patchedName,
-      content: roundTripResult.patchedIfcBytes,
-      mimeType: 'application/x-step',
-      filterName: 'IFC',
-      extensions: ['ifc']
-    });
+    for (const patched of roundTripResult.patchedModels ?? []) {
+      const targetModel = readyModels.find((m) => m.id === patched.modelId);
+      const origName = targetModel?.fileName ?? 'model.ifc';
+      const patchedName = origName.replace(/\.ifc$/i, '') + '_patched.ifc';
+      await saveOutputWithFallback(filePort, {
+        defaultName: patchedName,
+        content: patched.patchedIfcBytes,
+        mimeType: 'application/x-step',
+        filterName: 'IFC',
+        extensions: ['ifc']
+      });
+    }
   };
 
   const handleDownloadRoundTripCsv = async () => {
@@ -803,15 +862,17 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
               {exportStatus && <div className="clash-notice">{exportStatus}</div>}
               {roundTripResult && (
                 <div className="clash-alignment-actions" data-testid="clash-roundtrip-downloads">
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-xs"
-                    onClick={() => void handleDownloadPatchedIfc()}
-                    title={t('clash.downloadPatchedIfcTitle')}
-                  >
-                    <Download size={12} />
-                    <span>{t('clash.downloadPatchedIfcBtn')}</span>
-                  </button>
+                  {(roundTripResult.patchedModels?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-xs"
+                      onClick={() => void handleDownloadPatchedIfc()}
+                      title={t('clash.downloadPatchedIfcTitle')}
+                    >
+                      <Download size={12} />
+                      <span>{t('clash.downloadPatchedIfcBtn')}</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn btn-secondary btn-xs"

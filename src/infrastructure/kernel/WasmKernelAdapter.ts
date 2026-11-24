@@ -3,6 +3,7 @@ import type {
   ClashAlignmentDxfBatch,
   ClashAlignmentDxfRequest,
   ClashAlignmentDxfSectionOutput,
+  ClashDxfEditItem,
   ClashDxfRoundTripResult,
   ClashReport,
   ClashRequest,
@@ -921,6 +922,7 @@ export class WasmKernelAdapter implements KernelPort {
             clashAModelIndices,
             clashAIds,
             clashAGuids: [...sec.clashAGuids],
+            clashAOwners: sec.clashAIds.map((_, idx) => sec.clashAModelIds?.[idx] ?? sec.modelId),
             clashBModelIndices,
             clashBIds,
             clashPointsFlat,
@@ -977,30 +979,81 @@ export class WasmKernelAdapter implements KernelPort {
     modelId: ModelId,
     dxfBytes: Uint8Array
   ): Promise<ClashDxfRoundTripResult> {
+    // The DXF goes to every open model. Each model takes only its own edits: an element
+    // exported from an open model goes back to that model, and one exported in an earlier
+    // session (model ids are per session) only to the product carrying its GlobalId. The
+    // model the section names goes first, and an edit applied there is excluded elsewhere.
+    const open = [...this.workers.keys()];
+    if (open.length === 0) {
+      throw new KernelError('model-not-open', `El modelo ${modelId} no está abierto.`);
+    }
     const metaModelId = extractMetaModelIdFromDxf(dxfBytes);
-    const targetModelId =
-      metaModelId && this.workers.has(metaModelId) ? metaModelId : modelId;
-    const worker = this.workerOf(targetModelId);
-    const payload = new Uint8Array(dxfBytes);
-    const res = await worker.call<{
-      patchedIfcBytes: Uint8Array;
-      diffJson: string;
-    }>({ op: 'clash-roundtrip-apply', dxfBytes: payload }, [payload.buffer as ArrayBuffer]);
+    const first =
+      metaModelId !== null && this.workers.has(metaModelId)
+        ? metaModelId
+        : this.workers.has(modelId)
+          ? modelId
+          : open[0];
+    const order = [first, ...open.filter((id) => id !== first)];
 
-    const parsed = JSON.parse(res.diffJson) as DxfRoundTripDiffResult;
-    const resolvedDiff: DxfRoundTripDiffResult = {
-      ...parsed,
-      modelId: targetModelId
-    };
+    type Parsed = DxfRoundTripDiffResult & { metadataComplete?: boolean };
+    const appliedIndices = new Set<number>();
+    const best = new Map<number, { edit: ClashDxfEditItem; rank: number }>();
+    const patchedModels: { modelId: ModelId; patchedIfcBytes: Uint8Array; applied: number }[] = [];
+    let head: Parsed | null = null;
+    let firstBytes: Uint8Array | null = null;
+    for (const target of order) {
+      const worker = this.workerOf(target);
+      const payload = new Uint8Array(dxfBytes);
+      const exclude = Uint32Array.from(appliedIndices);
+      const res = await worker.call<{ patchedIfcBytes: Uint8Array; diffJson: string }>(
+        {
+          op: 'clash-roundtrip-apply',
+          dxfBytes: payload,
+          selfModelId: target,
+          openModelIds: open,
+          exclude
+        },
+        [payload.buffer as ArrayBuffer, exclude.buffer as ArrayBuffer]
+      );
+      const parsed = JSON.parse(res.diffJson) as Parsed;
+      head ??= parsed;
+      firstBytes ??= res.patchedIfcBytes;
+      let appliedHere = 0;
+      parsed.edits.forEach((edit, position) => {
+        const index = typeof edit.index === 'number' ? edit.index : position;
+        if (edit.status === 'applied') {
+          appliedIndices.add(index);
+          appliedHere++;
+        }
+        const rank = roundTripOutcomeRank(edit);
+        const prev = best.get(index);
+        if (!prev || rank < prev.rank) best.set(index, { edit: { ...edit, modelId: target }, rank });
+      });
+      if (appliedHere > 0) {
+        patchedModels.push({ modelId: target, patchedIfcBytes: res.patchedIfcBytes, applied: appliedHere });
+      }
+    }
+    if (!head) throw new KernelError('model-not-open', `El modelo ${modelId} no está abierto.`);
+
+    const edits = [...best.entries()].sort((x, y) => x[0] - y[0]).map(([, v]) => v.edit);
+    const applied = edits.filter((e) => e.status === 'applied').length;
+    const skipped = edits.length - applied;
+    const primary = patchedModels[0];
+    const targetModelId = primary?.modelId ?? first;
+    const pkM = typeof head.pkM === 'number' ? head.pkM : Number.NaN;
+    const resolvedDiff: DxfRoundTripDiffResult = { ...head, pkM, modelId: targetModelId, edits };
     const auditCsv = buildRoundTripAuditCsv(resolvedDiff);
     return {
       modelId: targetModelId,
-      pkM: parsed.pkM,
-      applied: parsed.applied ?? parsed.edits.length,
-      skipped: parsed.skipped ?? 0,
-      edits: parsed.edits,
-      patchedIfcBytes: res.patchedIfcBytes,
-      auditCsv
+      pkM,
+      applied,
+      skipped,
+      edits,
+      patchedIfcBytes: primary?.patchedIfcBytes ?? firstBytes ?? new Uint8Array(),
+      auditCsv,
+      metadataComplete: head.metadataComplete,
+      patchedModels
     };
   }
 
@@ -1045,5 +1098,30 @@ export class WasmKernelAdapter implements KernelPort {
       if (isClosed(err)) return null;
       throw err;
     }
+  }
+}
+
+/**
+ * Which model's answer to report for an edit no model applied: an applied edit first, then a
+ * reason given by the model the edit belongs to (`already-applied`, `invalid-points`, ...),
+ * then GlobalId and lookup misses, then models that were never meant to take it.
+ */
+function roundTripOutcomeRank(edit: ClashDxfEditItem): number {
+  if (edit.status === 'applied') return 0;
+  switch (edit.reason) {
+    case 'guid-mismatch':
+    case 'guid-missing':
+      return 2;
+    case 'not-found':
+    case 'not-a-product':
+      return 3;
+    case 'other-model':
+      return 4;
+    case null:
+    case undefined:
+    case 'internal':
+      return 5;
+    default:
+      return 1;
   }
 }

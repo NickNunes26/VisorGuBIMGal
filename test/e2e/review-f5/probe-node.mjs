@@ -18,7 +18,11 @@ function apply(label, dxf, requireGuid = false) {
   const model = nodeModel(ifc);
   let res;
   try {
-    res = model.applyClashDxf(new TextEncoder().encode(dxf), requireGuid);
+    // requireGuid=false: apply as the model the DXF was exported from; true: as an unrelated
+    // open model, so only GlobalId matches land.
+    const owner = /GUBIM_(?:ORIG|META) [^\r\n]*?\bmodel=(\S+)/.exec(dxf)?.[1] ?? '';
+    const self = requireGuid ? '__probe_other__' : owner;
+    res = model.applyClashDxf(new TextEncoder().encode(dxf), self, [self], new Uint32Array());
   } catch (e) {
     out.push({ label, error: String(e) });
     console.log(label, 'ERROR', String(e));

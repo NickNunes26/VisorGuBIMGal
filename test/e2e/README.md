@@ -35,6 +35,7 @@ Needs Google Chrome and Node 22 or later (global `WebSocket`).
   - Screenshots of the 3D view and the plan preview, with overlays hidden, against `ref/<platform>-<mode>/`. More than 0.5 % of pixels off by more than 24 fails. A 3° change of the default iso angle fails at 1.9 %.
 - `e2e.mjs`: T-135 navigation, T-136 BCF, T-137 face cut.
 - `glb-check.mjs`: T-138 GLB export, read back with its own parser.
+- `f5-check.mjs`: F1–F5 (`docs/12`). Clash sections along a LandXML axis, the DXF ZIP, and the DXF → IFC round trip on a generated bridge with a decoy copy: every DXF value fits R12, a re-import is idempotent, a DXF from an earlier session never patches another model, and the downloaded IFC is checked by the kernel in Node.
 - `smoke.mjs`: the production build (`vite preview`) loads a sample: `node test/e2e/smoke.mjs gpu "http://127.0.0.1:4173/VisorGuBIMGal/?model=/VisorGuBIMGal/samples/ManySimpleWalls.ifc" "$TEMP/gubim-e2e"`.
 
 ## CI

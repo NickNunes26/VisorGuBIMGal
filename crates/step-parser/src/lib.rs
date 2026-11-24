@@ -12,7 +12,10 @@ mod index;
 mod parser;
 pub mod patch;
 
-pub use patch::{StepPatch, StepPatchReport, patch_step_file};
+pub use patch::{
+    PatchOptions, PatchOutcome, PlacementTransform, StepPatch, StepPatchReport, find_patch_notes,
+    patch_step_file, patch_step_file_with,
+};
 
 use std::collections::HashMap;
 use std::fmt;

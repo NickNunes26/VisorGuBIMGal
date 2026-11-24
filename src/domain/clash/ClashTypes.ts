@@ -114,8 +114,28 @@ export interface ClashAlignmentDxfBatch {
   masterDxfBytes?: Uint8Array;
 }
 
+/**
+ * What happened to one DXF edit. `skipped` reasons: `guid-mismatch`, `guid-missing`,
+ * `not-found`, `not-a-product`, `unsupported-placement`, `no-representation-context`,
+ * `invalid-points`, `invalid-radius`, `duplicate-edit`, `already-applied`, `metadata-incomplete`,
+ * `invalid-number`, `unsupported-transform`, `duplicate-insert`, `duplicate-polyline`,
+ * `ambiguous-element`, `out-of-range`, `other-model`.
+ */
+export interface ClashDxfEditStatus {
+  status?: 'applied' | 'skipped' | 'detected';
+  reason?: string | null;
+  /** `GlobalId` (or its truncated block-name prefix) the edit was checked against. */
+  globalId?: string | null;
+  /** Position in the DXF's edit list, the same for every model the DXF is applied to. */
+  index?: number;
+  /** Session id of the model the element was exported from, when the DXF records it. */
+  owner?: string | null;
+  /** Model the edit was applied to (or, when skipped, the model whose answer is reported). */
+  modelId?: string;
+}
+
 /** Level 1 CAD MOVE edit detected on an exported `INSERT` (`GUBIM_A_<expressId>_<GlobalId>`). */
-export interface ClashDxfMoveEdit {
+export interface ClashDxfMoveEdit extends ClashDxfEditStatus {
   kind: 'move';
   expressId: number;
   blockName: string;
@@ -124,7 +144,7 @@ export interface ClashDxfMoveEdit {
 }
 
 /** Level 2 CAD polyline edit detected on an `EDIT_A_<expressId>` centerline layer. */
-export interface ClashDxfRebendEdit {
+export interface ClashDxfRebendEdit extends ClashDxfEditStatus {
   kind: 'rebend';
   expressId: number;
   points3d: [number, number, number][];
@@ -135,10 +155,18 @@ export type ClashDxfEditItem = ClashDxfMoveEdit | ClashDxfRebendEdit;
 /** Result of applying an edited clash DXF to an open IFC model's STEP file (F5). */
 export interface ClashDxfRoundTripResult {
   modelId: ModelId;
+  /** `NaN` when the DXF metadata lost it (files exported before the 2026-11-24 fix). */
   pkM: number;
   applied: number;
   skipped: number;
   edits: ClashDxfEditItem[];
   patchedIfcBytes: Uint8Array;
   auditCsv: string;
+  /** False for DXFs whose metadata was clipped on export: moves work, rebends are skipped. */
+  metadataComplete?: boolean;
+  /**
+   * Every model this import patched (a section can hold elements of several federated
+   * models). `modelId` / `patchedIfcBytes` above repeat the first of them.
+   */
+  patchedModels?: { modelId: ModelId; patchedIfcBytes: Uint8Array; applied: number }[];
 }

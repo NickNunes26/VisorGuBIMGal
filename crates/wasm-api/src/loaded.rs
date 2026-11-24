@@ -117,11 +117,17 @@ impl LoadedModel {
     }
 
     /// Parses an edited clash DXF and surgically patches this model's STEP bytes (F5, Level 1 + Level 2).
-    pub fn apply_clash_dxf(&self, dxf_bytes: &[u8]) -> Result<(Vec<u8>, String), String> {
-        crate::clash_dxf::apply_clash_dxf_to_step(
+    /// `scope` decides which of the DXF's edits belong to this model.
+    pub fn apply_clash_dxf(
+        &self,
+        dxf_bytes: &[u8],
+        scope: &crate::clash_dxf::ApplyScope,
+    ) -> Result<(Vec<u8>, String), String> {
+        crate::clash_dxf::apply_clash_dxf_to_step_scoped(
             self.raw_bytes(),
             self.length_unit_scale(),
             dxf_bytes,
+            scope,
         )
     }
 

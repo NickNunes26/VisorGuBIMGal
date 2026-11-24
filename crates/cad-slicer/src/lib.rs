@@ -26,7 +26,9 @@ pub use dimension::OverallDimensions;
 pub use dxf::{DxfOptions, to_dxf, to_dxf_with};
 pub use geom::{Loop, Segment};
 pub use hatch::HatchStyle;
-pub use roundtrip::{DxfRoundTripDiff, DxfRoundTripEdit, ParsedClashMeta, parse_clash_dxf_edits};
+pub use roundtrip::{
+    DxfRoundTripDiff, DxfRoundTripEdit, ParsedClashMeta, RejectedDxfEdit, parse_clash_dxf_edits,
+};
 pub use space::{AreaSource, SpaceInput, SpaceLabel};
 pub use svg::{SvgOptions, to_svg, to_svg_with};
 

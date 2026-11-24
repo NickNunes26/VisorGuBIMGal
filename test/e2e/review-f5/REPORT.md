@@ -146,3 +146,28 @@ Out of scope: a CR-only (classic Mac) DXF fails with «DXF does not contain GUBI
 | `probe-models.mjs` | Checks that the generated models load with the intended bounding boxes |
 
 The scripts are not wired into `test/e2e/run.mjs`. Some scenarios fail on purpose until F1–F10 are fixed.
+
+## Status after the fixes (2026-11-25)
+
+Rerun of `scenarios.mjs` on `gpu`, `gl2` and `none` against the fixed tree: **111/115 checks pass on each renderer**, with a clean console everywhere. The 4 that still fail are the open decisions below (F11 three times, once per schema; F7 once).
+
+| Finding | Status | Fix |
+|---|---|---|
+| F1 | Fixed | `GUBIM_ORIG` names its block, edit layer and session model (`model=`); `GUBIM_POLY` names its block. The reader pairs by block and layer, not by expressId. The adapter applies the DXF to every open model: each edit goes to the model it came from, or by GlobalId when that model is not open, and an edit applied in one model is excluded in the others. |
+| F2 | Fixed | An empty or unparseable number is refused (`invalid-number`). |
+| F3 | Fixed | Repeated vertices are dropped; fewer than two distinct points is `invalid-points`. Moves or points beyond 10⁸ m are `out-of-range`. |
+| F4 | Fixed | An element put back where the export had it reverts the earlier edit (move and rebend). |
+| F5 | Fixed | When a later import moves a rebent element, the rebend is written again minus the move, so one import or two give the same result. |
+| F6 | Fixed | A copied INSERT is `duplicate-insert`. With two polylines on one edit layer, the one still matching the export is ignored; two that both differ are `duplicate-polyline`. |
+| F7 | **Open, Nick to decide** | Two sections editing one element still add up. |
+| F8 | Fixed | The reported reason is the owning model's (`already-applied` before `guid-mismatch`). |
+| F9 | Fixed | A rotated, scaled or mirrored INSERT is `unsupported-transform`. |
+| F10 | Fixed | The CSV, and the patched IFC of an earlier import, stay downloadable after an import that applies nothing. |
+| F11 | **Open, Nick to decide** | A rebend still replaces the whole `IfcProductDefinitionShape`. |
+| F12 | Partly | Only the 10⁸ m sanity bound; a tighter limit is Nick's call. |
+
+The expectations of two checks changed with the fixes, and the edits sit next to them in `scenarios.mjs`:
+- **NaN vertex:** it is now refused while reading the DXF, so the reason is `invalid-number` rather than `invalid-points`.
+- **Federated (b):** that DXF shows the left INSERT at its exported position, so the F4 revert puts the left bar back.
+
+`probe-node.mjs` follows the new `Model.applyClashDxf(dxf, selfModelId, openModelIds, exclude)` signature.

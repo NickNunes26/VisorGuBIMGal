@@ -526,6 +526,7 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
         request.clashAModelIndices,
         request.clashAIds,
         request.clashAGuids,
+        request.clashAOwners,
         request.clashBModelIndices,
         request.clashBIds,
         request.clashPointsFlat,
@@ -557,7 +558,12 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
       return { value: dxfBytes, transfer: [dxfBytes.buffer as ArrayBuffer] };
     }
     case 'clash-roundtrip-apply': {
-      const out = current().model.applyClashDxf(request.dxfBytes);
+      const out = current().model.applyClashDxf(
+        request.dxfBytes,
+        request.selfModelId,
+        request.openModelIds,
+        request.exclude
+      );
       try {
         const patchedIfcBytes = out.patchedIfcBytes();
         const diffJson = out.diffJson();

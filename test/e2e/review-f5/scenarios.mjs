@@ -509,7 +509,8 @@ await scenario('reasons-csv', async ({ dir, check, open }) => {
   const ins = inserts(d110).find((i) => blockOf(m.products.bar10)(i.block));
   const mixed = setEditPolyline(moveInsert(d110, blockOf(m.products.bar10), 0, 0.3).text, m.products.bar10, [[ins.x - 1.8, ins.y], [ins.x, NaN], [ins.x + 1.8, ins.y]], { lw: true });
   const n = await S.reimport(W(dir, 'mixed.dxf', mixed));
-  check('mixed import: 1 applied, NaN rebend skipped "geometría no válida" (Spanish)', appliedOf(n) === 1 && /1 omitidos: 1 geometría no válida/.test(n.join(' ')), n);
+  // Since the F1-F10 fixes a NaN vertex is refused while reading the DXF (`invalid-number`).
+  check('mixed import: 1 applied, NaN rebend skipped "coordenada ilegible" (Spanish)', appliedOf(n) === 1 && /1 omitidos: 1 coordenada ilegible en el DXF/.test(n.join(' ')), n);
   const csvPath = await S.downloadCsv();
   const csv = readFileSync(csvPath, 'utf8');
   writeFileSync(path.join(dir, 'audit.csv'), csv);
@@ -519,7 +520,7 @@ await scenario('reasons-csv', async ({ dir, check, open }) => {
   const rs = cols.indexOf('reason');
   const gi = cols.indexOf('global_id');
   const parsed = rows.map((r) => r.split(','));
-  check('CSV has status, reason, global_id; rows match', st >= 0 && rs >= 0 && gi >= 0 && parsed.some((r) => r[2] === 'move' && r[st] === 'applied' && r[gi] === m.guids.bar10) && parsed.some((r) => r[2] === 'rebend' && r[st] === 'skipped' && r[rs] === 'invalid-points'), { hdr, rows });
+  check('CSV has status, reason, global_id; rows match', st >= 0 && rs >= 0 && gi >= 0 && parsed.some((r) => r[2] === 'move' && r[st] === 'applied' && r[gi] === m.guids.bar10) && parsed.some((r) => r[2] === 'rebend' && r[st] === 'skipped' && r[rs] === 'invalid-number'), { hdr, rows });
   // All skipped: tampered GlobalId on L1 (PK 0+125).
   const d125 = sectionDxf(zip, '0+125');
   const tam = retargetGuid(moveInsert(d125, blockOf(m.products.L1), 0, 0.1).text, m.products.L1, m.guids.L1, decoy.guids.L1);
@@ -558,11 +559,12 @@ await scenario('federated', async ({ dir, check, open }) => {
   const na = await S.reimport(W(dir, 'a_moveL.dxf', a.text));
   const za = [await z(lid), await z(rid)];
   check('(a) move of the left INSERT: applied to the left bar or skipped with a reason, never silently dropped, right untouched', a.moved === 1 && Math.abs(za[1] - 0.5) < 1e-6 && ((appliedOf(na) === 1 && Math.abs(za[0] - 0.8) < 1e-4) || /omitidos/.test(na.join(' '))), { na, z: za });
-  // (b) move only the right deck's INSERT.
+  // (b) move only the right deck's INSERT. This DXF shows the left INSERT where the export put
+  // it, so since the revert fix (F4) the left bar goes back to 0.5: the DXF is the state.
   const b = moveInsert(d105, isR, 0, 0.2);
   const nb = await S.reimport(W(dir, 'b_moveR.dxf', b.text));
   const zb = [await z(lid), await z(rid)];
-  check('(b) move of the right INSERT: never lands on the left bar', Math.abs(zb[0] - za[0]) < 1e-6 && (Math.abs(zb[1] - 0.7) < 1e-4 || /omitidos/.test(nb.join(' '))), { nb, z: zb });
+  check('(b) move of the right INSERT: lands on the right bar only; the left bar is back where this DXF shows it', Math.abs(zb[0] - 0.5) < 1e-4 && Math.abs(zb[1] - 0.7) < 1e-4, { nb, z: zb });
   // (c) move the left INSERT and delete the right one (CAD user removes what they do not edit).
   const lines = dxfLines(a.text);
   const { ents, secStart, secEnd } = entities(lines);

@@ -274,11 +274,27 @@ impl Model {
     }
 
     /// Parses an edited clash DXF and surgically patches this open model's STEP bytes (F5).
+    /// `self_model_id` is this model's session id and `open_model_ids` every open model's:
+    /// an edit lands on the model it was exported from, or, when that model is not open, on
+    /// the product carrying its `GlobalId`. `exclude` lists edit indices already applied to
+    /// another model in this import. See `applyClashDxfRoundTrip` in `docs/05`.
     #[wasm_bindgen(js_name = applyClashDxf)]
-    pub fn apply_clash_dxf(&self, dxf_bytes: Vec<u8>) -> Result<ClashRoundTripOutput, JsError> {
+    pub fn apply_clash_dxf(
+        &self,
+        dxf_bytes: Vec<u8>,
+        self_model_id: String,
+        open_model_ids: Vec<String>,
+        exclude: Vec<u32>,
+    ) -> Result<ClashRoundTripOutput, JsError> {
+        let scope = clash_dxf::ApplyScope {
+            self_model_id: Some(self_model_id),
+            open_model_ids,
+            exclude,
+            require_global_id: true,
+        };
         let (patched_ifc, diff_json) = self
             .inner
-            .apply_clash_dxf(&dxf_bytes)
+            .apply_clash_dxf(&dxf_bytes, &scope)
             .map_err(|msg| JsError::new(&format!("parse||{msg}")))?;
         Ok(ClashRoundTripOutput {
             patched_ifc,
@@ -379,6 +395,7 @@ impl ClashBatchSlicer {
         clash_a_model_indices: Vec<u32>,
         clash_a_ids: Vec<u32>,
         clash_a_guids: Vec<String>,
+        clash_a_owners: Vec<String>,
         clash_b_model_indices: Vec<u32>,
         clash_b_ids: Vec<u32>,
         clash_points_flat: Vec<f64>,
@@ -416,6 +433,7 @@ impl ClashBatchSlicer {
             [nx, ny, nz],
             depth_m,
             a_refs,
+            clash_a_owners,
             b_refs,
             pts,
             align_pt,
@@ -521,11 +539,7 @@ pub fn compute_element_a_slab_wasm(
 pub fn diff_clash_dxf_json(dxf_bytes: Vec<u8>) -> Result<String, JsError> {
     let diff = cad_slicer::parse_clash_dxf_edits(&dxf_bytes)
         .map_err(|msg| JsError::new(&format!("parse||{msg}")))?;
-    Ok(clash_dxf::format_roundtrip_json(
-        &diff,
-        diff.edits.len(),
-        0,
-    ))
+    Ok(clash_dxf::format_detected_json(&diff))
 }
 
 /// Applies surgical Level 1 (`MovePlacement`) STEP patches encoded as flat `[expressId, dx, dy, dz, ...]`
@@ -540,6 +554,8 @@ pub fn patch_ifc_step_moves(
         patches.push(step_parser::StepPatch::MovePlacement {
             express_id: chunk[0] as u32,
             delta_file_units: [chunk[1], chunk[2], chunk[3]],
+            expected_global_id: None,
+            note: None,
         });
     }
     let (patched, _) = step_parser::patch_step_file(&original_ifc, &patches)

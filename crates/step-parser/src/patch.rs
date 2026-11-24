@@ -1,29 +1,88 @@
 //! Surgical ISO 10303-21 (STEP) IFC patcher for Phase F5 (`docs/12_clash_alignment_dxf.md` §3.5).
 //!
-//! Preserves >99.99% of the original IFC file byte-for-byte: all headers, GUIDs, property sets,
-//! concrete, tendons, alignments, and untouched entities remain completely unchanged.
-//! Only appends newly created entities immediately before `ENDSEC;` in `DATA;` and updates the
-//! single `#ref` attribute (`ObjectPlacement` for Level 1 moves, `Representation` for Level 2
-//! rebends) on each modified product entity.
+//! Preserves the original IFC file byte for byte: headers, GUIDs, property sets and every
+//! untouched entity stay unchanged. New entities are appended just before the `ENDSEC;` that
+//! closes `DATA;`, and only one `#ref` attribute is rewritten on each modified product
+//! (`ObjectPlacement` for Level 1 moves, `Representation` for Level 2 rebends).
+//!
+//! Safety rules:
+//! - An edit is applied only when the product's `GlobalId` matches the one the edit expects
+//!   (a prefix is accepted, because DXF block names are cut to 31 characters). Without an
+//!   expected `GlobalId` the edit is refused when [`PatchOptions::require_global_id`] is set.
+//! - World transforms of placements come from [`PatchOptions::placement_resolver`] when given
+//!   (the kernel's own evaluator, which understands `IfcLinearPlacement` and `IfcGridPlacement`).
+//!   The built-in fallback only walks `IfcLocalPlacement` chains and refuses anything else, so a
+//!   move is never applied in the wrong frame.
+//! - Each product is patched at most once per call; later edits of the same kind are skipped.
 
 use crate::{StepIndex, Value, index};
+use std::collections::BTreeSet;
+
+/// World rotation (columns: local X, Y, Z axes) and translation, in the file's length units.
+pub type PlacementTransform = ([[f64; 3]; 3], [f64; 3]);
 
 /// One surgical edit to apply to an IFC STEP file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepPatch {
-    /// Level 1 (`MOVE`): translates `IfcProduct.ObjectPlacement` by `delta_file_units` (in the
-    /// IFC file's own length units, e.g. metres or millimetres).
+    /// Level 1 (`MOVE`): translates `IfcProduct.ObjectPlacement` by `delta_file_units`, a
+    /// world-space vector in the IFC file's own length units.
     MovePlacement {
         express_id: u32,
         delta_file_units: [f64; 3],
+        /// `GlobalId` (or a prefix of it) the product must carry.
+        expected_global_id: Option<String>,
+        /// Written as a `/* ... */` STEP comment before the new entities when applied.
+        note: Option<String>,
     },
-    /// Level 2 (`Rebend`): replaces `IfcProduct.Representation` with a new `IFCSWEPTDISKSOLID`
-    /// swept along `points_file_units` with `radius_file_units`.
+    /// Level 2 (`Rebend`): replaces `IfcProduct.Representation` with a new swept disk solid
+    /// along `points_file_units` (world space, file units) with `radius_file_units`
+    /// (`<= 0` reads the radius from the product).
     RebendSweptDisk {
         express_id: u32,
         points_file_units: Vec<[f64; 3]>,
         radius_file_units: f64,
+        expected_global_id: Option<String>,
+        note: Option<String>,
     },
+}
+
+impl StepPatch {
+    pub fn express_id(&self) -> u32 {
+        match self {
+            StepPatch::MovePlacement { express_id, .. }
+            | StepPatch::RebendSweptDisk { express_id, .. } => *express_id,
+        }
+    }
+
+    fn expected_global_id(&self) -> Option<&str> {
+        match self {
+            StepPatch::MovePlacement {
+                expected_global_id, ..
+            }
+            | StepPatch::RebendSweptDisk {
+                expected_global_id, ..
+            } => expected_global_id.as_deref().filter(|g| !g.is_empty()),
+        }
+    }
+
+    fn note(&self) -> Option<&str> {
+        match self {
+            StepPatch::MovePlacement { note, .. } | StepPatch::RebendSweptDisk { note, .. } => {
+                note.as_deref()
+            }
+        }
+    }
+}
+
+/// What happened to one [`StepPatch`], in input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchOutcome {
+    pub express_id: u32,
+    pub applied: bool,
+    /// Stable reason code when skipped: `not-found`, `not-a-product`, `guid-mismatch`,
+    /// `guid-missing`, `unsupported-placement`, `no-representation-context`, `invalid-points`,
+    /// `invalid-radius`, `duplicate-edit`.
+    pub reason: Option<&'static str>,
 }
 
 /// Summary of applied surgical STEP patches.
@@ -33,13 +92,53 @@ pub struct StepPatchReport {
     pub skipped: usize,
     pub first_new_id: u32,
     pub last_new_id: u32,
+    pub outcomes: Vec<PatchOutcome>,
 }
 
-/// Applies surgical STEP patches to `original_ifc` bytes, preserving untouched bytes verbatim.
+/// Options for [`patch_step_file_with`].
+#[derive(Default)]
+pub struct PatchOptions<'r> {
+    /// World transform of a placement entity (`IfcObjectPlacement` subtype) in file units.
+    /// `None` from the resolver means the placement cannot be resolved and the edit is skipped.
+    pub placement_resolver: Option<&'r mut dyn FnMut(u32) -> Option<PlacementTransform>>,
+    /// Refuse edits that carry no expected `GlobalId`.
+    pub require_global_id: bool,
+}
+
+/// Applies surgical STEP patches with the default options.
 pub fn patch_step_file(
     original_ifc: &[u8],
     patches: &[StepPatch],
 ) -> Result<(Vec<u8>, StepPatchReport), String> {
+    patch_step_file_with(original_ifc, patches, PatchOptions::default())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Schema {
+    Ifc2x3,
+    Ifc4,
+    Ifc4x3,
+}
+
+fn schema_of(step: &StepIndex<'_>) -> Schema {
+    let ids = step.schema_identifiers();
+    let has = |needle: &str| ids.iter().any(|s| s.to_ascii_uppercase().starts_with(needle));
+    if has("IFC2X3") {
+        Schema::Ifc2x3
+    } else if has("IFC4X3") {
+        Schema::Ifc4x3
+    } else {
+        Schema::Ifc4
+    }
+}
+
+/// Applies surgical STEP patches to `original_ifc` bytes, preserving untouched bytes verbatim.
+pub fn patch_step_file_with(
+    original_ifc: &[u8],
+    patches: &[StepPatch],
+    mut options: PatchOptions<'_>,
+) -> Result<(Vec<u8>, StepPatchReport), String> {
+    let mut outcomes = Vec::with_capacity(patches.len());
     if patches.is_empty() {
         return Ok((
             original_ifc.to_vec(),
@@ -48,179 +147,165 @@ pub fn patch_step_file(
                 skipped: 0,
                 first_new_id: 0,
                 last_new_id: 0,
+                outcomes,
             },
         ));
     }
 
     let step = index(original_ifc).map_err(|e| format!("failed to index STEP file: {e}"))?;
+    let schema = schema_of(&step);
     let max_id = step.ids().max().unwrap_or(0);
     let mut next_id = max_id.saturating_add(1);
     let first_new_id = next_id;
 
-    let data_endsec_offset = find_data_endsec(original_ifc)
+    let data_endsec_offset = find_data_endsec(&step, original_ifc)
         .ok_or_else(|| "could not locate DATA; ... ENDSEC; in STEP file".to_string())?;
 
-    // Find an existing geometric representation context for Level 2 rebends.
-    let default_ctx_id = step
-        .ids_by_type("IFCGEOMETRICREPRESENTATIONSUBCONTEXT")
-        .next()
-        .or_else(|| step.ids_by_type("IFCGEOMETRICREPRESENTATIONCONTEXT").next());
+    let mut resolve = |id: u32| -> Option<PlacementTransform> {
+        match options.placement_resolver.as_mut() {
+            Some(r) => r(id),
+            None => resolve_local_placement_chain(&step, Some(id)),
+        }
+    };
 
     // Byte-range replacements inside the original file: (byte_start, byte_end, replacement_bytes).
     let mut replacements: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     let mut appended = String::new();
     let mut applied = 0usize;
     let mut skipped = 0usize;
+    let mut moved: BTreeSet<u32> = BTreeSet::new();
+    let mut rebent: BTreeSet<u32> = BTreeSet::new();
 
     for patch in patches {
-        match patch {
-            StepPatch::MovePlacement {
-                express_id,
-                delta_file_units,
-            } => {
-                let Some(ent_ref) = step.get(*express_id) else {
-                    skipped += 1;
-                    continue;
-                };
-                let Ok(entity) = step.decode_ref(ent_ref) else {
-                    skipped += 1;
-                    continue;
-                };
-                // IfcProduct attribute index 5 is ObjectPlacement.
-                let old_placement_ref = match entity.params.get(5) {
-                    Some(Value::Ref(id)) => Some(*id),
-                    Some(Value::Null) => None,
-                    _ => {
-                        skipped += 1;
-                        continue;
-                    }
-                };
-                let Some((arg_start, arg_end)) =
-                    find_top_level_param_span(&original_ifc[ent_ref.start..ent_ref.end], 5)
-                else {
-                    skipped += 1;
-                    continue;
-                };
-
-                // Compute new location: if old placement has an axis with a location, copy its
-                // parent placement and axis/ref_direction while shifting location by delta!
-                let (parent_ref_str, new_loc, axis_ref_str, ref_dir_str) =
-                    resolve_shifted_placement(&step, old_placement_ref, *delta_file_units);
-
-                let pt_id = next_id;
-                next_id += 1;
-                let axis_id = next_id;
-                next_id += 1;
-                let place_id = next_id;
-                next_id += 1;
-
-                appended.push_str(&format!(
-                    "#{pt_id}=IFCCARTESIANPOINT(({:.6},{:.6},{:.6}));\r\n",
-                    new_loc[0], new_loc[1], new_loc[2]
-                ));
-                appended.push_str(&format!(
-                    "#{axis_id}=IFCAXIS2PLACEMENT3D(#{pt_id},{axis_ref_str},{ref_dir_str});\r\n"
-                ));
-                appended.push_str(&format!(
-                    "#{place_id}=IFCLOCALPLACEMENT({parent_ref_str},#{axis_id});\r\n"
-                ));
-
-                replacements.push((
-                    ent_ref.start + arg_start,
-                    ent_ref.start + arg_end,
-                    format!("#{place_id}").into_bytes(),
-                ));
-                applied += 1;
+        let express_id = patch.express_id();
+        let result: Result<(), &'static str> = (|| {
+            let ent_ref = step.get(express_id).ok_or("not-found")?;
+            let entity = step.decode_ref(ent_ref).map_err(|_| "not-found")?;
+            let actual_guid = match entity.params.first() {
+                Some(Value::String(g)) => g.as_str(),
+                _ => return Err("not-a-product"),
+            };
+            match patch.expected_global_id() {
+                Some(expected) if !actual_guid.starts_with(expected) => {
+                    return Err("guid-mismatch");
+                }
+                None if options.require_global_id => return Err("guid-missing"),
+                _ => {}
             }
-            StepPatch::RebendSweptDisk {
-                express_id,
-                points_file_units,
-                radius_file_units,
-            } => {
-                if points_file_units.len() < 2 {
-                    skipped += 1;
-                    continue;
+            let record = &original_ifc[ent_ref.start..ent_ref.end];
+
+            match patch {
+                StepPatch::MovePlacement {
+                    delta_file_units, ..
+                } => {
+                    if moved.contains(&express_id) {
+                        return Err("duplicate-edit");
+                    }
+                    if !delta_file_units.iter().all(|v| v.is_finite()) {
+                        return Err("invalid-points");
+                    }
+                    // IfcProduct attribute index 5 is ObjectPlacement.
+                    let old_placement = match entity.params.get(5) {
+                        Some(Value::Ref(id)) => Some(*id),
+                        Some(Value::Null) => None,
+                        _ => return Err("not-a-product"),
+                    };
+                    let (arg_start, arg_end) =
+                        find_top_level_param_span(record, 5).ok_or("not-a-product")?;
+                    let new_entities = shifted_placement_entities(
+                        &step,
+                        old_placement,
+                        *delta_file_units,
+                        &mut resolve,
+                        &mut next_id,
+                    )
+                    .ok_or("unsupported-placement")?;
+                    if let Some(note) = patch.note() {
+                        push_note(&mut appended, note);
+                    }
+                    appended.push_str(&new_entities.text);
+                    replacements.push((
+                        ent_ref.start + arg_start,
+                        ent_ref.start + arg_end,
+                        format!("#{}", new_entities.placement_id).into_bytes(),
+                    ));
+                    moved.insert(express_id);
+                    Ok(())
                 }
-                let resolved_radius = if radius_file_units.is_finite() && *radius_file_units > 0.0 {
-                    *radius_file_units
-                } else {
-                    resolve_existing_bar_radius(&step, *express_id).unwrap_or(0.01)
-                };
-                if !resolved_radius.is_finite() || resolved_radius <= 0.0 {
-                    skipped += 1;
-                    continue;
+                StepPatch::RebendSweptDisk {
+                    points_file_units,
+                    radius_file_units,
+                    ..
+                } => {
+                    if rebent.contains(&express_id) {
+                        return Err("duplicate-edit");
+                    }
+                    if !points_file_units.iter().flatten().all(|v| v.is_finite()) {
+                        return Err("invalid-points");
+                    }
+                    // Repeated vertices give a sweep no direction; a polyline left with fewer
+                    // than two distinct points (drawn at one spot) would delete the geometry.
+                    let points_file_units = distinct_points(points_file_units);
+                    if points_file_units.len() < 2 {
+                        return Err("invalid-points");
+                    }
+                    let radius = if radius_file_units.is_finite() && *radius_file_units > 0.0 {
+                        *radius_file_units
+                    } else {
+                        resolve_existing_bar_radius(&step, express_id).ok_or("invalid-radius")?
+                    };
+                    if !radius.is_finite() || radius <= 0.0 {
+                        return Err("invalid-radius");
+                    }
+                    let ctx_id =
+                        body_context_for(&step, &entity.params).ok_or("no-representation-context")?;
+                    // World points into the product's own placement frame.
+                    let (r_elem, t_elem) = match entity.params.get(5) {
+                        Some(Value::Ref(id)) => resolve(*id).ok_or("unsupported-placement")?,
+                        _ => (IDENTITY_ROT3, [0.0; 3]),
+                    };
+                    let (arg_start, arg_end) =
+                        find_top_level_param_span(record, 6).ok_or("not-a-product")?;
+                    let local: Vec<[f64; 3]> = points_file_units
+                        .iter()
+                        .map(|p| {
+                            inv_rotate_vec3(
+                                r_elem,
+                                [p[0] - t_elem[0], p[1] - t_elem[1], p[2] - t_elem[2]],
+                            )
+                        })
+                        .collect();
+                    if let Some(note) = patch.note() {
+                        push_note(&mut appended, note);
+                    }
+                    let prod_shape_id =
+                        append_swept_disk(&mut appended, &mut next_id, schema, ctx_id, &local, radius);
+                    replacements.push((
+                        ent_ref.start + arg_start,
+                        ent_ref.start + arg_end,
+                        format!("#{prod_shape_id}").into_bytes(),
+                    ));
+                    rebent.insert(express_id);
+                    Ok(())
                 }
-                let Some(ctx_id) = default_ctx_id else {
-                    skipped += 1;
-                    continue;
-                };
-                let Some(ent_ref) = step.get(*express_id) else {
-                    skipped += 1;
-                    continue;
-                };
-                let Ok(entity) = step.decode_ref(ent_ref) else {
-                    skipped += 1;
-                    continue;
-                };
-                // IfcProduct attribute index 5 is ObjectPlacement; transform world points into
-                // the product's local placement coordinates.
-                let placement_ref = match entity.params.get(5) {
-                    Some(Value::Ref(id)) => Some(*id),
-                    _ => None,
-                };
-                let (r_elem, t_elem) = resolve_placement_chain_transform(&step, placement_ref);
-                // IfcProduct attribute index 6 is Representation.
-                let Some((arg_start, arg_end)) =
-                    find_top_level_param_span(&original_ifc[ent_ref.start..ent_ref.end], 6)
-                else {
-                    skipped += 1;
-                    continue;
-                };
-
-                let pt_list_id = next_id;
-                next_id += 1;
-                let curve_id = next_id;
-                next_id += 1;
-                let solid_id = next_id;
-                next_id += 1;
-                let shape_rep_id = next_id;
-                next_id += 1;
-                let prod_shape_id = next_id;
-                next_id += 1;
-
-                let pts_str: String = points_file_units
-                    .iter()
-                    .map(|p| {
-                        let d = [p[0] - t_elem[0], p[1] - t_elem[1], p[2] - t_elem[2]];
-                        let local = inv_rotate_vec3(r_elem, d);
-                        format!("({:.6},{:.6},{:.6})", local[0], local[1], local[2])
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                appended.push_str(&format!(
-                    "#{pt_list_id}=IFCCARTESIANPOINTLIST3D(({pts_str}));\r\n"
-                ));
-                appended.push_str(&format!(
-                    "#{curve_id}=IFCINDEXEDPOLYCURVE(#{pt_list_id},$,.F.);\r\n"
-                ));
-                appended.push_str(&format!(
-                    "#{solid_id}=IFCSWEPTDISKSOLID(#{curve_id},{:.6},$,$,$);\r\n",
-                    resolved_radius
-                ));
-                appended.push_str(&format!(
-                    "#{shape_rep_id}=IFCSHAPEREPRESENTATION(#{ctx_id},'Body','SweptSolid',(#{solid_id}));\r\n"
-                ));
-                appended.push_str(&format!(
-                    "#{prod_shape_id}=IFCPRODUCTDEFINITIONSHAPE($,$,(#{shape_rep_id}));\r\n"
-                ));
-
-                replacements.push((
-                    ent_ref.start + arg_start,
-                    ent_ref.start + arg_end,
-                    format!("#{prod_shape_id}").into_bytes(),
-                ));
+            }
+        })();
+        match result {
+            Ok(()) => {
                 applied += 1;
+                outcomes.push(PatchOutcome {
+                    express_id,
+                    applied: true,
+                    reason: None,
+                });
+            }
+            Err(reason) => {
+                skipped += 1;
+                outcomes.push(PatchOutcome {
+                    express_id,
+                    applied: false,
+                    reason: Some(reason),
+                });
             }
         }
     }
@@ -230,13 +315,14 @@ pub fn patch_step_file(
         replacements.push((data_endsec_offset, data_endsec_offset, appended.into_bytes()));
     }
 
-    // Apply all non-overlapping byte-range replacements in ascending byte order.
+    // Apply byte-range replacements in ascending byte order. Placement and representation
+    // spans of one product never overlap, and each product is patched once per kind.
     replacements.sort_by_key(|(start, end, _)| (*start, *end));
     let mut out = Vec::with_capacity(original_ifc.len() + 512);
     let mut cursor = 0usize;
     for (start, end, bytes) in replacements {
         if start < cursor || end > original_ifc.len() {
-            continue;
+            return Err("internal: overlapping STEP patch ranges".to_string());
         }
         out.extend_from_slice(&original_ifc[cursor..start]);
         out.extend_from_slice(&bytes);
@@ -255,69 +341,249 @@ pub fn patch_step_file(
         StepPatchReport {
             applied,
             skipped,
-            first_new_id: if applied > 0 { first_new_id } else { 0 },
+            first_new_id: if next_id > first_new_id { first_new_id } else { 0 },
             last_new_id,
+            outcomes,
         },
     ))
 }
 
-fn resolve_shifted_placement(
+/// Every `/* GUBIM_F5 ... */` note found in a STEP file, in file order (without the delimiters).
+pub fn find_patch_notes(bytes: &[u8]) -> Vec<String> {
+    const OPEN: &[u8] = b"/* GUBIM_F5 ";
+    let mut notes = Vec::new();
+    let mut at = 0;
+    while let Some(rel) = find_bytes(&bytes[at..], OPEN) {
+        let start = at + rel + 3;
+        let Some(end_rel) = find_bytes(&bytes[start..], b"*/") else {
+            break;
+        };
+        notes.push(String::from_utf8_lossy(&bytes[start..start + end_rel]).trim().to_string());
+        at = start + end_rel + 2;
+    }
+    notes
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn push_note(out: &mut String, note: &str) {
+    let clean: String = note
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '_' })
+        .collect::<String>()
+        .replace("*/", "*_");
+    out.push_str("/* ");
+    out.push_str(&clean);
+    out.push_str(" */\r\n");
+}
+
+fn fmt_real(v: f64) -> String {
+    // Normalise -0 so the output stays tidy; 6 decimals is a micrometre in metres.
+    let v = if v.abs() < 5e-7 { 0.0 } else { v };
+    format!("{v:.6}")
+}
+
+fn append_swept_disk(
+    out: &mut String,
+    next_id: &mut u32,
+    schema: Schema,
+    ctx_id: u32,
+    local: &[[f64; 3]],
+    radius: f64,
+) -> u32 {
+    let mut take = || {
+        let id = *next_id;
+        *next_id += 1;
+        id
+    };
+    let curve_id;
+    // IFC2X3 requires StartParam/EndParam (polyline parameter = segment index); later schemas
+    // make them optional.
+    let params = if schema == Schema::Ifc2x3 {
+        format!("0.,{}.", local.len().saturating_sub(1))
+    } else {
+        "$,$".to_string()
+    };
+    if schema == Schema::Ifc2x3 {
+        // IFC2X3 has neither IfcCartesianPointList3D nor IfcIndexedPolyCurve, and its
+        // IfcSweptDiskSolid requires StartParam/EndParam (polyline parameter = segment index).
+        let mut pt_ids = Vec::with_capacity(local.len());
+        for p in local {
+            let id = take();
+            out.push_str(&format!(
+                "#{id}=IFCCARTESIANPOINT(({},{},{}));\r\n",
+                fmt_real(p[0]),
+                fmt_real(p[1]),
+                fmt_real(p[2])
+            ));
+            pt_ids.push(format!("#{id}"));
+        }
+        curve_id = take();
+        out.push_str(&format!("#{curve_id}=IFCPOLYLINE(({}));\r\n", pt_ids.join(",")));
+    } else {
+        let list_id = take();
+        let coords = local
+            .iter()
+            .map(|p| format!("({},{},{})", fmt_real(p[0]), fmt_real(p[1]), fmt_real(p[2])))
+            .collect::<Vec<_>>()
+            .join(",");
+        // IFC4X3 adds the optional TagList attribute to IfcCartesianPointList3D.
+        let tag = if schema == Schema::Ifc4x3 { ",$" } else { "" };
+        out.push_str(&format!("#{list_id}=IFCCARTESIANPOINTLIST3D(({coords}){tag});\r\n"));
+        curve_id = take();
+        out.push_str(&format!("#{curve_id}=IFCINDEXEDPOLYCURVE(#{list_id},$,.F.);\r\n"));
+    }
+    let solid_id = take();
+    out.push_str(&format!(
+        "#{solid_id}=IFCSWEPTDISKSOLID(#{curve_id},{},$,{params});\r\n",
+        fmt_real(radius)
+    ));
+    let rep_id = take();
+    out.push_str(&format!(
+        "#{rep_id}=IFCSHAPEREPRESENTATION(#{ctx_id},'Body','AdvancedSweptSolid',(#{solid_id}));\r\n"
+    ));
+    let prod_id = take();
+    out.push_str(&format!("#{prod_id}=IFCPRODUCTDEFINITIONSHAPE($,$,(#{rep_id}));\r\n"));
+    prod_id
+}
+
+struct NewPlacement {
+    text: String,
+    placement_id: u32,
+}
+
+/// Builds a new `IfcLocalPlacement` that reproduces `old_placement` shifted by `delta_world`.
+fn shifted_placement_entities(
     step: &StepIndex<'_>,
-    old_placement_id: Option<u32>,
+    old_placement: Option<u32>,
     delta_world: [f64; 3],
-) -> (String, [f64; 3], String, String) {
-    let Some(pid) = old_placement_id else {
-        return ("$".to_string(), delta_world, "$".to_string(), "$".to_string());
+    resolve: &mut dyn FnMut(u32) -> Option<PlacementTransform>,
+    next_id: &mut u32,
+) -> Option<NewPlacement> {
+    let mut take = || {
+        let id = *next_id;
+        *next_id += 1;
+        id
     };
-    let Ok(place_ent) = step.decode(pid) else {
-        return (format!("#{pid}"), delta_world, "$".to_string(), "$".to_string());
+    let mut text = String::new();
+    let point = |text: &mut String, id: u32, p: [f64; 3]| {
+        text.push_str(&format!(
+            "#{id}=IFCCARTESIANPOINT(({},{},{}));\r\n",
+            fmt_real(p[0]),
+            fmt_real(p[1]),
+            fmt_real(p[2])
+        ));
     };
-    if !place_ent.type_name.eq_ignore_ascii_case("IFCLOCALPLACEMENT") {
-        return (format!("#{pid}"), delta_world, "$".to_string(), "$".to_string());
+
+    // Same parent and same axes, location shifted: only when the old placement is a plain
+    // IfcLocalPlacement over an IfcAxis2Placement3D.
+    if let Some(pid) = old_placement
+        && let Ok(place) = step.decode(pid)
+        && place.type_name.eq_ignore_ascii_case("IFCLOCALPLACEMENT")
+        && let Some(Value::Ref(axis_id)) = place.params.get(1)
+        && let Ok(axis) = step.decode(*axis_id)
+        && axis.type_name.eq_ignore_ascii_case("IFCAXIS2PLACEMENT3D")
+    {
+        let parent = match place.params.first() {
+            Some(Value::Ref(p)) => Some(*p),
+            _ => None,
+        };
+        let r_parent = match parent {
+            Some(p) => resolve(p)?.0,
+            None => IDENTITY_ROT3,
+        };
+        let delta_local = inv_rotate_vec3(r_parent, delta_world);
+        let mut loc = [0.0; 3];
+        if let Some(Value::Ref(pt)) = axis.params.first() {
+            loc = step.get(*pt).and_then(|r| step.decode_coordinates(r)).map(|(c, _)| c)?;
+        }
+        let ref_of = |i: usize| match axis.params.get(i) {
+            Some(Value::Ref(r)) => format!("#{r}"),
+            _ => "$".to_string(),
+        };
+        let pt_id = take();
+        let axis_new = take();
+        let place_id = take();
+        point(
+            &mut text,
+            pt_id,
+            [loc[0] + delta_local[0], loc[1] + delta_local[1], loc[2] + delta_local[2]],
+        );
+        text.push_str(&format!(
+            "#{axis_new}=IFCAXIS2PLACEMENT3D(#{pt_id},{},{});\r\n",
+            ref_of(1),
+            ref_of(2)
+        ));
+        let parent_str = parent.map_or_else(|| "$".to_string(), |p| format!("#{p}"));
+        text.push_str(&format!("#{place_id}=IFCLOCALPLACEMENT({parent_str},#{axis_new});\r\n"));
+        return Some(NewPlacement {
+            text,
+            placement_id: place_id,
+        });
     }
 
-    let parent_id = match place_ent.params.first() {
-        Some(Value::Ref(p)) => Some(*p),
+    // Anything else (no placement, IfcLinearPlacement, IfcGridPlacement, 2D axes): nest a
+    // pure translation under the old placement, expressed in its resolved world frame.
+    let r_self = match old_placement {
+        Some(pid) => resolve(pid)?.0,
+        None => IDENTITY_ROT3,
+    };
+    let delta_self = inv_rotate_vec3(r_self, delta_world);
+    let pt_id = take();
+    let axis_new = take();
+    let place_id = take();
+    point(&mut text, pt_id, delta_self);
+    text.push_str(&format!("#{axis_new}=IFCAXIS2PLACEMENT3D(#{pt_id},$,$);\r\n"));
+    let rel = old_placement.map_or_else(|| "$".to_string(), |p| format!("#{p}"));
+    text.push_str(&format!("#{place_id}=IFCLOCALPLACEMENT({rel},#{axis_new});\r\n"));
+    Some(NewPlacement {
+        text,
+        placement_id: place_id,
+    })
+}
+
+/// The representation context for a new Body: the context of the product's current `Body`
+/// representation, else the `Body` subcontext, else a `Model` context.
+fn body_context_for(step: &StepIndex<'_>, product_params: &[Value]) -> Option<u32> {
+    let label = |v: Option<&Value>| match v {
+        Some(Value::String(s)) => Some(s.to_ascii_lowercase()),
         _ => None,
     };
-    let parent_str = parent_id.map_or_else(|| "$".to_string(), |p| format!("#{p}"));
-    let (r_parent, _) = resolve_placement_chain_transform(step, parent_id);
-    let delta_local = inv_rotate_vec3(r_parent, delta_world);
-
-    if let Some(Value::Ref(axis_id)) = place_ent.params.get(1)
-        && let Ok(axis_ent) = step.decode(*axis_id)
-        && axis_ent.type_name.eq_ignore_ascii_case("IFCAXIS2PLACEMENT3D")
+    if let Some(Value::Ref(shape_id)) = product_params.get(6)
+        && let Ok(shape) = step.decode(*shape_id)
+        && let Some(Value::List(reps)) = shape.params.get(2)
     {
-        let mut loc = [0.0, 0.0, 0.0];
-        if let Some(Value::Ref(pt_id)) = axis_ent.params.first()
-            && let Some(pt_ref) = step.get(*pt_id)
-            && let Some((coords, _)) = step.decode_coordinates(pt_ref)
-        {
-            loc = coords;
+        for rep in reps {
+            if let Value::Ref(rep_id) = rep
+                && let Ok(rep) = step.decode(*rep_id)
+                && label(rep.params.get(1)).as_deref() == Some("body")
+                && let Some(Value::Ref(ctx)) = rep.params.first()
+            {
+                return Some(*ctx);
+            }
         }
-        let axis_str = match axis_ent.params.get(1) {
-            Some(Value::Ref(r)) => format!("#{r}"),
-            _ => "$".to_string(),
-        };
-        let ref_dir_str = match axis_ent.params.get(2) {
-            Some(Value::Ref(r)) => format!("#{r}"),
-            _ => "$".to_string(),
-        };
-        return (
-            parent_str,
-            [
-                loc[0] + delta_local[0],
-                loc[1] + delta_local[1],
-                loc[2] + delta_local[2],
-            ],
-            axis_str,
-            ref_dir_str,
-        );
     }
-
-    let (r_self, _) = resolve_placement_chain_transform(step, Some(pid));
-    let delta_self = inv_rotate_vec3(r_self, delta_world);
-    (format!("#{pid}"), delta_self, "$".to_string(), "$".to_string())
+    let subs: Vec<u32> = step
+        .ids_by_type("IFCGEOMETRICREPRESENTATIONSUBCONTEXT")
+        .collect();
+    for &id in &subs {
+        if let Ok(ctx) = step.decode(id)
+            && label(ctx.params.first()).as_deref() == Some("body")
+        {
+            return Some(id);
+        }
+    }
+    let contexts: Vec<u32> = step.ids_by_type("IFCGEOMETRICREPRESENTATIONCONTEXT").collect();
+    for &id in &contexts {
+        if let Ok(ctx) = step.decode(id)
+            && label(ctx.params.get(1)).as_deref() == Some("model")
+        {
+            return Some(id);
+        }
+    }
+    contexts.first().copied()
 }
 
 const IDENTITY_ROT3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -338,7 +604,7 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 #[inline]
 fn normalize3(v: [f64; 3]) -> Option<[f64; 3]> {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let len = dot3(v, v).sqrt();
     (len.is_finite() && len > 1e-12).then(|| [v[0] / len, v[1] / len, v[2] / len])
 }
 
@@ -352,6 +618,26 @@ fn rotate_vec3(cols: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
 }
 
 #[inline]
+/// The points without consecutive repeats (closer than a part in 10¹² of the coordinates).
+fn distinct_points(points: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    let size = points
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |m, v| m.max(v.abs()));
+    let tol = (size * 1e-12).max(1e-12);
+    let mut out: Vec<[f64; 3]> = Vec::with_capacity(points.len());
+    for p in points {
+        let repeat = out.last().is_some_and(|q| {
+            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= tol
+        });
+        if !repeat {
+            out.push(*p);
+        }
+    }
+    out
+}
+
 fn inv_rotate_vec3(cols: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     [dot3(cols[0], v), dot3(cols[1], v), dot3(cols[2], v)]
 }
@@ -374,58 +660,46 @@ fn decode_direction3(step: &StepIndex<'_>, id: u32) -> Option<[f64; 3]> {
     let Value::List(items) = ent.params.first()? else {
         return None;
     };
-    let num = |v: &Value| -> Option<f64> {
-        match v {
-            Value::Real(n) => Some(*n),
-            Value::Integer(n) => Some(*n as f64),
-            _ => None,
-        }
-    };
     Some([
-        items.first().and_then(num)?,
-        items.get(1).and_then(num)?,
-        items.get(2).and_then(num).unwrap_or(0.0),
+        items.first().and_then(value_as_f64)?,
+        items.get(1).and_then(value_as_f64)?,
+        items.get(2).and_then(value_as_f64).unwrap_or(0.0),
     ])
 }
 
-fn decode_axis2_placement_3d(step: &StepIndex<'_>, id: u32) -> ([[f64; 3]; 3], [f64; 3]) {
-    let Ok(axis_ent) = step.decode(id) else {
-        return (IDENTITY_ROT3, [0.0, 0.0, 0.0]);
-    };
-    if !axis_ent.type_name.eq_ignore_ascii_case("IFCAXIS2PLACEMENT3D") {
-        return (IDENTITY_ROT3, [0.0, 0.0, 0.0]);
+/// `IfcAxis2Placement3D` or `IfcAxis2Placement2D` as (rotation columns, location).
+fn decode_axis2_placement(step: &StepIndex<'_>, id: u32) -> Option<PlacementTransform> {
+    let axis_ent = step.decode(id).ok()?;
+    let is_3d = axis_ent.type_name.eq_ignore_ascii_case("IFCAXIS2PLACEMENT3D");
+    let is_2d = axis_ent.type_name.eq_ignore_ascii_case("IFCAXIS2PLACEMENT2D");
+    if !is_3d && !is_2d {
+        return None;
     }
     let mut loc = [0.0, 0.0, 0.0];
-    if let Some(Value::Ref(pt_id)) = axis_ent.params.first()
-        && let Some(pt_ref) = step.get(*pt_id)
-        && let Some((coords, _)) = step.decode_coordinates(pt_ref)
-    {
-        loc = coords;
+    if let Some(Value::Ref(pt_id)) = axis_ent.params.first() {
+        let (coords, count) = step.get(*pt_id).and_then(|r| step.decode_coordinates(r))?;
+        loc = if count == 3 { coords } else { [coords[0], coords[1], 0.0] };
     }
-    let z = axis_ent
-        .params
-        .get(1)
-        .and_then(|v| match v {
-            Value::Ref(r) => decode_direction3(step, *r),
-            _ => None,
-        })
-        .and_then(normalize3)
-        .unwrap_or([0.0, 0.0, 1.0]);
-    let x_hint = axis_ent
-        .params
-        .get(2)
-        .and_then(|v| match v {
-            Value::Ref(r) => decode_direction3(step, *r),
-            _ => None,
-        })
-        .unwrap_or([1.0, 0.0, 0.0]);
+    let dir_at = |i: usize| match axis_ent.params.get(i) {
+        Some(Value::Ref(r)) => decode_direction3(step, *r),
+        _ => None,
+    };
+    let (z, x_hint) = if is_3d {
+        (
+            dir_at(1).and_then(normalize3).unwrap_or([0.0, 0.0, 1.0]),
+            dir_at(2).unwrap_or([1.0, 0.0, 0.0]),
+        )
+    } else {
+        let d = dir_at(1).unwrap_or([1.0, 0.0, 0.0]);
+        ([0.0, 0.0, 1.0], [d[0], d[1], 0.0])
+    };
     let proj = dot3(x_hint, z);
-    let x_raw = [
+    let x = normalize3([
         x_hint[0] - z[0] * proj,
         x_hint[1] - z[1] * proj,
         x_hint[2] - z[2] * proj,
-    ];
-    let x = normalize3(x_raw).unwrap_or_else(|| {
+    ])
+    .or_else(|| {
         let fallback = if z[0].abs() < 0.9 {
             [1.0, 0.0, 0.0]
         } else {
@@ -437,27 +711,29 @@ fn decode_axis2_placement_3d(step: &StepIndex<'_>, id: u32) -> ([[f64; 3]; 3], [
             fallback[1] - z[1] * p,
             fallback[2] - z[2] * p,
         ])
-        .unwrap_or([1.0, 0.0, 0.0])
-    });
+    })?;
     let y = cross3(z, x);
-    ([x, y, z], loc)
+    Some(([x, y, z], loc))
 }
 
-/// Evaluates the full world `(rotation_cols, translation_in_file_units)` of an `IFCLOCALPLACEMENT` chain.
-fn resolve_placement_chain_transform(
+/// World transform of an `IfcLocalPlacement` chain in file units. `None` when the chain holds
+/// any other placement type (linear, grid), an unreadable axis, or is cyclic.
+fn resolve_local_placement_chain(
     step: &StepIndex<'_>,
     placement_id: Option<u32>,
-) -> ([[f64; 3]; 3], [f64; 3]) {
+) -> Option<PlacementTransform> {
     let mut chain = Vec::new();
     let mut cur = placement_id;
-    for _ in 0..64 {
-        let Some(pid) = cur else { break };
-        let Ok(ent) = step.decode(pid) else { break };
+    while let Some(pid) = cur {
+        if chain.len() >= 64 {
+            return None;
+        }
+        let ent = step.decode(pid).ok()?;
         if !ent.type_name.eq_ignore_ascii_case("IFCLOCALPLACEMENT") {
-            break;
+            return None;
         }
         let rel = match ent.params.get(1) {
-            Some(Value::Ref(axis_id)) => decode_axis2_placement_3d(step, *axis_id),
+            Some(Value::Ref(axis_id)) => decode_axis2_placement(step, *axis_id)?,
             _ => (IDENTITY_ROT3, [0.0, 0.0, 0.0]),
         };
         chain.push(rel);
@@ -477,7 +753,7 @@ fn resolve_placement_chain_transform(
         ];
         r_world = mul_rot3(r_world, r_rel);
     }
-    (r_world, t_world)
+    Some((r_world, t_world))
 }
 
 fn value_as_f64(v: &Value) -> Option<f64> {
@@ -489,14 +765,19 @@ fn value_as_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// Inspects an existing product entity to determine its bar/disk radius in file units when
-/// Level 2 `RebendSweptDisk` is called with `radius_file_units <= 0.0`.
+/// Bar radius in file units for a Level 2 rebend called with `radius_file_units <= 0.0`.
 fn resolve_existing_bar_radius(step: &StepIndex<'_>, express_id: u32) -> Option<f64> {
     let ent = step.decode(express_id).ok()?;
-    // 1. Check NominalDiameter on IfcReinforcingBar or IfcTendon (attribute 9 -> diameter).
-    if (ent.type_name.eq_ignore_ascii_case("IFCREINFORCINGBAR")
-        || ent.type_name.eq_ignore_ascii_case("IFCTENDON"))
-        && let Some(d) = ent.params.get(9).and_then(value_as_f64)
+    // 1. NominalDiameter: attribute 9 on IfcReinforcingBar, 10 on IfcTendon (after PredefinedType).
+    let diameter_index = if ent.type_name.eq_ignore_ascii_case("IFCREINFORCINGBAR") {
+        Some(9)
+    } else if ent.type_name.eq_ignore_ascii_case("IFCTENDON") {
+        Some(10)
+    } else {
+        None
+    };
+    if let Some(i) = diameter_index
+        && let Some(d) = ent.params.get(i).and_then(value_as_f64)
         && d.is_finite()
         && d > 0.0
     {
@@ -584,24 +865,18 @@ fn inspect_item_radius(step: &StepIndex<'_>, item_id: u32, depth: usize) -> Opti
     None
 }
 
-/// Locates the byte offset of `ENDSEC;` that closes the `DATA;` section.
-fn find_data_endsec(bytes: &[u8]) -> Option<usize> {
-    let text = std::str::from_utf8(bytes).ok().or(None);
-    if let Some(s) = text {
-        let upper = s.to_ascii_uppercase();
-        let data_pos = upper.find("DATA;")?;
-        let rel = upper[data_pos..].find("ENDSEC;")?;
-        return Some(data_pos + rel);
-    }
-    // Fallback for non-UTF-8 (Latin-1) IFC files: ASCII case-insensitive byte scan.
-    let find_ascii = |haystack: &[u8], needle: &[u8]| -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|w| w.eq_ignore_ascii_case(needle))
-    };
-    let data_pos = find_ascii(bytes, b"DATA;")?;
-    let rel = find_ascii(&bytes[data_pos..], b"ENDSEC;")?;
-    Some(data_pos + rel)
+/// Byte offset of the `ENDSEC` that closes `DATA;`: the first one after the last entity record,
+/// so strings inside entities can never be mistaken for it.
+fn find_data_endsec(step: &StepIndex<'_>, bytes: &[u8]) -> Option<usize> {
+    let last_end = step
+        .ids()
+        .filter_map(|id| step.get(id).map(|r| r.end))
+        .max()?;
+    let tail = bytes.get(last_end..)?;
+    let rel = tail
+        .windows(6)
+        .position(|w| w.eq_ignore_ascii_case(b"ENDSEC"))?;
+    Some(last_end + rel)
 }
 
 /// Finds the byte span `(start, end)` of top-level argument `target_index` inside an entity body
@@ -651,4 +926,155 @@ fn find_top_level_param_span(record: &[u8], target_index: usize) -> Option<(usiz
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "ISO-10303-21;\r\nHEADER;\r\nFILE_DESCRIPTION((''),'2;1');\r\nFILE_NAME('t','',(''),(''),'','','');\r\nFILE_SCHEMA(('@SCHEMA@'));\r\nENDSEC;\r\nDATA;\r\n\
+#1=IFCPROJECT('0000000000000000000001',$,'P',$,$,$,$,(#10),$);\r\n\
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#11,$);\r\n\
+#11=IFCAXIS2PLACEMENT3D(#12,$,$);\r\n\
+#12=IFCCARTESIANPOINT((0.,0.,0.));\r\n\
+#13=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Axis','Model',*,*,*,*,#10,$,.GRAPH_VIEW.,$);\r\n\
+#14=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#10,$,.MODEL_VIEW.,$);\r\n\
+#20=IFCLOCALPLACEMENT($,#11);\r\n\
+#30=IFCPOLYLINE((#12,#31));\r\n\
+#31=IFCCARTESIANPOINT((1.,0.,0.));\r\n\
+#32=IFCSWEPTDISKSOLID(#30,0.01,$,$,$);\r\n\
+#33=IFCSHAPEREPRESENTATION(#14,'Body','AdvancedSweptSolid',(#32));\r\n\
+#34=IFCPRODUCTDEFINITIONSHAPE($,$,(#33));\r\n\
+#100=IFCREINFORCINGBAR('2O2Fr$t4X7Zf8NOew3FLOH',$,'Bar ''ENDSEC;''',$,$,#20,#34,$,$,0.02,$,$,$,$);\r\n\
+ENDSEC;\r\nEND-ISO-10303-21;\r\n";
+
+    fn file(schema: &str) -> String {
+        BASE.replace("@SCHEMA@", schema)
+    }
+
+    fn rebend(guid: Option<&str>) -> StepPatch {
+        StepPatch::RebendSweptDisk {
+            express_id: 100,
+            points_file_units: vec![[0.0, 0.0, 0.3], [1.0, 0.0, 0.3]],
+            radius_file_units: 0.0,
+            expected_global_id: guid.map(str::to_string),
+            note: Some("GUBIM_F5 test".to_string()),
+        }
+    }
+
+    #[test]
+    fn rebend_uses_body_context_and_schema_specific_entities() {
+        for (schema, list, tail) in [
+            ("IFC4", true, "));"),
+            ("IFC4X3_ADD2", true, "),$);"),
+            ("IFC2X3", false, ""),
+        ] {
+            let src = file(schema);
+            let (out, report) =
+                patch_step_file(src.as_bytes(), &[rebend(Some("2O2Fr$t4X7Zf8NOew3FLOH"))]).unwrap();
+            assert_eq!(report.applied, 1, "{schema}");
+            let text = String::from_utf8(out).unwrap();
+            let added = text[src.find("ENDSEC;\r\nEND").unwrap()..].trim_start();
+            assert!(added.contains("IFCSHAPEREPRESENTATION(#14,'Body','AdvancedSweptSolid'"), "{schema}: {added}");
+            assert_eq!(added.contains("IFCCARTESIANPOINTLIST3D"), list, "{schema}");
+            assert_eq!(added.contains("IFCINDEXEDPOLYCURVE"), list, "{schema}");
+            if list {
+                let line = added.lines().find(|l| l.contains("POINTLIST3D")).unwrap();
+                assert!(line.ends_with(tail), "{schema}: {line}");
+            } else {
+                assert!(added.contains("=IFCPOLYLINE(("));
+                assert!(added.contains(",0.010000,$,0.,1.);"), "{added}");
+            }
+            assert!(added.starts_with("/* GUBIM_F5 test */"), "{added}");
+            let step = index(text.as_bytes()).expect("patched file indexes");
+            assert!(step.skipped().is_empty());
+            assert_eq!(find_patch_notes(text.as_bytes()), vec!["GUBIM_F5 test".to_string()]);
+        }
+    }
+
+    #[test]
+    fn guid_mismatch_and_missing_guid_are_skipped() {
+        let src = file("IFC4");
+        let (out, report) = patch_step_file(src.as_bytes(), &[rebend(Some("3F5e2eTestB"))]).unwrap();
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.outcomes[0].reason, Some("guid-mismatch"));
+        assert_eq!(out, src.as_bytes());
+
+        let (_, report) = patch_step_file_with(
+            src.as_bytes(),
+            &[rebend(None)],
+            PatchOptions {
+                require_global_id: true,
+                ..PatchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.outcomes[0].reason, Some("guid-missing"));
+
+        // A truncated block-name prefix is accepted.
+        let (_, report) = patch_step_file(src.as_bytes(), &[rebend(Some("2O2Fr$t4X7Zf8"))]).unwrap();
+        assert_eq!(report.applied, 1);
+    }
+
+    #[test]
+    fn linear_placement_without_resolver_is_refused_and_with_resolver_is_rotated() {
+        let src = file("IFC4X3_ADD2").replace(
+            "#20=IFCLOCALPLACEMENT($,#11);",
+            "#20=IFCLINEARPLACEMENT($,#21,$);\r\n#21=IFCAXIS2PLACEMENTLINEAR(#12,$,$);",
+        );
+        let mv = StepPatch::MovePlacement {
+            express_id: 100,
+            delta_file_units: [0.0, 0.0, 0.3],
+            expected_global_id: Some("2O2Fr$t4X7Zf8NOew3FLOH".into()),
+            note: None,
+        };
+        let (_, report) = patch_step_file(src.as_bytes(), std::slice::from_ref(&mv)).unwrap();
+        assert_eq!(report.outcomes[0].reason, Some("unsupported-placement"));
+
+        // Resolver says the linear placement is rotated 90 deg about X (local Y = world Z).
+        let mut resolver = |id: u32| -> Option<PlacementTransform> {
+            (id == 20).then_some((
+                [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+                [5.0, 0.0, 0.0],
+            ))
+        };
+        let (out, report) = patch_step_file_with(
+            src.as_bytes(),
+            &[mv],
+            PatchOptions {
+                placement_resolver: Some(&mut resolver),
+                ..PatchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.applied, 1);
+        let text = String::from_utf8(out).unwrap();
+        // World +Z is local +Y of the linear placement.
+        assert!(text.contains("IFCCARTESIANPOINT((0.000000,0.300000,0.000000))"), "{text}");
+        assert!(text.contains("=IFCLOCALPLACEMENT(#20,"));
+    }
+
+    #[test]
+    fn duplicate_moves_of_one_product_are_skipped() {
+        let src = file("IFC4");
+        let mv = StepPatch::MovePlacement {
+            express_id: 100,
+            delta_file_units: [0.0, 0.0, 0.3],
+            expected_global_id: None,
+            note: None,
+        };
+        let (_, report) = patch_step_file(src.as_bytes(), &[mv.clone(), mv]).unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.outcomes[1].reason, Some("duplicate-edit"));
+    }
+
+    #[test]
+    fn tendon_diameter_is_read_after_predefined_type() {
+        let src = file("IFC4").replace(
+            "#100=IFCREINFORCINGBAR('2O2Fr$t4X7Zf8NOew3FLOH',$,'Bar ''ENDSEC;''',$,$,#20,#34,$,$,0.02,$,$,$,$);",
+            "#100=IFCTENDON('2O2Fr$t4X7Zf8NOew3FLOH',$,'T',$,$,#20,#34,$,$,.STRAND.,0.08,$,$,$,$,$,$);",
+        );
+        let step = index(src.as_bytes()).unwrap();
+        assert_eq!(resolve_existing_bar_radius(&step, 100), Some(0.04));
+    }
 }

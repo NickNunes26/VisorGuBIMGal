@@ -933,6 +933,17 @@ impl<'a> ModelEvaluator<'a> {
         origin.is_finite().then_some(origin)
     }
 
+    /// World transform of an `IfcObjectPlacement` (local, linear or grid), in metres, resolved
+    /// exactly as product geometry is. `None` for anything else or a non-finite result.
+    pub fn placement_world(&mut self, placement_id: u32) -> Option<DMat4> {
+        let (_, def) = self.lookup(placement_id)?;
+        if !def.is_a("IfcObjectPlacement") {
+            return None;
+        }
+        let world = self.placement(placement_id, 0);
+        world.is_finite().then_some(world)
+    }
+
     fn product_meshes(&mut self, entity: &Entity, def: &EntityDef) -> Vec<ElementMesh> {
         let placement = match attribute(entity, def, "ObjectPlacement").and_then(reference) {
             Some(id) => self.placement(id, 0),
