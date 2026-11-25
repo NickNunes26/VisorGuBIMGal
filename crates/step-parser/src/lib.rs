@@ -13,8 +13,8 @@ mod parser;
 pub mod patch;
 
 pub use patch::{
-    PatchOptions, PatchOutcome, PlacementTransform, StepPatch, StepPatchReport, find_patch_notes,
-    patch_step_file, patch_step_file_with,
+    PatchOptions, PatchOutcome, PlacementTransform, StepPatch, StepPatchReport, check_product_guid,
+    find_patch_notes, patch_step_file, patch_step_file_with,
 };
 
 use std::collections::HashMap;

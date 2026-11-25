@@ -410,6 +410,7 @@ struct PlanInput<'a> {
     meta: &'a cad_slicer::ParsedClashMeta,
     scope: &'a ApplyScope,
     previous: &'a BTreeMap<(String, u32, String), NoteState>,
+    step: Option<&'a step_parser::StepIndex<'a>>,
     inv_scale: f64,
 }
 
@@ -432,6 +433,7 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
         meta,
         scope,
         previous,
+        step,
         inv_scale,
     } = *input;
     let mut outcomes: Vec<Option<EditOutcome>> = (0..all.len()).map(|_| None).collect();
@@ -466,6 +468,19 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
                 continue;
             }
         };
+        if let Some(step) = step
+            && let Err(reason) = step_parser::check_product_guid(
+                step,
+                *express_id,
+                global_id.as_deref(),
+                guid_required,
+            )
+        {
+            if i < changed {
+                outcomes[i] = skip(reason);
+            }
+            continue;
+        }
         let key = edit_key(meta, edit);
         let done = previous
             .get(&(key.clone(), *express_id, "move".to_string()))
@@ -527,6 +542,19 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
                 continue;
             }
         };
+        if let Some(step) = step
+            && let Err(reason) = step_parser::check_product_guid(
+                step,
+                *express_id,
+                global_id.as_deref(),
+                guid_required,
+            )
+        {
+            if i < changed {
+                outcomes[i] = skip(reason);
+            }
+            continue;
+        }
         let key = edit_key(meta, edit);
         let shape = fnv_hex(
             &points_3d
@@ -615,6 +643,18 @@ pub fn apply_clash_dxf_to_step_scoped(
     dxf_bytes: &[u8],
     scope: &ApplyScope,
 ) -> Result<(Vec<u8>, String), String> {
+    apply_clash_dxf_to_step_indexed(original_ifc, None, length_unit_scale, dxf_bytes, scope)
+}
+
+/// [`apply_clash_dxf_to_step_scoped`] reusing an existing [`step_parser::StepIndex`] when the
+/// caller already holds one (`LoadedModel`).
+pub fn apply_clash_dxf_to_step_indexed(
+    original_ifc: &[u8],
+    preindexed: Option<&step_parser::StepIndex<'_>>,
+    length_unit_scale: f64,
+    dxf_bytes: &[u8],
+    scope: &ApplyScope,
+) -> Result<(Vec<u8>, String), String> {
     let diff = cad_slicer::parse_clash_dxf_edits(dxf_bytes)?;
     let scale = if length_unit_scale.is_finite() && length_unit_scale > 0.0 {
         length_unit_scale
@@ -627,12 +667,22 @@ pub fn apply_clash_dxf_to_step_scoped(
     // Index space of the result: edits, then unchanged elements, then rejected entities.
     let all: Vec<&cad_slicer::DxfRoundTripEdit> =
         diff.edits.iter().chain(diff.unchanged.iter()).collect();
+    let any_admitted = all
+        .iter()
+        .enumerate()
+        .any(|(i, edit)| scope.admits(i, edit, &meta.model_id).is_ok());
+    let owned_step = if preindexed.is_none() && any_admitted {
+        step_parser::index(original_ifc).ok()
+    } else {
+        None
+    };
     let input = PlanInput {
         all: &all,
         changed: diff.edits.len(),
         meta,
         scope,
         previous: &previous,
+        step: preindexed.or(owned_step.as_ref()),
         inv_scale: 1.0 / scale,
     };
     let first = plan_edits(&input, &Adjust::default());

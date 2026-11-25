@@ -105,6 +105,37 @@ pub struct PatchOptions<'r> {
     pub require_global_id: bool,
 }
 
+/// Checks that `express_id` exists in `step`, has a `GlobalId` string at parameter 0 and
+/// `IfcProduct` placement/representation slots, and matches `expected_global_id` (prefix match
+/// allowed for 31-character DXF block names). Returns the product's current `Representation`
+/// reference (`param 6`) when present.
+pub fn check_product_guid(
+    step: &StepIndex<'_>,
+    express_id: u32,
+    expected_global_id: Option<&str>,
+    require_global_id: bool,
+) -> Result<Option<u32>, &'static str> {
+    let ent_ref = step.get(express_id).ok_or("not-found")?;
+    let entity = step.decode_ref(ent_ref).map_err(|_| "not-found")?;
+    let actual_guid = match entity.params.first() {
+        Some(Value::String(g)) => g.as_str(),
+        _ => return Err("not-a-product"),
+    };
+    if entity.params.len() < 7 {
+        return Err("not-a-product");
+    }
+    match expected_global_id.filter(|g| !g.is_empty()) {
+        Some(expected) if !actual_guid.starts_with(expected) => return Err("guid-mismatch"),
+        None if require_global_id => return Err("guid-missing"),
+        _ => {}
+    }
+    let rep_id = match entity.params.get(6) {
+        Some(Value::Ref(id)) => Some(*id),
+        _ => None,
+    };
+    Ok(rep_id)
+}
+
 /// Applies surgical STEP patches with the default options.
 pub fn patch_step_file(
     original_ifc: &[u8],

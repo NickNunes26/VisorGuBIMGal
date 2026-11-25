@@ -123,8 +123,9 @@ impl LoadedModel {
         dxf_bytes: &[u8],
         scope: &crate::clash_dxf::ApplyScope,
     ) -> Result<(Vec<u8>, String), String> {
-        crate::clash_dxf::apply_clash_dxf_to_step_scoped(
+        crate::clash_dxf::apply_clash_dxf_to_step_indexed(
             self.raw_bytes(),
+            Some(self.file),
             self.length_unit_scale(),
             dxf_bytes,
             scope,

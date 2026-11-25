@@ -1090,3 +1090,35 @@ fn f5_reverting_rebend_while_moving_insert_lands_at_moved_position() {
     assert!(json.contains("\"reason\":\"already-applied\""), "{json}");
     assert_eq!(again, moved_straight);
 }
+
+#[test]
+fn f7_foreign_global_id_on_patched_express_id_reports_guid_mismatch_not_conflict() {
+    let ifc = utm_ifc();
+    let a = utm_sheet_at(ifc.as_bytes(), 540_000.5, 1234.0, 1000.0);
+    let b = utm_sheet_at(ifc.as_bytes(), 540_001.5, 1235.0, 1000.0);
+    let a_up = move_insert(&a, 100, 0.0, 0.10);
+    let (after_a, json) = apply_policy(ifc.as_bytes(), &a_up, "ask", 2000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+
+    // Another model's edit on #100 (different GlobalId) in section B must report `guid-mismatch`,
+    // never a false F7 `edit-conflict` from this model's own note on #100.
+    let b_foreign = move_insert(&b, 100, 0.0, 0.20)
+        .replace(GUID_A, GUID_RIGHT)
+        .replace(&GUID_A[..17], &GUID_RIGHT[..17]);
+    let (out_b, json_b) = apply_policy(&after_a, &b_foreign, "ask", 3000.0);
+    assert_eq!(json_field(&json_b, "applied"), "0", "{json_b}");
+    assert!(json_b.contains("\"reason\":\"guid-mismatch\""), "{json_b}");
+    assert!(!json_b.contains("edit-conflict"), "{json_b}");
+    assert_eq!(out_b, after_a);
+
+    // Likewise, tampering the GlobalId on an already-applied section A DXF must report
+    // `guid-mismatch`, never `already-applied`.
+    let a_foreign = a_up
+        .replace(GUID_A, GUID_RIGHT)
+        .replace(&GUID_A[..17], &GUID_RIGHT[..17]);
+    let (out_a, json_a) = apply_policy(&after_a, &a_foreign, "ask", 3000.0);
+    assert_eq!(json_field(&json_a, "applied"), "0", "{json_a}");
+    assert!(json_a.contains("\"reason\":\"guid-mismatch\""), "{json_a}");
+    assert!(!json_a.contains("already-applied"), "{json_a}");
+    assert_eq!(out_a, after_a);
+}
