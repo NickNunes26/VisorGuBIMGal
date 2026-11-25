@@ -477,22 +477,27 @@ pub fn parse_clash_dxf_edits(dxf_bytes: &[u8]) -> Result<DxfRoundTripDiff, Strin
                     .flatten()
             });
         let delta = insert_delta.get(&block_key).copied().unwrap_or(DVec2::ZERO);
-        let is_unchanged_or_same_move = |pts_2d: &[DVec2]| {
+        let matches_orig = |pts_2d: &[DVec2]| {
             orig_pts.is_some_and(|orig_pts| {
-                if orig_pts.len() != pts_2d.len() {
-                    return false;
-                }
-                let matches_orig = orig_pts
-                    .iter()
-                    .zip(pts_2d)
-                    .all(|(a, b)| a.distance(*b) <= MIN_MOVE_EPS_M);
-                let matches_insert_move = delta.length() > MIN_MOVE_EPS_M
+                orig_pts.len() == pts_2d.len()
                     && orig_pts
                         .iter()
                         .zip(pts_2d)
-                        .all(|(a, b)| (*a + delta).distance(*b) <= MIN_MOVE_EPS_M);
-                matches_orig || matches_insert_move
+                        .all(|(a, b)| a.distance(*b) <= MIN_MOVE_EPS_M)
             })
+        };
+        let matches_insert_move = |pts_2d: &[DVec2]| {
+            delta.length() > MIN_MOVE_EPS_M
+                && orig_pts.is_some_and(|orig_pts| {
+                    orig_pts.len() == pts_2d.len()
+                        && orig_pts
+                            .iter()
+                            .zip(pts_2d)
+                            .all(|(a, b)| (*a + delta).distance(*b) <= MIN_MOVE_EPS_M)
+                })
+        };
+        let is_unchanged_or_same_move = |pts_2d: &[DVec2]| {
+            matches_orig(pts_2d) || matches_insert_move(pts_2d)
         };
         // A new polyline drawn next to the exported one, which was left in place, is the
         // edit; two that both differ from the export cannot be told apart.
@@ -524,7 +529,8 @@ pub fn parse_clash_dxf_edits(dxf_bytes: &[u8]) -> Result<DxfRoundTripDiff, Strin
             }
             None => continue,
         };
-        let is_unchanged_or_same_move = is_unchanged_or_same_move(&pts_2d);
+        let stayed_at_orig = matches_orig(&pts_2d);
+        let is_unchanged_or_same_move = stayed_at_orig || matches_insert_move(&pts_2d);
         let (Some(norm), true) = (meta.norm_offset, meta.complete) else {
             if !is_unchanged_or_same_move {
                 rejected.push(reject("metadata-incomplete"));
@@ -533,9 +539,12 @@ pub fn parse_clash_dxf_edits(dxf_bytes: &[u8]) -> Result<DxfRoundTripDiff, Strin
         };
         let s_mid = 0.5 * (meta.s_min.unwrap_or(0.0) + meta.s_max.unwrap_or(0.0));
         let s_mid_shift = s_mid - meta.frame.origin.dot(meta.frame.look);
+        // When the drafter moved only the INSERT and left EDIT_A untouched at its exported
+        // place, the unbent bar in this DXF stands at `pts_2d + delta`.
+        let lift_delta = if stayed_at_orig { delta } else { DVec2::ZERO };
         let points_3d: Vec<DVec3> = pts_2d
             .into_iter()
-            .map(|p| meta.frame.unproject(p + norm) + meta.frame.look * s_mid_shift)
+            .map(|p| meta.frame.unproject(p + lift_delta + norm) + meta.frame.look * s_mid_shift)
             .collect();
         let edit = DxfRoundTripEdit::Rebend {
             express_id: rec.id,

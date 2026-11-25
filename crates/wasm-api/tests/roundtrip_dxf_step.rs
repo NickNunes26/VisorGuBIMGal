@@ -1051,3 +1051,42 @@ fn f7_rebends_from_two_sections_ask_and_replace_keeps_the_later_drawing() {
     assert_eq!(json_field(&json, "applied"), "0", "{json}");
     assert!(!json.contains("edit-conflict"), "{json}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Third F5 review regression tests (`test/e2e/review-f5/REPORT.md`, T-F5R3).
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn f5_reverting_rebend_while_moving_insert_lands_at_moved_position() {
+    let ifc = utm_ifc();
+    let sheet = utm_sheet(&ifc);
+    let dxf = String::from_utf8(to_clash_dxf(&sheet)).unwrap();
+    let z0 = centre_z(ifc.as_bytes());
+    let ins = sheet.blocks_a[0].insert_point;
+
+    // 1. Rebend #100 into a V.
+    let v_dxf = add_edit_polyline(
+        &dxf,
+        100,
+        &[(ins.x - 0.04, ins.y), (ins.x, ins.y + 0.15), (ins.x + 0.04, ins.y)],
+    );
+    let (bent, json) = apply_plain(ifc.as_bytes(), &v_dxf);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+
+    // 2. Revert EDIT_A_100 to the exported straight polyline while moving INSERT +0.30 m up.
+    let straight_moved = move_insert(&dxf, 100, 0.0, 0.30);
+    let (moved_straight, json) = apply_plain(&bent, &straight_moved);
+    assert_eq!(json_field(&json, "applied"), "2", "{json}");
+    let (lo, hi) = bounds(&eval_mesh(&moved_straight, 100));
+    assert!(
+        (hi.z - lo.z) < 0.05 && ((lo.z + hi.z) * 0.5 - (z0 + 0.30)).abs() < 1e-4,
+        "bar must be straight at z0 + 0.30 ({}), got {lo:?}..{hi:?}",
+        z0 + 0.30
+    );
+
+    // 3. Re-importing the same straight+move DXF is idempotent (`already-applied`).
+    let (again, json) = apply_plain(&moved_straight, &straight_moved);
+    assert_eq!(json_field(&json, "applied"), "0", "{json}");
+    assert!(json.contains("\"reason\":\"already-applied\""), "{json}");
+    assert_eq!(again, moved_straight);
+}
