@@ -171,3 +171,35 @@ The expectations of two checks changed with the fixes, and the edits sit next to
 - **Federated (b):** that DXF shows the left INSERT at its exported position, so the F4 revert puts the left bar back.
 
 `probe-node.mjs` follows the new `Model.applyClashDxf(dxf, selfModelId, openModelIds, exclude)` signature.
+
+## Third review (2026-11-25)
+
+**Starting commit:** `3bb5912` (`fix/f5-roundtrip`).
+**Setup:** Vite dev server serving the worktree (`http://127.0.0.1:5198/`, as `5199` was occupied by the main checkout) + headless Chrome via `test/e2e/cdp.mjs` across `gpu`, `gl2` and `none`, plus `probe-models.mjs` and `probe-node.mjs`.
+
+### Scenarios added (`test/e2e/review-f5/scenarios.mjs`)
+
+| Scenario | Checks | What it exercises |
+|---|---|---|
+| `f7-three-sections-and-choices` | 21 | Longitudinal tendon `T1` across 3 sections (`PK 0+105`, `0+110`, `0+115`): «Cancelar» and «Omitir» preserving live geometry, `patched.ifc` and `audit.csv`; equal-displacement «Sustituir»; cycling «Sustituir» across all 3 sections in turn; «Sumar» followed by re-importing an earlier section to undo the sum; Node readback |
+| `f7-move-rebend-cross` | 11 | Two-tendon stirrup cut by two transverse sections (`twoSectionStirrupModel` in `gen.mjs`): single-section rebend -> revert `EDIT_A` + move `INSERT`; move in A + rebend in B («Sustituir» and «Sumar»); rebend in A + move in B with untouched `EDIT_A` and with `EDIT_A` deleted in CAD («Sustituir» and commutative «Sumar») |
+| `f7-legacy-and-clock` | 9 | Legacy DXF without `GUBIM_META t=`; pre-F7 IFC notes without `w=`/`t=` (same-section idempotence, safe `edit-conflict` refusal on «Sustituir», working «Sumar»); multi-day clock (`t = now - 3d` warning on 2nd section, `t = now + 1d` applying without conflict) |
+| `f7-federated` | 7 | Two federated bridge decks: mixed section with conflict on left deck + clean move on right deck («Omitir» applies right and skips left; re-import + «Sustituir» updates left; both patched IFCs verified in Node); stale-session foreign `GlobalId` on a patched `expressId` (different key and tampered same key) refused as `guid-mismatch` |
+| `f11-representations-deep` | 7 | `IFC2X3`, `IFC4` and `IFC4X3_ADD2` with `[Axis, Body, Box]` (`IfcBoundingBox`) on `bar5`: rebend + subsequent move+rebend keeps order, redraws `Axis` in its own subcontext on the new directrix, leaves `Box` verbatim, and re-reads in Node with 0 diagnostics |
+
+### Findings on `3bb5912` and fixes on `gemini/f5-review3`
+
+| ID | Severity | Scenario | Expected vs got on `3bb5912` | Cause (`file:line` on `3bb5912`) | Status |
+|---|---|---|---|---|---|
+| F13 | High | `f7-move-rebend-cross` (a), (c1): revert `EDIT_A` to straight while moving `INSERT` `+0.30` (or `Replace` from section B moving `+0.20` with untouched `EDIT_A` after section A rebent) | Expected straight bar at `z = 0.80` / `0.70`; got `z = 0.50` (`2 elementos actualizados`, move cancelled out and stuck as `ya aplicado`) | `crates/cad-slicer/src/roundtrip.rs:536-539` lifted untouched `EDIT_A` without `INSERT` `delta`, while `crates/wasm-api/src/clash_dxf.rs:577` subtracted `shift = delta_3d` | Fixed in `262e64b` |
+| F14 | Medium | `f7-move-rebend-cross` (b2), (c3): section A moves `+0.20`, then section B (pre-move DXF) rebends to `V` -> «Sumar las dos ediciones» | Expected `V + 0.20` (`z = 0.365..0.735`, matching `rebend A + move B`); got `V` (`0.165..0.535`), wiping out A's move while leaving A's `w=+0.20` note active | `crates/wasm-api/src/clash_dxf.rs:544,667` did not add kept unseen moves (`unseen(..., "move")`) to B's pre-move `points_3d`, and `RebendSweptDisk` subtracted the already-shifted `t_elem` | Fixed in `f4a6686` |
+| F15 | Medium | `f7-move-rebend-cross` (c2): section A rebends to `V`, then section B (no `EDIT_A` polyline: longitudinal cut or `EDIT_A` deleted in CAD) moves `+0.20` -> «Sustituir por este DXF» | Expected original straight bar at `z = 0.70` with A's rebend dropped; got `V + 0.20` (`0.365..0.735`, identical to «Sumar») | `crates/wasm-api/src/clash_dxf.rs:689-700` relied on `force_rebend`, which is a no-op when the imported DXF has no `Rebend` entry | Fixed in `f4a6686` (`rep=` in rebend notes + `StepPatch::RestoreRepresentation`) |
+| F16 | Medium | `f7-three-sections-and-choices`: section A moves `+0.10`, section B also draws `+0.10` -> «Sustituir por este DXF» | Expected `1 elementos actualizados` (`z = 0.60`), A's note dropped and B recorded; got `1 omitidos (1 ya aplicado)`, A not dropped, re-importing B warned again | `crates/wasm-api/src/clash_dxf.rs:477` skipped `delta_world <= MOVE_EPS_M` even when `drop_moves` was non-empty | Fixed in `b3b7f42` (`StepPatch::RecordNote`) |
+| F17 | Medium | `f7-three-sections-and-choices`: section A (`+0.30`) applied, section B (`+0.10`) summed via «Sumar» (`z = 0.90`), then section A (`+0.30`) re-imported | Expected F7 conflict warning so «Sustituir» can restore `z = 0.80`; got `ya aplicado`, leaving `T1` at `z = 0.90` | `crates/wasm-api/src/clash_dxf.rs:477,553` checked only `own = delta_2d - done` without checking whether another section imported a newer active unseen edit after `own_note.seq` | Fixed in `b3b7f42` |
+| F18 | Medium | `f7-federated`: stale-session DXF carrying another model's `GlobalId` on an `expressId` that has F5 notes in the open model | Expected `GlobalId distinto` (`guid-mismatch`); got false F7 conflict banner naming the foreign `GlobalId` (or `ya aplicado` on a tampered same-key DXF) | `crates/wasm-api/src/clash_dxf.rs:452-590` planned notes/conflicts before `patch_step_file_with` checked `GlobalId` | Fixed in `8556018` (`step_parser::check_product_guid` in `plan_edits`) |
+
+Also noted (Low UX observation, left unchanged to avoid scope creep): at `1400×900` with `ClashPanel` at `scrollTop = 0`, `clash-roundtrip-conflict` opens near the bottom of the scrollable left sidebar so the wrapped second row of buttons (`Cancelar`) sits just below the fold until scrolled. Also cleaned up `process.once('exit', ...)` listener accumulation on Chrome exit in `test/e2e/cdp.mjs` (`f4a6686`).
+
+### Status after the third-review fixes
+
+Full rerun of `scenarios.mjs` across all 19 scenarios on `gpu`, `gl2` and `none`: **174/174 checks pass on `gpu`, 174/174 on `gl2`, and 174/174 on `none`** (522/522 total), with zero console errors, clean `probe-models.mjs`, and expected refusal/apply outcomes across all 19 `probe-node.mjs` cases (including F12's `1e7` m move allowed and `1e300` m refused as `out-of-range`).

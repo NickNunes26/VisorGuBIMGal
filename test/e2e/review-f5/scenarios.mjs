@@ -5,11 +5,11 @@
 import os from 'node:os';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { bridge, gridModel, linearModel, landXml } from './gen.mjs';
+import { bridge, gridModel, linearModel, twoSectionStirrupModel, landXml } from './gen.mjs';
 import {
   REPO, session, sleep, nodeModel, nodeBounds, centre, near, sub, r6, readZip,
   dxfLines, entities, units, rebuild, inserts, metaTexts, moveInsert, blockOf, editPolyline,
-  setEditPolyline, kerbTop, maxLineLen, retargetGuid
+  setEditPolyline, deleteEditPolyline, setMetaTimestamp, kerbTop, maxLineLen, retargetGuid
 } from './lib.mjs';
 
 const [mode = 'gpu', base = 'http://127.0.0.1:5199/', outArg = '', only = ''] = process.argv.slice(2);
@@ -774,6 +774,441 @@ await scenario('patched-fresh', async ({ dir, check, open }) => {
   const c15 = centre(await S.liveBounds(pid, m.products.bar15));
   check('new export from the patched file, bar15 moved: applied, 1 clash left', appliedOf(n2) === 1 && remainingOf(n2) === 1 && Math.abs(c15[2] - 0.8) < 1e-4, { n2, c15: r6(c15) });
   await S.shot(path.join(dir, '01-patched-fresh.png'));
+});
+
+// =============================================================================================
+// Third review scenarios (T-F5R3, 2026-11-25): F7 edge cases & deep F11 verification.
+// =============================================================================================
+await scenario('f7-three-sections-and-choices', async ({ dir, check, open }) => {
+  const m = bridge({ guidPrefix: '3ThrSec' });
+  const S = await open();
+  const { ids, zip } = await bridgeFlow(S, dir, [W(dir, 'bridge.ifc', m.text)], { classA: 'IfcTendon', classB: 'IfcReinforcingBar' });
+  const bid = ids[0];
+  const d105 = sectionDxf(zip, '0+105');
+  const d110 = sectionDxf(zip, '0+110');
+  const d115 = sectionDxf(zip, '0+115');
+  const tz = async () => centre(await S.liveBounds(bid, m.products.tendon))[2];
+
+  // 1. Apply PK 105 (+0.10 -> z=0.60), capture baseline patched IFC and CSV.
+  const p105_010 = W(dir, 'PK105_010.dxf', moveInsert(d105, blockOf(m.products.tendon), 0, 0.10).text);
+  const p110_020 = W(dir, 'PK110_020.dxf', moveInsert(d110, blockOf(m.products.tendon), 0, 0.20).text);
+  const p110_010 = W(dir, 'PK110_010.dxf', moveInsert(d110, blockOf(m.products.tendon), 0, 0.10).text);
+  const p115_030 = W(dir, 'PK115_030.dxf', moveInsert(d115, blockOf(m.products.tendon), 0, 0.30).text);
+
+  const n1 = await S.reimport(p105_010);
+  check('PK105 +0.10 applied (z=0.60)', appliedOf(n1) === 1 && Math.abs((await tz()) - 0.6) < 1e-4, { n1, z: await tz() });
+  const ifcBefore = readFileSync(await S.downloadPatched(), 'utf8');
+  const csvBefore = readFileSync(await S.downloadCsv(), 'utf8');
+
+  // 2. «Cancelar» leaves live model, patched IFC and CSV byte-for-byte identical.
+  await S.reimport(p110_020);
+  const cText = await S.conflictText();
+  check('PK110 +0.20 raises F7 conflict naming T1 and its GlobalId', (await S.conflictShown()) && cText.includes(`#${m.products.tendon}`) && cText.includes(m.guids.tendon), { cText });
+  await S.shot(path.join(dir, '01-conflict-choices.png'));
+  await S.ev(`document.querySelector('[data-testid="clash-roundtrip-conflict"]')?.scrollIntoView({ block: 'center' })`);
+  await sleep(100);
+  await S.shot(path.join(dir, '01b-conflict-choices-scrolled.png'));
+  const nCancel = await S.resolveConflict('cancel');
+  const ifcAfterCancel = readFileSync(await S.downloadPatched(), 'utf8');
+  const csvAfterCancel = readFileSync(await S.downloadCsv(), 'utf8');
+  check('«Cancelar» hides warning, leaves live z=0.60, patched IFC and CSV byte-for-byte identical', !(await S.conflictShown()) && /Importación DXF cancelada/.test(nCancel.join(' ')) && Math.abs((await tz()) - 0.6) < 1e-6 && ifcAfterCancel === ifcBefore && csvAfterCancel === csvBefore, { nCancel });
+
+  // 3. «Omitir» leaves live model and patched IFC byte-for-byte identical, and CSV stays downloadable.
+  await S.reimport(p110_020);
+  check('re-importing PK110 after Cancelar asks again', await S.conflictShown());
+  const nSkip = await S.resolveConflict('skip');
+  const ifcAfterSkip = readFileSync(await S.downloadPatched(), 'utf8');
+  const csvAfterSkip = readFileSync(await S.downloadCsv(), 'utf8');
+  check('«Omitir» leaves live z=0.60 and patched IFC identical, reports edit-conflict', !(await S.conflictShown()) && /editado desde otra sección/.test(nSkip.join(' ')) && Math.abs((await tz()) - 0.6) < 1e-6 && ifcAfterSkip === ifcBefore && csvAfterSkip.includes('edit-conflict'), { nSkip });
+
+  // 4. Same displacement (+0.10) in PK110 resolved with «Sustituir»: adopts PK110 without error and drops PK105.
+  await S.reimport(p110_010);
+  check('PK110 +0.10 (same move as PK105) asks before double-moving to +0.20', await S.conflictShown());
+  const nSameReplace = await S.resolveConflict('replace');
+  check('«Sustituir» with equal displacement (+0.10) succeeds (1 applied, z=0.60, not red error)', appliedOf(nSameReplace) === 1 && Math.abs((await tz()) - 0.6) < 1e-4, { nSameReplace, z: await tz() });
+  const nSameAgain = await S.reimport(p110_010);
+  check('re-importing PK110 +0.10 after «Sustituir» says "ya aplicado" without asking again', !(await S.conflictShown()) && /ya aplicado/.test(nSameAgain.join(' ')), { nSameAgain });
+
+  // 5. Three sections editing T1 (+0.10, +0.20, +0.30) and «Sustituir» cycling through all three in turn.
+  const nTo110 = await S.reimport(p110_020);
+  check('PK110 updated from +0.10 to +0.20 applies +0.10 difference without conflict', !(await S.conflictShown()) && appliedOf(nTo110) === 1 && Math.abs((await tz()) - 0.7) < 1e-4, { nTo110, z: await tz() });
+  await S.reimport(p115_030);
+  check('3rd section PK115 +0.30 asks on conflict', await S.conflictShown());
+  const n115 = await S.resolveConflict('replace');
+  check('PK115 «Sustituir» lands at +0.30 (z=0.80)', appliedOf(n115) === 1 && Math.abs((await tz()) - 0.8) < 1e-4, { n115, z: await tz() });
+
+  for (const [label, file, wantZ] of [['PK105', p105_010, 0.6], ['PK110', p110_020, 0.7], ['PK115', p115_030, 0.8]]) {
+    await S.reimport(file);
+    const asked = await S.conflictShown();
+    const nr = asked ? await S.resolveConflict('replace') : [];
+    const curZ = await tz();
+    check(`cycle «Sustituir» ${label} lands at z=${wantZ}`, asked && appliedOf(nr) === 1 && Math.abs(curZ - wantZ) < 1e-4, { asked, nr, z: curZ });
+  }
+  const n115Idem = await S.reimport(p115_030);
+  check('after cycle, re-importing active PK115 says "ya aplicado"', !(await S.conflictShown()) && /ya aplicado/.test(n115Idem.join(' ')), n115Idem);
+
+  // 6. «Sumar» (PK115 +0.30 + PK105 +0.10 = +0.40), then re-importing earlier PK115 asks and «Sustituir» restores +0.30.
+  await S.reimport(p105_010);
+  check('PK105 +0.10 after PK115 asks', await S.conflictShown());
+  const nSum = await S.resolveConflict('add');
+  check('«Sumar» lands T1 at +0.40 (z=0.90)', appliedOf(nSum) === 1 && Math.abs((await tz()) - 0.9) < 1e-4, { nSum, z: await tz() });
+  const n105Idem = await S.reimport(p105_010);
+  check('re-importing just-summed PK105 says "ya aplicado"', !(await S.conflictShown()) && /ya aplicado/.test(n105Idem.join(' ')), n105Idem);
+  await S.reimport(p115_030);
+  const askedAfterSum = await S.conflictShown();
+  const nBack115 = askedAfterSum ? await S.resolveConflict('replace') : [];
+  check('re-importing earlier PK115 (+0.30) after PK105 was summed asks and «Sustituir» restores z=0.80', askedAfterSum && appliedOf(nBack115) === 1 && Math.abs((await tz()) - 0.8) < 1e-4, { askedAfterSum, nBack115, z: await tz() });
+
+  const patched = readFileSync(await S.downloadPatched(), 'utf8');
+  const nm = nodeModel(patched);
+  const nc = centre(nodeBounds(nm, m.products.tendon));
+  check('Node kernel readback of downloaded IFC matches live z=0.80', near(nc, [1015, 2000, 0.8], 1e-4), { nc: r6(nc) });
+  await S.shot(path.join(dir, '02-three-sections-final.png'));
+});
+
+// =============================================================================================
+await scenario('f7-move-rebend-cross', async ({ dir, check, open }) => {
+  const m = twoSectionStirrupModel({ guidPrefix: '3MvRbCr' });
+  const ifcPath = W(dir, 'two_sec.ifc', m.text);
+  let secA;
+  let secB;
+  let V;
+  // Session 1: export two sections of bar5; test single-section rebend -> revert+move; then reset.
+  {
+    const S = await open();
+    const { ids, cards, zip } = await bridgeFlow(S, dir, [ifcPath]);
+    const bid = ids[0];
+    const indiv = [...zip.keys()].filter((k) => k.startsWith('individual/')).sort();
+    check('2 clashes on bar5 produce 2 transverse DXF sections', cards.length === 2 && indiv.length === 2, { cards: cards.length, indiv });
+    secA = dec(zip.get(indiv[0]));
+    secB = dec(zip.get(indiv[1]));
+    const iA = inserts(secA).find((i) => blockOf(m.products.bar5)(i.block));
+    check('both sections carry bar5 INSERT and EDIT_A polyline', !!iA && !!editPolyline(secA, m.products.bar5) && !!editPolyline(secB, m.products.bar5), {});
+    V = [[iA.x - 1.8, iA.y], [iA.x, iA.y - 0.3], [iA.x + 1.8, iA.y]];
+
+    // (a) Single-section: rebend V, then revert EDIT_A to straight + move INSERT +0.30 -> straight at z=0.80.
+    const n1 = await S.reimport(W(dir, 'secA_V.dxf', setEditPolyline(secA, m.products.bar5, V)));
+    const b1 = await S.liveBounds(bid, m.products.bar5);
+    check('(a) single-section V rebend applied (z ~ 0.165..0.535)', appliedOf(n1) === 1 && Math.abs(b1.lo[2] - 0.165) < 0.01 && Math.abs(b1.hi[2] - 0.535) < 0.01, { lo: r6(b1.lo), hi: r6(b1.hi) });
+    const revMove = W(dir, 'secA_straight_up030.dxf', moveInsert(secA, blockOf(m.products.bar5), 0, 0.30).text);
+    const n2 = await S.reimport(revMove);
+    const b2 = await S.liveBounds(bid, m.products.bar5);
+    check('(a) reverting EDIT_A + moving INSERT +0.30 puts bar5 straight at z=0.80', Math.abs(centre(b2)[2] - 0.8) < 0.004 && Math.abs(b2.hi[2] - b2.lo[2] - 0.07) < 0.008, { n2, lo: r6(b2.lo), hi: r6(b2.hi) });
+    const n3 = await S.reimport(revMove);
+    check('(a) re-importing straight+move DXF again is idempotent ("ya aplicado", z=0.80)', /ya aplicado/.test(n3.join(' ')) && Math.abs(centre(await S.liveBounds(bid, m.products.bar5))[2] - 0.8) < 0.004, { n3 });
+    await S.close();
+  }
+  const iB = inserts(secB).find((i) => blockOf(m.products.bar5)(i.block));
+  const VB = [[iB.x - 1.8, iB.y], [iB.x, iB.y - 0.3], [iB.x + 1.8, iB.y]];
+  const fMoveA = W(dir, 'A_move020.dxf', moveInsert(secA, blockOf(m.products.bar5), 0, 0.20).text);
+  const fRebendB = W(dir, 'B_rebendV.dxf', setEditPolyline(secB, m.products.bar5, VB));
+  const fRebendA = W(dir, 'A_rebendV.dxf', setEditPolyline(secA, m.products.bar5, V));
+  const fMoveB = W(dir, 'B_move020.dxf', moveInsert(secB, blockOf(m.products.bar5), 0, 0.20).text);
+  const fMoveBNoPoly = W(dir, 'B_move020_nopoly.dxf', deleteEditPolyline(moveInsert(secB, blockOf(m.products.bar5), 0, 0.20).text, m.products.bar5));
+
+  // (b1) Move in A (+0.20), then Rebend in B (V) -> «Sustituir» lands on V (0.165..0.535).
+  {
+    const S = await open();
+    await S.loadIfc(ifcPath, 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcReinforcingBar', classB: 'IfcTendon' });
+    await S.runClash();
+    await S.reimport(fMoveA);
+    await S.reimport(fRebendB);
+    const asked = await S.conflictShown();
+    const nr = asked ? await S.resolveConflict('replace') : [];
+    const b = await S.liveBounds(bid, m.products.bar5);
+    const nm = nodeModel(readFileSync(await S.downloadPatched(), 'utf8'));
+    const nb = nodeBounds(nm, m.products.bar5);
+    check('(b1) A move +0.20 then B rebend V -> «Sustituir» lands on V (A undone)', asked && Math.abs(b.lo[2] - 0.165) < 0.01 && Math.abs(b.hi[2] - 0.535) < 0.01 && near(nb.lo, b.lo, 1e-4), { asked, nr, lo: r6(b.lo), hi: r6(b.hi) });
+    await S.close();
+  }
+  // (b2) Move in A (+0.20), then Rebend in B (V) -> «Sumar» lands on V + 0.20 (0.365..0.735).
+  let sumMoveThenRebend;
+  {
+    const S = await open();
+    await S.loadIfc(ifcPath, 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcReinforcingBar', classB: 'IfcTendon' });
+    await S.runClash();
+    await S.reimport(fMoveA);
+    await S.reimport(fRebendB);
+    const asked = await S.conflictShown();
+    const nr = asked ? await S.resolveConflict('add') : [];
+    sumMoveThenRebend = await S.liveBounds(bid, m.products.bar5);
+    check('(b2) A move +0.20 then B rebend V -> «Sumar» shifts V by +0.20 (0.365..0.735)', asked && Math.abs(sumMoveThenRebend.lo[2] - 0.365) < 0.01 && Math.abs(sumMoveThenRebend.hi[2] - 0.735) < 0.01, { asked, nr, lo: r6(sumMoveThenRebend.lo), hi: r6(sumMoveThenRebend.hi) });
+    await S.close();
+  }
+  // (c1) Rebend in A (V), then Move in B (+0.20, untouched EDIT_A) -> «Sustituir» lands straight at z=0.70.
+  {
+    const S = await open();
+    await S.loadIfc(ifcPath, 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcReinforcingBar', classB: 'IfcTendon' });
+    await S.runClash();
+    await S.reimport(fRebendA);
+    await S.reimport(fMoveB);
+    const asked = await S.conflictShown();
+    const nr = asked ? await S.resolveConflict('replace') : [];
+    const b = await S.liveBounds(bid, m.products.bar5);
+    check('(c1) A rebend V then B move +0.20 -> «Sustituir» lands straight at z=0.70', asked && Math.abs(centre(b)[2] - 0.7) < 0.004 && Math.abs(b.hi[2] - b.lo[2] - 0.07) < 0.008, { asked, nr, lo: r6(b.lo), hi: r6(b.hi) });
+    await S.close();
+  }
+  // (c2) Rebend in A (V), then Move in B (+0.20, EDIT_A deleted in CAD) -> «Sustituir» restores straight shape at z=0.70.
+  {
+    const S = await open();
+    await S.loadIfc(ifcPath, 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcReinforcingBar', classB: 'IfcTendon' });
+    await S.runClash();
+    await S.reimport(fRebendA);
+    await S.reimport(fMoveBNoPoly);
+    const asked = await S.conflictShown();
+    const nr = asked ? await S.resolveConflict('replace') : [];
+    const b = await S.liveBounds(bid, m.products.bar5);
+    const nAgain = await S.reimport(fMoveBNoPoly);
+    check('(c2) A rebend V then B move +0.20 (no EDIT_A) -> «Sustituir» restores straight bar at z=0.70 and is idempotent', asked && Math.abs(centre(b)[2] - 0.7) < 0.004 && Math.abs(b.hi[2] - b.lo[2] - 0.07) < 0.008 && !(await S.conflictShown()) && /ya aplicado/.test(nAgain.join(' ')), { asked, nr, lo: r6(b.lo), hi: r6(b.hi), nAgain });
+    await S.close();
+  }
+  // (c3) Rebend in A (V), then Move in B (+0.20) -> «Sumar» matches (b2) commutatively (V + 0.20).
+  {
+    const S = await open();
+    await S.loadIfc(ifcPath, 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcReinforcingBar', classB: 'IfcTendon' });
+    await S.runClash();
+    await S.reimport(fRebendA);
+    await S.reimport(fMoveB);
+    const asked = await S.conflictShown();
+    await S.resolveConflict('add');
+    const b = await S.liveBounds(bid, m.products.bar5);
+    check('(c3) «Sumar» is commutative: (rebend A + move B) matches (move A + rebend B)', asked && near(b.lo, sumMoveThenRebend.lo, 2e-3) && near(b.hi, sumMoveThenRebend.hi, 2e-3), { lo: r6(b.lo), hi: r6(b.hi) });
+    await S.shot(path.join(dir, '01-move-rebend-cross.png'));
+    await S.close();
+  }
+});
+
+// =============================================================================================
+await scenario('f7-legacy-and-clock', async ({ dir, check, open }) => {
+  const m = bridge({ guidPrefix: '3LegClk' });
+  let d105;
+  let d110;
+  let d115;
+  let patchedPreF7;
+  // (a) Legacy DXF without `t=` in GUBIM_META + capture a pre-F7 IFC without `w=` / `t=` in notes.
+  {
+    const S = await open();
+    const { ids, zip } = await bridgeFlow(S, dir, [W(dir, 'bridge.ifc', m.text)], { classA: 'IfcTendon', classB: 'IfcReinforcingBar' });
+    const bid = ids[0];
+    d105 = sectionDxf(zip, '0+105');
+    d110 = sectionDxf(zip, '0+110');
+    d115 = sectionDxf(zip, '0+115');
+    await S.reimport(W(dir, 'PK105_010.dxf', moveInsert(d105, blockOf(m.products.tendon), 0, 0.10).text));
+    const fullPatched = readFileSync(await S.downloadPatched(), 'utf8');
+    patchedPreF7 = fullPatched.replace(/(\/\* GUBIM_F5 [^*]*?)\s+w=\S+\s+t=\d+(\s*\*\/)/g, '$1$2');
+    check('constructed pre-F7 patched IFC note without w= or t=', !/\bw=/.test(patchedPreF7) && /\/\* GUBIM_F5 /.test(patchedPreF7), {});
+
+    const noT110 = setMetaTimestamp(moveInsert(d110, blockOf(m.products.tendon), 0, 0.20).text, null);
+    check('legacy DXF has no t= in GUBIM_META', !/GUBIM_META [^\r\n]*\bt=/.test(noT110), {});
+    await S.reimport(W(dir, 'PK110_no_t.dxf', noT110));
+    const asked = await S.conflictShown();
+    const nr = asked ? await S.resolveConflict('replace') : [];
+    const z = centre(await S.liveBounds(bid, m.products.tendon))[2];
+    check('(a) DXF without t= raises conflict and «Sustituir» lands at z=0.70', asked && appliedOf(nr) === 1 && Math.abs(z - 0.7) < 1e-4, { asked, nr, z });
+    await S.close();
+  }
+  // (b) Pre-F7 IFC note without w= / t=.
+  {
+    const S = await open();
+    await S.loadIfc(W(dir, 'bridge_pref7.ifc', patchedPreF7), 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcTendon', classB: 'IfcReinforcingBar' });
+    await S.runClash();
+    const nSame = await S.reimport(W(dir, 'PK105_010_stale.dxf', moveInsert(d105, blockOf(m.products.tendon), 0, 0.10).text));
+    check('(b) pre-F7 note: re-importing same section PK105 says "ya aplicado" without conflict', !(await S.conflictShown()) && /ya aplicado/.test(nSame.join(' ')), nSame);
+    await S.reimport(W(dir, 'PK110_020_on_pref7.dxf', moveInsert(d110, blockOf(m.products.tendon), 0, 0.20).text));
+    const asked = await S.conflictShown();
+    const nRep = asked ? await S.resolveConflict('replace') : [];
+    const zAfterRep = centre(await S.liveBounds(bid, m.products.tendon))[2];
+    check('(b) pre-F7 note without w=: «Sustituir» safely refuses with edit-conflict, leaving z=0.60', asked && /editado desde otra sección/.test(nRep.join(' ')) && Math.abs(zAfterRep - 0.6) < 1e-4, { asked, nRep, zAfterRep });
+    await S.reimport(W(dir, 'PK110_020_on_pref7.dxf', moveInsert(d110, blockOf(m.products.tendon), 0, 0.20).text));
+    const nAdd = await S.resolveConflict('add');
+    const zAfterAdd = centre(await S.liveBounds(bid, m.products.tendon))[2];
+    check('(b) pre-F7 note without w=: «Sumar» adds +0.20 -> z=0.80', appliedOf(nAdd) === 1 && Math.abs(zAfterAdd - 0.8) < 1e-4, { nAdd, zAfterAdd });
+    await S.close();
+  }
+  // (c) Multi-day clock: DXFs exported 3 days ago, imported today; and a DXF exported 1 day in the future.
+  {
+    const S = await open();
+    await S.loadIfc(W(dir, 'bridge_clk.ifc', m.text), 1);
+    const [bid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: bid, modelB: bid, classA: 'IfcTendon', classB: 'IfcReinforcingBar' });
+    await S.runClash();
+    const dayMinus3 = Date.now() - 3 * 86_400_000;
+    const dayPlus1 = Date.now() + 86_400_000;
+    const old105 = setMetaTimestamp(moveInsert(d105, blockOf(m.products.tendon), 0, 0.15).text, dayMinus3);
+    const old110 = setMetaTimestamp(moveInsert(d110, blockOf(m.products.tendon), 0, 0.25).text, dayMinus3);
+    const future115 = setMetaTimestamp(moveInsert(d115, blockOf(m.products.tendon), 0, 0.05).text, dayPlus1);
+    await S.reimport(W(dir, 'day1_PK105.dxf', old105));
+    await S.reimport(W(dir, 'day1_PK110.dxf', old110));
+    const asked = await S.conflictShown();
+    await S.resolveConflict('replace');
+    const z1 = centre(await S.liveBounds(bid, m.products.tendon))[2];
+    check('(c) DXFs exported 3 days ago, imported today: 2nd section warns and «Sustituir» lands at z=0.75', asked && Math.abs(z1 - 0.75) < 1e-4, { asked, z1 });
+    const nFut = await S.reimport(W(dir, 'day_next_PK115.dxf', future115));
+    const z2 = centre(await S.liveBounds(bid, m.products.tendon))[2];
+    check('(c) DXF exported on a later day than earlier import applies +0.05 without conflict (z=0.80)', !(await S.conflictShown()) && appliedOf(nFut) === 1 && Math.abs(z2 - 0.8) < 1e-4, { nFut, z2 });
+    await S.shot(path.join(dir, '01-legacy-clock.png'));
+    await S.close();
+  }
+});
+
+// =============================================================================================
+await scenario('f7-federated', async ({ dir, check, open }) => {
+  const Lm = bridge({ guidPrefix: '3FedLft' });
+  const Rm = bridge({ guidPrefix: '4FedRgt', yOffset: 6 });
+  const lp = W(dir, 'left.ifc', Lm.text);
+  const rp = W(dir, 'right.ifc', Rm.text);
+  const isLT = (b) => b.includes('_' + Lm.guids.tendon.slice(0, 6));
+  const isRT = (b) => b.includes('_' + Rm.guids.tendon.slice(0, 6));
+  let d105;
+  let d110;
+  let leftPatchedText;
+  {
+    const S = await open();
+    const { ids, zip } = await bridgeFlow(S, dir, [lp, rp], { classA: 'IfcTendon', classB: 'IfcReinforcingBar', models: () => ({ a: '*', b: '*' }) });
+    const [lid, rid] = ids;
+    d105 = sectionDxf(zip, '0+105');
+    d110 = sectionDxf(zip, '0+110');
+    const tz = async (mid) => centre(await S.liveBounds(mid, Lm.products.tendon))[2];
+
+    // 1. PK105 moves left T1 +0.10 (z=0.60); right T1 untouched (z=0.50).
+    const n1 = await S.reimport(W(dir, 'PK105_L010.dxf', moveInsert(d105, isLT, 0, 0.10).text));
+    check('federated PK105 moves left T1 to 0.60, right stays 0.50', appliedOf(n1) === 1 && Math.abs((await tz(lid)) - 0.6) < 1e-4 && Math.abs((await tz(rid)) - 0.5) < 1e-6, { n1 });
+
+    // 2. PK110 moves left T1 +0.20 (conflicts!) AND right T1 +0.15 (clean!).
+    const both110 = W(dir, 'PK110_L020_R015.dxf', moveInsert(moveInsert(d110, isLT, 0, 0.20).text, isRT, 0, 0.15).text);
+    await S.reimport(both110);
+    const cText = await S.conflictText();
+    check('federated PK110 raises conflict for left T1 only (1 element), neither model reloaded yet', (await S.conflictShown()) && cText.includes('1 elemento') && cText.includes(Lm.guids.tendon) && !cText.includes(Rm.guids.tendon) && Math.abs((await tz(lid)) - 0.6) < 1e-6 && Math.abs((await tz(rid)) - 0.5) < 1e-6, { cText });
+    await S.shot(path.join(dir, '01-federated-conflict.png'));
+
+    // 3. «Omitir» applies right T1 (+0.15 -> 0.65) and leaves left T1 at 0.60!
+    const nSkip = await S.resolveConflict('skip');
+    check('federated «Omitir» applies right T1 (0.65) and skips left T1 (0.60)', appliedOf(nSkip) === 1 && /1 omitidos/.test(nSkip.join(' ')) && Math.abs((await tz(lid)) - 0.6) < 1e-4 && Math.abs((await tz(rid)) - 0.65) < 1e-4, { nSkip });
+
+    // 4. Re-import PK110: right T1 is already applied, left T1 asks -> «Sustituir» moves left T1 to 0.70.
+    await S.reimport(both110);
+    const asked2 = await S.conflictShown();
+    const nRep = asked2 ? await S.resolveConflict('replace') : [];
+    check('federated re-import PK110 + «Sustituir» moves left T1 to 0.70, right stays 0.65', asked2 && appliedOf(nRep) === 1 && Math.abs((await tz(lid)) - 0.7) < 1e-4 && Math.abs((await tz(rid)) - 0.65) < 1e-4, { asked2, nRep });
+
+    const dlFiles = await S.downloadAllPatched(2);
+    const byName = new Map(dlFiles.map((f) => [path.basename(f), readFileSync(f, 'utf8')]));
+    leftPatchedText = byName.get('left_patched.ifc');
+    const rightPatchedText = byName.get('right_patched.ifc');
+    const nl = centre(nodeBounds(nodeModel(leftPatchedText), Lm.products.tendon));
+    const nr = centre(nodeBounds(nodeModel(rightPatchedText), Rm.products.tendon));
+    check('both patched federated IFCs download and verify in Node (0.70 and 0.65)', near(nl, [1015, 2000, 0.7], 1e-4) && near(nr, [1015, 2006, 0.65], 1e-4), { nl: r6(nl), nr: r6(nr) });
+    await S.close();
+  }
+  // 5. Stale session with ONLY left_patched.ifc open: a DXF editing right's T1 (same expressId, GUID_R)
+  // must report "GlobalId distinto", NEVER a false F7 conflict or "ya aplicado".
+  {
+    const S = await open();
+    await S.loadIfc(W(dir, 'left_only.ifc', leftPatchedText), 1);
+    const [lid] = await S.modelIds();
+    await S.openClashTab();
+    await S.configure({ modelA: lid, modelB: lid, classA: 'IfcTendon', classB: 'IfcReinforcingBar' });
+    await S.runClash();
+    // Build a single-element edit targeting right's T1 (GUID_R) by deleting left's INSERT from PK105.
+    const lines = dxfLines(moveInsert(d105, isRT, 0, 0.25).text);
+    const { ents, secStart, secEnd } = entities(lines);
+    const onlyRight = rebuild(lines, units(ents).filter((u) => !(u.type === 'INSERT' && isLT(u.parts[0].pairs.find((p) => p[0] === '2')[1].trim()))), secStart, secEnd).join('\r\n');
+    const n = await S.reimport(W(dir, 'stale_right_only.dxf', onlyRight));
+    // Also test tampered GlobalId on an already-applied section key (PK110 left T1 retargeted to a foreign GUID).
+    const tamPrefix = `GUBIM_A_${Lm.products.tendon}_${Lm.guids.tendon.slice(0, 6)}`;
+    const lines2 = dxfLines(moveInsert(d110, isLT, 0, 0.20).text);
+    const e2 = entities(lines2);
+    const onlyLeftMoved = rebuild(lines2, units(e2.ents).filter((u) => !(u.type === 'INSERT' && isRT(u.parts[0].pairs.find((p) => p[0] === '2')[1].trim()))), e2.secStart, e2.secEnd).join('\r\n');
+    const onlyTam = onlyLeftMoved
+      .split(Lm.guids.tendon).join('5TamGuid00000000000000')
+      .replace(new RegExp(`${tamPrefix}[0-9A-Za-z_$]*`, 'g'), (m) => `GUBIM_A_${Lm.products.tendon}_` + '5TamGuid00000000000000'.slice(0, m.length - `GUBIM_A_${Lm.products.tendon}_`.length));
+    const nTam = await S.reimport(W(dir, 'tampered_same_key.dxf', onlyTam));
+    check('stale DXF for another model\'s GlobalId on patched expressId reports "GlobalId distinto" (never edit-conflict or ya aplicado)', !(await S.conflictShown()) && /GlobalId distinto/.test(n.join(' ')) && /GlobalId distinto/.test(nTam.join(' ')), { n, nTam });
+    await S.close();
+  }
+});
+
+// =============================================================================================
+await scenario('f11-representations-deep', async ({ dir, check, open }) => {
+  for (const schema of ['IFC2X3', 'IFC4', 'IFC4X3_ADD2']) {
+    const m = bridge({ schema, withBoxOnBar5: true, guidPrefix: '3F11' + schema.slice(3, 6).replace('_', 'x') });
+    const S = await open();
+    const { ids, zip } = await bridgeFlow(S, dir, [W(dir, `f11_${schema}.ifc`, m.text)]);
+    const bid = ids[0];
+    const d105 = sectionDxf(zip, '0+105');
+    const i5 = inserts(d105).find((i) => blockOf(m.products.bar5)(i.block));
+    const V = [[i5.x - 1.8, i5.y], [i5.x, i5.y - 0.3], [i5.x + 1.8, i5.y]];
+    await S.reimport(W(dir, `V_${schema}.dxf`, setEditPolyline(d105, m.products.bar5, V)));
+    // Second import adds a +0.20 move so the rebend is re-written on top of an already-rebent shape.
+    await S.reimport(W(dir, `V_move_${schema}.dxf`, setEditPolyline(moveInsert(d105, blockOf(m.products.bar5), 0, 0.20).text, m.products.bar5, V)));
+    const patched = readFileSync(await S.downloadPatched(), 'utf8');
+    const stepMap = new Map(
+      patched
+        .split(/\r?\n/)
+        .filter((l) => /^#\d+=/.test(l))
+        .map((l) => {
+          const idx = l.indexOf('=');
+          return [Number(l.slice(1, idx)), l.slice(idx + 1)];
+        })
+    );
+    const barRec = stepMap.get(m.products.bar5);
+    const shapeId = Number(barRec.split(',')[6].slice(1));
+    const shapeRec = stepMap.get(shapeId);
+    const repIds = [...(shapeRec.match(/\((#\d+(?:,#\d+)*)\)\);$/)?.[1] ?? '').matchAll(/#(\d+)/g)].map((x) => Number(x[1]));
+    const axisRec = stepMap.get(repIds[0]) ?? '';
+    const bodyRec = stepMap.get(repIds[1]) ?? '';
+    const solidId = Number(bodyRec.match(/\(#(\d+)\)\);$/)?.[1] ?? 0);
+    const solidRec = stepMap.get(solidId) ?? '';
+    const directrixId = Number(solidRec.match(/^IFCSWEPTDISKSOLID\(#(\d+),/)?.[1] ?? 0);
+    const axisCurveId = Number(axisRec.match(/\(#(\d+)\)\);$/)?.[1] ?? 0);
+    const ex = m.ids.bar5Extra;
+    const origBboxLine = m.text.split('\r\n').find((l) => l.startsWith(`#${ex.bbox}=`));
+    const patchedBboxLine = patched.split(/\r?\n/).find((l) => l.startsWith(`#${ex.bbox}=`));
+
+    check(
+      `F11 (${schema}): Axis in own subcontext points to new directrix, Body replaced, Box #${ex.boxRep} and #${ex.bbox} untouched`,
+      repIds.length === 3 &&
+        repIds[2] === ex.boxRep &&
+        axisRec.startsWith(`IFCSHAPEREPRESENTATION(#${m.ids.axisCtx},'Axis','Curve3D',`) &&
+        bodyRec.startsWith(`IFCSHAPEREPRESENTATION(#${m.ids.body},'Body','AdvancedSweptSolid',`) &&
+        directrixId > 0 &&
+        axisCurveId === directrixId &&
+        axisCurveId !== ex.origAxisCurve &&
+        origBboxLine === patchedBboxLine,
+      { repIds, axisRec, bodyRec, directrixId, axisCurveId }
+    );
+
+    const nm = nodeModel(patched);
+    const diag = JSON.parse(nm.summaryJson()).diagnostics ?? [];
+    const nb = nodeBounds(nm, m.products.bar5);
+    const lb = await S.liveBounds(bid, m.products.bar5);
+    check(
+      `F11 (${schema}): Node kernel re-reads cleanly with 0 diagnostics and V geometry`,
+      diag.length === 0 && nb && nb.nan === 0 && near(nb.lo, lb.lo, 1e-4) && near(nb.hi, lb.hi, 1e-4) && Math.abs(nb.lo[2] - 0.19) < 0.006,
+      { diag, lo: r6(nb?.lo), hi: r6(nb?.hi) }
+    );
+    if (schema === 'IFC4X3_ADD2') await S.shot(path.join(dir, '01-f11-deep.png'));
+    await S.close();
+  }
 });
 
 // =============================================================================================

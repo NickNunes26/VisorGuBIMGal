@@ -175,6 +175,25 @@ export function setEditPolyline(text, id, pts, { lw = false, fmt = (v) => String
   });
   return [...lines.slice(0, secStart), ...body, ...lines.slice(secEnd)].join('\r\n');
 }
+/** Deletes the EDIT_A_<id> POLYLINE/LWPOLYLINE entity from ENTITIES. */
+export function deleteEditPolyline(text, id) {
+  const lines = dxfLines(text);
+  const { ents, secStart, secEnd } = entities(lines);
+  const re = new RegExp(`^EDIT_A_${id}(\\b|_|$)`);
+  const us = units(ents).filter((x) => !((x.type === 'POLYLINE' || x.type === 'LWPOLYLINE') && re.test(x.layer ?? '')));
+  return rebuild(lines, us, secStart, secEnd).join('\r\n');
+}
+/** Sets or strips (`ms === null`) the `t=<ms>` token in every GUBIM_META comment and TEXT record. */
+export function setMetaTimestamp(text, ms) {
+  return dxfLines(text)
+    .map((line) => {
+      if (!line.startsWith('GUBIM_META ')) return line;
+      const stripped = line.replace(/\s+t=\d+/g, '');
+      if (ms === null || !/\bv=/.test(stripped)) return stripped;
+      return stripped.replace(/(\bv=\S+)/, `$1 t=${Math.round(ms)}`);
+    })
+    .join('\r\n');
+}
 /** Kerb (topmost LINE not on app layers): returns its x mid and top y in sheet units. */
 export function kerbTop(text) {
   const ents = entities(dxfLines(text)).ents.filter((e) => e.type === 'LINE');
@@ -337,6 +356,7 @@ export async function session({ mode, base, outDir, port, name }) {
     },
     /** The F7 warning: another section edited an element after this DXF was exported. */
     conflictShown: () => ev(`!!document.querySelector('[data-testid="clash-roundtrip-conflict"]')`),
+    conflictText: () => ev(`document.querySelector('[data-testid="clash-roundtrip-conflict"]')?.textContent?.replace(/\\s+/g, ' ')?.trim() ?? null`),
     /** Answers the F7 warning (`replace`, `add`, `skip` or `cancel`) and waits for the import. */
     async resolveConflict(choice) {
       await ev(`(() => {
@@ -358,6 +378,20 @@ export async function session({ mode, base, outDir, port, name }) {
       const wait = await S.waitDownload((n) => n.endsWith('.ifc'));
       if (!(await S.clickText('Descargar IFC parcheado'))) throw new Error('no patched-IFC button');
       return wait();
+    },
+    async downloadAllPatched(count, timeout = 60000) {
+      const before = new Map(readdirSync(dl).map((n) => [n, statSync(path.join(dl, n)).mtimeMs]));
+      if (!(await S.clickText('Descargar IFC parcheado'))) throw new Error('no patched-IFC button');
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeout) {
+        const fresh = readdirSync(dl).filter((n) => n.endsWith('.ifc') && !n.endsWith('.crdownload') && (!before.has(n) || statSync(path.join(dl, n)).mtimeMs !== before.get(n)));
+        if (fresh.length >= count) {
+          await sleep(600);
+          return fresh.sort().map((f) => path.join(dl, f));
+        }
+        await sleep(200);
+      }
+      throw new Error('downloadAllPatched timeout');
     },
     async downloadCsv() {
       const wait = await S.waitDownload((n) => n.endsWith('.csv'));

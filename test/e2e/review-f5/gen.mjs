@@ -80,10 +80,20 @@ export function bridge(opts = {}) {
   e(`IFCRELAGGREGATES('${guid()}',$,$,$,#${site},(#${bld}))`);
   e(`IFCRELAGGREGATES('${guid()}',$,$,$,#${bld},(#${storey}))`);
 
-  const shape = (item, kind, axisItem) => {
-    const reps = [e(`IFCSHAPEREPRESENTATION(#${body},'Body','${kind}',(#${item}))`)];
-    if (axisItem) reps.push(e(`IFCSHAPEREPRESENTATION(#${axisCtx},'Axis','Curve3D',(#${axisItem}))`));
-    return e(`IFCPRODUCTDEFINITIONSHAPE($,$,(${reps.map((r) => '#' + r).join(',')}))`);
+  const shape = (item, kind, axisItem, extraReps = [], meta = null) => {
+    const reps = [];
+    if (axisItem && extraReps.length > 0) {
+      reps.push(e(`IFCSHAPEREPRESENTATION(#${axisCtx},'Axis','Curve3D',(#${axisItem}))`));
+      reps.push(e(`IFCSHAPEREPRESENTATION(#${body},'Body','${kind}',(#${item}))`));
+      reps.push(...extraReps);
+    } else {
+      reps.push(e(`IFCSHAPEREPRESENTATION(#${body},'Body','${kind}',(#${item}))`));
+      if (axisItem) reps.push(e(`IFCSHAPEREPRESENTATION(#${axisCtx},'Axis','Curve3D',(#${axisItem}))`));
+      reps.push(...extraReps);
+    }
+    const nm = meta?.[0] ? `'${meta[0]}'` : '$';
+    const ds = meta?.[1] ? `'${meta[1]}'` : '$';
+    return e(`IFCPRODUCTDEFINITIONSHAPE(${nm},${ds},(${reps.map((r) => '#' + r).join(',')}))`);
   };
   const params = is2x3 ? '0.,1.' : '$,$';
   const polyline = (a, b) => e(`IFCPOLYLINE((#${pt(...a)},#${pt(...b)}))`);
@@ -105,10 +115,19 @@ export function bridge(opts = {}) {
   const t2 = disk([0, -1.8, 0], [0, 1.8, 0], 0.04);
   products.t2 = e(`IFCTENDON('${g('t2')}',$,'Tendon T2 transverse',$,$,#${lp(stPl, ax(pt(25, 0, 0.3), null, null))},#${shape(t2.solid, 'AdvancedSweptSolid')},$,$,.STRAND.,${L(0.08)},$,$,$,$,$,$)`);
   const role = is2x3 ? '.LIGATURE.' : '.LIGATURE.';
+  let bar5Extra = null;
   const bar = (key, name, placement, a, b, withAxis) => {
     const d = disk(a, b, 0.01);
     const axisItem = withAxis ? polyline(a, b) : null;
-    products[key] = e(`IFCREINFORCINGBAR('${g(key)}',$,'${name}',$,$,#${placement},#${shape(d.solid, 'AdvancedSweptSolid', axisItem)},$,$,${L(0.02)},${L(0.000314)},$,${role},$)`);
+    const extraReps = [];
+    if (key === 'bar5' && opts.withBoxOnBar5) {
+      const bboxCorner = pt(-0.01, -1.8, -0.01);
+      const bbox = e(`IFCBOUNDINGBOX(#${bboxCorner},${L(0.02)},${L(3.6)},${L(0.02)})`);
+      const boxRep = e(`IFCSHAPEREPRESENTATION(#${ctx},'Box','BoundingBox',(#${bbox}))`);
+      extraReps.push(boxRep);
+      bar5Extra = { bbox, boxRep, origAxisCurve: axisItem, origBodySolid: d.solid };
+    }
+    products[key] = e(`IFCREINFORCINGBAR('${g(key)}',$,'${name}',$,$,#${placement},#${shape(d.solid, 'AdvancedSweptSolid', axisItem, extraReps, key === 'bar5' ? opts.shapeMetaOnBar5 : null)},$,$,${L(0.02)},${L(0.000314)},$,${role},$)`);
   };
   bar('bar5', 'Stirrup x5', lp(stPl, ax(pt(5, 0, 0.5), null, null)), [0, -1.8, 0], [0, 1.8, 0], true);
   const tilt = lp(stPl, ax(pt(10, 0, 0.5), dir(1, 0, 0), dir(0, 1, 0)));
@@ -133,7 +152,62 @@ export function bridge(opts = {}) {
     t2: [ox + 25, oy, oz + 0.3],
     tendon: [ox + 15, oy, oz + 0.5]
   };
-  return { text, products, guids, centres, ids: { body, axisCtx, ctx }, schema, k };
+  return { text, products, guids, centres, ids: { body, axisCtx, ctx, bar5Extra }, schema, k };
+}
+
+/**
+ * Bridge deck where one transverse stirrup (`bar5` at x=5.00, r=0.035 -> x in [4.965, 5.035])
+ * clashes with two tendons separated along X by >=30 mm (`tA` ending at x=4.985, `tB` starting at
+ * x=5.015), so default 20 mm PK grouping exports TWO transverse DXF sections that both hold `bar5`
+ * with an `INSERT` and an `EDIT_A` polyline on the same mid-plane `s_mid = 5.00`.
+ */
+export function twoSectionStirrupModel(opts = {}) {
+  const schema = opts.schema ?? 'IFC4';
+  const origin = opts.origin ?? [1000, 2000, 0];
+  const guid = guidMaker(opts.guidPrefix ?? '3TwoSec');
+  const S = new Step();
+  const e = (s) => S.e(s);
+  const pt = (x, y, z) => e(`IFCCARTESIANPOINT((${num(x)},${num(y)},${num(z)}))`);
+  const pt2 = (x, y) => e(`IFCCARTESIANPOINT((${num(x)},${num(y)}))`);
+  const dir = (x, y, z) => e(`IFCDIRECTION((${num(x)},${num(y)},${num(z)}))`);
+  const ax = (p, z, x) => e(`IFCAXIS2PLACEMENT3D(#${p},${z ? '#' + z : '$'},${x ? '#' + x : '$'})`);
+  const lp = (rel, a) => e(`IFCLOCALPLACEMENT(${rel ? '#' + rel : '$'},#${a})`);
+  const ua = e(`IFCUNITASSIGNMENT((#${e('IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)')},#${e('IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.)')}))`);
+  const ctx = e(`IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#${ax(pt(0, 0, 0), null, null)},$)`);
+  const axisCtx = e(`IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Axis','Model',*,*,*,*,#${ctx},$,.GRAPH_VIEW.,$)`);
+  const body = e(`IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#${ctx},$,.MODEL_VIEW.,$)`);
+  const project = e(`IFCPROJECT('${guid()}',$,'F5 two-section stirrup',$,$,$,$,(#${ctx}),#${ua})`);
+  const sitePl = lp(null, ax(pt(...origin), null, null));
+  const site = e(`IFCSITE('${guid()}',$,'Site',$,$,#${sitePl},$,$,.ELEMENT.,$,$,$,$,$)`);
+  const bldPl = lp(sitePl, ax(pt(0, 0, 0), null, null));
+  const bld = e(`IFCBUILDING('${guid()}',$,'Bridge',$,$,#${bldPl},$,$,.ELEMENT.,$,$,$)`);
+  const stPl = lp(bldPl, ax(pt(0, 0, 0), null, null));
+  const storey = e(`IFCBUILDINGSTOREY('${guid()}',$,'Deck',$,$,#${stPl},$,$,.ELEMENT.,0.)`);
+  e(`IFCRELAGGREGATES('${guid()}',$,$,$,#${project},(#${site}))`);
+  e(`IFCRELAGGREGATES('${guid()}',$,$,$,#${site},(#${bld}))`);
+  e(`IFCRELAGGREGATES('${guid()}',$,$,$,#${bld},(#${storey}))`);
+  const shape = (item, kind) => e(`IFCPRODUCTDEFINITIONSHAPE($,$,(#${e(`IFCSHAPEREPRESENTATION(#${body},'Body','${kind}',(#${item}))`)}))`);
+  const disk = (a, b, r) => e(`IFCSWEPTDISKSOLID(#${e(`IFCPOLYLINE((#${pt(...a)},#${pt(...b)}))`)},${num(r)},$,$,$)`);
+  const box = (cx, cy, dx, dy, z0, h) => {
+    const prof = e(`IFCRECTANGLEPROFILEDEF(.AREA.,$,#${e(`IFCAXIS2PLACEMENT2D(#${pt2(cx, cy)},$)`)},${num(dx)},${num(dy)})`);
+    return e(`IFCEXTRUDEDAREASOLID(#${prof},#${ax(pt(0, 0, z0), null, null)},#${dir(0, 0, 1)},${num(h)})`);
+  };
+  const products = {};
+  const guids = {};
+  const g = (k) => (guids[k] = guid());
+  products.deck = e(`IFCSLAB('${g('deck')}',$,'Deck slab',$,$,#${lp(stPl, ax(pt(0, 0, 0), null, null))},#${shape(box(15, 0, 30, 4, 0, 1), 'SweptSolid')},$,.FLOOR.)`);
+  products.kerb = e(`IFCBUILDINGELEMENTPROXY('${g('kerb')}',$,'Kerb',$,$,#${lp(stPl, ax(pt(0, 0, 0), null, null))},#${shape(box(15, 1.4, 30, 0.4, 1, 0.4), 'SweptSolid')},$,$)`);
+  products.tA = e(`IFCTENDON('${g('tA')}',$,'Tendon A',$,$,#${lp(stPl, ax(pt(0, -0.6, 0.5), null, null))},#${shape(disk([0, 0, 0], [4.985, 0, 0], 0.04), 'AdvancedSweptSolid')},$,$,.STRAND.,0.08,$,$,$,$,$,$)`);
+  products.tB = e(`IFCTENDON('${g('tB')}',$,'Tendon B',$,$,#${lp(stPl, ax(pt(0, 0.6, 0.5), null, null))},#${shape(disk([5.015, 0, 0], [30, 0, 0], 0.04), 'AdvancedSweptSolid')},$,$,.STRAND.,0.08,$,$,$,$,$,$)`);
+  products.bar5 = e(`IFCREINFORCINGBAR('${g('bar5')}',$,'Stirrup x5 wide',$,$,#${lp(stPl, ax(pt(5, 0, 0.5), null, null))},#${shape(disk([0, -1.8, 0], [0, 1.8, 0], 0.035), 'AdvancedSweptSolid')},$,$,0.07,$,$,.LIGATURE.,$)`);
+  e(`IFCRELCONTAINEDINSPATIALSTRUCTURE('${guid()}',$,$,$,(${Object.values(products).map((p) => '#' + p).join(',')}),#${storey})`);
+  return {
+    text: wrap(schema, 'two_sec_stirrup.ifc', S.lines),
+    products,
+    guids,
+    centres: { bar5: [origin[0] + 5, origin[1], origin[2] + 0.5] },
+    ids: { body, axisCtx, ctx }
+  };
 }
 
 export function wrap(schema, name, lines) {
