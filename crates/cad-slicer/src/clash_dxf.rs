@@ -21,6 +21,9 @@ pub struct ClashDxfMeta {
     pub s_min: f64,
     pub s_max: f64,
     pub annotations: Vec<String>,
+    /// When the section was exported (ms since the Unix epoch, `GUBIM_META t=`). On re-import,
+    /// edits made from other sections after this time are ones the drawing did not show.
+    pub exported_at_ms: Option<f64>,
 }
 
 /// One highlighted Element A exported as a named `BLOCK` + `INSERT` (`GUBIM_A_<id>_<guid>`)
@@ -225,6 +228,7 @@ pub fn build_clash_section_sheet(
             s_min,
             s_max,
             annotations,
+            exported_at_ms: None,
         },
         drawing,
         blocks_a,
@@ -680,6 +684,9 @@ fn format_meta_lines(meta: &ClashDxfMeta) -> Vec<String> {
         format!("sMin={:.6}", meta.s_min),
         format!("sMax={:.6}", meta.s_max),
     ];
+    if let Some(t) = meta.exported_at_ms.filter(|t| t.is_finite() && *t >= 0.0) {
+        tokens.push(format!("t={t:.0}"));
+    }
     for (key, value) in [
         ("ox", f.origin.x),
         ("oy", f.origin.y),

@@ -6,6 +6,7 @@ import {
   type HorizontalAlignment
 } from '../../domain/alignment/landXml';
 import type {
+  ClashDxfConflictPolicy,
   ClashDxfRoundTripResult,
   ClashReport,
   ClashRule
@@ -96,8 +97,15 @@ const SKIP_REASONS = new Set([
   'duplicate-polyline',
   'ambiguous-element',
   'out-of-range',
-  'other-model'
+  'other-model',
+  'edit-conflict'
 ]);
+
+/** Elements another section edited after the imported DXF was exported (F7). */
+interface PendingRoundTripConflict {
+  dxfBytes: Uint8Array;
+  elements: { key: string; label: string }[];
+}
 
 /** «2 GlobalId distinto, 1 ya aplicado» from the skipped edits of a round trip. */
 function describeSkippedReasons(edits: Parameters<typeof skippedReasons>[0]): string {
@@ -161,6 +169,7 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [roundTripResult, setRoundTripResult] = useState<ClashDxfRoundTripResult | null>(null);
+  const [pendingConflict, setPendingConflict] = useState<PendingRoundTripConflict | null>(null);
   const [previewBusyId, setPreviewBusyId] = useState<string | null>(null);
   const [svgPreview, setSvgPreview] = useState<{
     svg: string;
@@ -396,13 +405,47 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file || !kernel.applyClashDxfRoundTrip || !primaryModel) return;
+    setPendingConflict(null);
+    await runRoundTrip(new Uint8Array(await file.arrayBuffer()), 'ask');
+  };
 
+  /** The user's answer to the F7 warning: apply the same DXF again with that policy. */
+  const handleResolveConflict = (policy: Exclude<ClashDxfConflictPolicy, 'ask'> | 'cancel') => {
+    const pending = pendingConflict;
+    setPendingConflict(null);
+    if (!pending) return;
+    if (policy === 'cancel') {
+      setExportStatus(t('clash.roundTripConflictCancelled'));
+      return;
+    }
+    void runRoundTrip(pending.dxfBytes, policy);
+  };
+
+  const runRoundTrip = async (dxfBytes: Uint8Array, conflict: ClashDxfConflictPolicy) => {
+    if (!kernel.applyClashDxfRoundTrip || !primaryModel) return;
     setRoundTripBusy(true);
     setExportError(null);
     setExportStatus(t('clash.roundTripBusyStatus'));
     try {
-      const dxfBytes = new Uint8Array(await file.arrayBuffer());
-      const rtResult = await kernel.applyClashDxfRoundTrip(primaryModel.id, dxfBytes);
+      const rtResult = await kernel.applyClashDxfRoundTrip(primaryModel.id, dxfBytes, { conflict });
+      // Elements another section edited after this DXF was exported: nothing is kept from
+      // this pass until the user says whether to add, replace or skip them.
+      const conflicted = rtResult.edits.filter(
+        (e) => e.status === 'skipped' && e.reason === 'edit-conflict'
+      );
+      if (conflict === 'ask' && conflicted.length > 0) {
+        const elements = new Map<string, string>();
+        for (const e of conflicted) {
+          const key = `${e.modelId ?? ''}#${e.expressId}`;
+          elements.set(key, e.globalId ? `#${e.expressId} ${e.globalId}` : `#${e.expressId}`);
+        }
+        setPendingConflict({
+          dxfBytes,
+          elements: [...elements].map(([key, label]) => ({ key, label }))
+        });
+        setExportStatus(null);
+        return;
+      }
       const reasons = describeSkippedReasons(rtResult.edits);
       if (rtResult.edits.length === 0) {
         setExportStatus(t('clash.roundTripNoEdits'));
@@ -745,7 +788,10 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
             </div>
           )}
 
-          {(filteredEntries.length > 0 || boundAlignment !== null || roundTripResult !== null) &&
+          {(filteredEntries.length > 0 ||
+            boundAlignment !== null ||
+            roundTripResult !== null ||
+            pendingConflict !== null) &&
             (kernel.exportClashAlignmentDxf || kernel.applyClashDxfRoundTrip) && (
               <div className="clash-alignment-box" data-testid="clash-alignment-dxf">
                 <div className="clash-alignment-header">
@@ -860,6 +906,66 @@ export const ClashPanel: React.FC<ClashPanelProps> = ({
               )}
               {exportProgressText && <div className="clash-progress">{exportProgressText}</div>}
               {exportStatus && <div className="clash-notice">{exportStatus}</div>}
+              {pendingConflict && (
+                <div className="clash-notice clash-roundtrip-conflict" data-testid="clash-roundtrip-conflict">
+                  <div className="clash-roundtrip-conflict-text">
+                    <AlertTriangle size={12} />
+                    <span>
+                      {t('clash.roundTripConflictText', { count: pendingConflict.elements.length })}
+                    </span>
+                  </div>
+                  <ul className="clash-roundtrip-conflict-list">
+                    {pendingConflict.elements.slice(0, 8).map((el) => (
+                      <li key={el.key}>{el.label}</li>
+                    ))}
+                    {pendingConflict.elements.length > 8 && (
+                      <li>{t('clash.roundTripConflictMore', { count: pendingConflict.elements.length - 8 })}</li>
+                    )}
+                  </ul>
+                  <div className="clash-alignment-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-xs"
+                      data-testid="clash-conflict-replace"
+                      disabled={roundTripBusy}
+                      onClick={() => handleResolveConflict('replace')}
+                      title={t('clash.roundTripConflictReplaceTitle')}
+                    >
+                      <span>{t('clash.roundTripConflictReplace')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      data-testid="clash-conflict-add"
+                      disabled={roundTripBusy}
+                      onClick={() => handleResolveConflict('add')}
+                      title={t('clash.roundTripConflictAddTitle')}
+                    >
+                      <span>{t('clash.roundTripConflictAdd')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      data-testid="clash-conflict-skip"
+                      disabled={roundTripBusy}
+                      onClick={() => handleResolveConflict('skip')}
+                      title={t('clash.roundTripConflictSkipTitle')}
+                    >
+                      <span>{t('clash.roundTripConflictSkip')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      data-testid="clash-conflict-cancel"
+                      disabled={roundTripBusy}
+                      onClick={() => handleResolveConflict('cancel')}
+                    >
+                      <X size={12} />
+                      <span>{t('clash.roundTripConflictCancel')}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
               {roundTripResult && (
                 <div className="clash-alignment-actions" data-testid="clash-roundtrip-downloads">
                   {(roundTripResult.patchedModels?.length ?? 0) > 0 && (

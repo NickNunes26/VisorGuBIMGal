@@ -11,6 +11,7 @@ import type { DrawingExportConfig, DrawingFrame, DrawingOptions } from '../drawi
 import type {
   ClashAlignmentDxfBatch,
   ClashAlignmentDxfRequest,
+  ClashDxfConflictPolicy,
   ClashDxfRoundTripResult,
   ClashReport,
   ClashRequest
@@ -253,11 +254,14 @@ export interface KernelPort {
   /**
    * Parses an edited clash DXF (Level 1 `MOVE` and Level 2 `EDIT_A_*` polyline rebend),
    * surgically patches the open model's STEP bytes in the Worker, and returns the patched IFC
-   * bytes plus the audit CSV log (F5, docs/12_clash_alignment_dxf.md).
+   * bytes plus the audit CSV log (F5, docs/12_clash_alignment_dxf.md). `conflict` handles
+   * elements another section edited after this DXF was exported (default `ask`: left alone
+   * with `edit-conflict`, so the caller can ask the user and apply again).
    */
   applyClashDxfRoundTrip?(
     modelId: ModelId,
-    dxfBytes: Uint8Array
+    dxfBytes: Uint8Array,
+    options?: { conflict?: ClashDxfConflictPolicy }
   ): Promise<ClashDxfRoundTripResult>;
 
   /**

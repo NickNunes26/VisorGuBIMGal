@@ -401,7 +401,7 @@ await test('F5 round-trip: Model.applyClashDxf patches STEP on Level 1 MOVE and 
     const replacement = `0\r\nINSERT\r\n8\r\nCLASH_A\r\n2\r\n${blockName}\r\n10\r\n${movedX}\r\n20\r\n${movedY}\r\n`;
     const movedDxfBytes = encoder.encode(dxfText.replace(needle, replacement));
 
-    const rtOut = model.applyClashDxf(movedDxfBytes, 'bridge-m1', ['bridge-m1'], new Uint32Array());
+    const rtOut = model.applyClashDxf(movedDxfBytes, 'bridge-m1', ['bridge-m1'], new Uint32Array(), 'ask', 0);
     const patchedIfcBytes = rtOut.patchedIfcBytes();
     const diff = JSON.parse(rtOut.diffJson());
     rtOut.free();
@@ -572,6 +572,7 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
             case 'clash-batch-new': {
               this.batch?.free();
               this.batch = new wasm.ClashBatchSlicer();
+              this.batch.setExportTime(request.exportTimeMs);
               value = undefined;
               break;
             }
@@ -620,7 +621,9 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
                 request.dxfBytes,
                 request.selfModelId,
                 request.openModelIds,
-                request.exclude
+                request.exclude,
+                request.conflict,
+                request.nowMs
               );
               try {
                 value = {
@@ -738,6 +741,10 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
 
     // Edit INSERT in exported DXF and round-trip through adapter.applyClashDxfRoundTrip!
     const dxfText = new TextDecoder('utf-8').decode(batch.sections[0].dxfBytes);
+    // F7: the export time travels in the metadata, so a later import can tell which edits of
+    // other sections this drawing did not show.
+    const stamp = /GUBIM_META [^\r\n]*\bt=(\d+)/.exec(dxfText);
+    assert.ok(stamp && Math.abs(Number(stamp[1]) - Date.now()) < 600000, 'GUBIM_META t= is the export time');
     const origMatch = /GUBIM_ORIG id=100 (?:model=\S+ )?(?:guid=\S+ )?block=([^\s]+) (?:layer=\S+ )?x=([0-9.-]+) y=([0-9.-]+)/.exec(dxfText);
     assert.ok(origMatch);
     const [, blockName, origXStr, origYStr] = origMatch;
@@ -755,6 +762,10 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
     assert.equal(rt.applied, 1);
     assert.ok(rt.auditCsv.includes('m-adapter,1.000,move,100,'));
     assert.ok(rt.patchedIfcBytes.byteLength > clashingIfc.length);
+    assert.ok(
+      /\/\* GUBIM_F5 key=\S+ id=100 kind=move v=\S+ w=\S+ t=\d+ \*\//.test(new TextDecoder().decode(rt.patchedIfcBytes)),
+      'the note carries the world move and the import time'
+    );
 
     await adapter.closeModel('m-adapter');
     assert.equal(activeWorkers, 0);

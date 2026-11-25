@@ -335,6 +335,25 @@ export async function session({ mode, base, outDir, port, name }) {
       await sleep(500);
       return S.notices();
     },
+    /** The F7 warning: another section edited an element after this DXF was exported. */
+    conflictShown: () => ev(`!!document.querySelector('[data-testid="clash-roundtrip-conflict"]')`),
+    /** Answers the F7 warning (`replace`, `add`, `skip` or `cancel`) and waits for the import. */
+    async resolveConflict(choice) {
+      await ev(`(() => {
+        const btn = document.querySelector('[data-testid="clash-reimport-dxf-btn"]');
+        window.__rt = { busy: false, done: false };
+        const mo = new MutationObserver(() => {
+          if (btn.disabled) window.__rt.busy = true;
+          else if (window.__rt.busy) { window.__rt.done = true; mo.disconnect(); }
+        });
+        mo.observe(btn, { attributes: true, attributeFilter: ['disabled'] });
+        document.querySelector('[data-testid="clash-conflict-${choice}"]').click();
+        return true;
+      })()`);
+      if (choice !== 'cancel') await waitFor(`window.__rt.done`, 120000);
+      await sleep(500);
+      return S.notices();
+    },
     async downloadPatched() {
       const wait = await S.waitDownload((n) => n.endsWith('.ifc'));
       if (!(await S.clickText('Descargar IFC parcheado'))) throw new Error('no patched-IFC button');

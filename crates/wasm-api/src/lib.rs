@@ -277,7 +277,9 @@ impl Model {
     /// `self_model_id` is this model's session id and `open_model_ids` every open model's:
     /// an edit lands on the model it was exported from, or, when that model is not open, on
     /// the product carrying its `GlobalId`. `exclude` lists edit indices already applied to
-    /// another model in this import. See `applyClashDxfRoundTrip` in `docs/05`.
+    /// another model in this import. `conflict` (`ask`, `add`, `replace` or `skip`) handles
+    /// elements another section edited after this DXF was exported, and `now_ms` is written
+    /// into the notes. See `applyClashDxfRoundTrip` in `docs/05`.
     #[wasm_bindgen(js_name = applyClashDxf)]
     pub fn apply_clash_dxf(
         &self,
@@ -285,12 +287,16 @@ impl Model {
         self_model_id: String,
         open_model_ids: Vec<String>,
         exclude: Vec<u32>,
+        conflict: String,
+        now_ms: f64,
     ) -> Result<ClashRoundTripOutput, JsError> {
         let scope = clash_dxf::ApplyScope {
             self_model_id: Some(self_model_id),
             open_model_ids,
             exclude,
             require_global_id: true,
+            conflict: clash_dxf::ConflictPolicy::parse(&conflict),
+            now_ms: (now_ms.is_finite() && now_ms >= 0.0).then_some(now_ms),
         };
         let (patched_ifc, diff_json) = self
             .inner
@@ -374,6 +380,13 @@ impl ClashBatchSlicer {
     #[wasm_bindgen(js_name = addSectionChunk)]
     pub fn add_section_chunk(&mut self, model_index: u32, chunk: Vec<u8>) -> bool {
         self.inner.add_section_chunk(model_index, &chunk)
+    }
+
+    /// Export time (ms since the Unix epoch) the following sections carry in `GUBIM_META t=`,
+    /// so a re-import can tell which edits from other sections the drawing did not show.
+    #[wasm_bindgen(js_name = setExportTime)]
+    pub fn set_export_time(&mut self, ms: f64) {
+        self.inner.set_export_time_ms(ms);
     }
 
     #[wasm_bindgen(js_name = clearCurrentSection)]

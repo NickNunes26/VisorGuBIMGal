@@ -32,6 +32,8 @@ pub struct ParsedClashMeta {
     pub norm_offset: Option<DVec2>,
     /// Everything a Level 2 rebend needs (origin, look, slab range, normalization) is present.
     pub complete: bool,
+    /// Export time (ms since the Unix epoch), when the exporter wrote it.
+    pub exported_at_ms: Option<f64>,
 }
 
 /// One element of the exported section as found in the edited DXF, ready for surgical STEP IFC
@@ -588,6 +590,7 @@ fn build_meta(kv: &BTreeMap<String, String>) -> Option<ParsedClashMeta> {
         },
         norm_offset,
         complete,
+        exported_at_ms: f("t"),
     })
 }
 

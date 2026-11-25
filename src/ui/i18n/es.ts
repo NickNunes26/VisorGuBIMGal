@@ -738,8 +738,21 @@ export const es = {
       'ambiguous-element': 'elemento ambiguo entre modelos, vuelva a exportar el ZIP',
       'out-of-range': 'desplazamiento fuera de rango',
       'other-model': 'pertenece a otro modelo',
+      'edit-conflict': 'editado desde otra sección después de exportar este DXF',
       unknown: 'motivo desconocido'
     },
+    roundTripConflictText:
+      '{count} elemento(s) de este DXF se editaron desde otra sección después de exportarlo, y este plano no muestra esa edición. Aplicarlo tal cual sumaría las dos ediciones. ¿Qué hacer con ellos?',
+    roundTripConflictMore: 'y {count} más',
+    roundTripConflictReplace: 'Sustituir por este DXF',
+    roundTripConflictReplaceTitle:
+      'Deshacer la edición de la otra sección y dejar estos elementos como los dibuja este DXF',
+    roundTripConflictAdd: 'Sumar las dos ediciones',
+    roundTripConflictAddTitle: 'Aplicar la edición de este DXF encima de la de la otra sección',
+    roundTripConflictSkip: 'Omitir estos elementos',
+    roundTripConflictSkipTitle: 'Aplicar el resto del DXF y dejar estos elementos como están',
+    roundTripConflictCancel: 'Cancelar',
+    roundTripConflictCancelled: 'Importación DXF cancelada: no se ha cambiado nada.',
     roundTripErrorFallback: 'No se pudo aplicar el parche STEP desde el DXF.',
     downloadPatchedIfcBtn: 'Descargar IFC parcheado',
     downloadPatchedIfcTitle: 'Guardar el archivo IFC actualizado con el parche quirúrgico STEP',

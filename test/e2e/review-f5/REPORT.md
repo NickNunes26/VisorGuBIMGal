@@ -149,7 +149,7 @@ The scripts are not wired into `test/e2e/run.mjs`. Some scenarios fail on purpos
 
 ## Status after the fixes (2026-11-25)
 
-Rerun of `scenarios.mjs` on `gpu`, `gl2` and `none` against the fixed tree: **111/115 checks pass on each renderer**, with a clean console everywhere. The 4 that still fail are the open decisions below (F11 three times, once per schema; F7 once).
+Rerun of `scenarios.mjs` on `gpu`, `gl2` and `none` against the fixed tree: **111/115 checks pass on each renderer**, with a clean console everywhere. The 4 that still failed were the then-open decisions F7 and F11 (F11 three times, once per schema; F7 once). After Nick's decisions (same day) and their fixes, with the F7 warning now driven by the scenario: **119/119 checks pass on each renderer**, console clean.
 
 | Finding | Status | Fix |
 |---|---|---|
@@ -159,12 +159,12 @@ Rerun of `scenarios.mjs` on `gpu`, `gl2` and `none` against the fixed tree: **11
 | F4 | Fixed | An element put back where the export had it reverts the earlier edit (move and rebend). |
 | F5 | Fixed | When a later import moves a rebent element, the rebend is written again minus the move, so one import or two give the same result. |
 | F6 | Fixed | A copied INSERT is `duplicate-insert`. With two polylines on one edit layer, the one still matching the export is ignored; two that both differ are `duplicate-polyline`. |
-| F7 | **Open, Nick to decide** | Two sections editing one element still add up. |
+| F7 | Fixed (Nick: warn and let the user decide) | Sections carry their export time (`GUBIM_META t=`), notes their import time and world move. An element another section edited after this DXF was exported stops the import, and the panel asks: «Sustituir por este DXF», «Sumar las dos ediciones», «Omitir estos elementos» or «Cancelar». |
 | F8 | Fixed | The reported reason is the owning model's (`already-applied` before `guid-mismatch`). |
 | F9 | Fixed | A rotated, scaled or mirrored INSERT is `unsupported-transform`. |
 | F10 | Fixed | The CSV, and the patched IFC of an earlier import, stay downloadable after an import that applies nothing. |
-| F11 | **Open, Nick to decide** | A rebend still replaces the whole `IfcProductDefinitionShape`. |
-| F12 | Partly | Only the 10⁸ m sanity bound; a tighter limit is Nick's call. |
+| F11 | Fixed | The rebend replaces `Body`, redraws `Axis` on the new curve and keeps every other representation. |
+| F12 | Closed (Nick: no limit) | The 10⁸ m bound only rejects impossible numbers. |
 
 The expectations of two checks changed with the fixes, and the edits sit next to them in `scenarios.mjs`:
 - **NaN vertex:** it is now refused while reading the DXF, so the reason is `invalid-number` rather than `invalid-points`.

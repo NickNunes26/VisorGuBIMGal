@@ -1329,6 +1329,30 @@ canvas.bim-viewport {
   font-size: 11px;
 }
 
+.clash-roundtrip-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.clash-roundtrip-conflict-text {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.clash-roundtrip-conflict-text svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.clash-roundtrip-conflict-list {
+  margin: 0;
+  padding-left: 18px;
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+
 .clash-results {
   display: flex;
   flex-direction: column;

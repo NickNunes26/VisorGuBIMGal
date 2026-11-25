@@ -119,7 +119,8 @@ export interface ClashAlignmentDxfBatch {
  * `not-found`, `not-a-product`, `unsupported-placement`, `no-representation-context`,
  * `invalid-points`, `invalid-radius`, `duplicate-edit`, `already-applied`, `metadata-incomplete`,
  * `invalid-number`, `unsupported-transform`, `duplicate-insert`, `duplicate-polyline`,
- * `ambiguous-element`, `out-of-range`, `other-model`.
+ * `ambiguous-element`, `out-of-range`, `other-model`, `edit-conflict` (another section edited the
+ * element after this DXF was exported; see {@link ClashDxfConflictPolicy}).
  */
 export interface ClashDxfEditStatus {
   status?: 'applied' | 'skipped' | 'detected';
@@ -151,6 +152,14 @@ export interface ClashDxfRebendEdit extends ClashDxfEditStatus {
 }
 
 export type ClashDxfEditItem = ClashDxfMoveEdit | ClashDxfRebendEdit;
+
+/**
+ * What a DXF import does with an element another section edited after the DXF was exported
+ * (that drawing did not show the edit): `ask` leaves it alone with reason `edit-conflict`,
+ * `add` applies this drawing's edit on top, `replace` undoes the other section's edit first,
+ * and `skip` leaves it alone.
+ */
+export type ClashDxfConflictPolicy = 'ask' | 'add' | 'replace' | 'skip';
 
 /** Result of applying an edited clash DXF to an open IFC model's STEP file (F5). */
 export interface ClashDxfRoundTripResult {

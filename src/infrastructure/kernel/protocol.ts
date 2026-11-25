@@ -64,7 +64,11 @@ export type WorkerRequest =
       expressIds: Uint32Array;
       transform?: number[];
     }
-  | { op: 'clash-batch-new' }
+  | {
+      op: 'clash-batch-new';
+      /** Export time (ms since the Unix epoch) each section carries in `GUBIM_META t=`. */
+      exportTimeMs: number;
+    }
   | { op: 'clash-batch-add'; modelIndex: number; chunk: ArrayBuffer }
   | {
       op: 'clash-batch-finish';
@@ -96,6 +100,10 @@ export type WorkerRequest =
       openModelIds: string[];
       /** Edit indices already applied to another model in this import. */
       exclude: Uint32Array;
+      /** Elements another section edited after the export: `ask`, `add`, `replace`, `skip`. */
+      conflict: string;
+      /** Import time (ms since the Unix epoch) written into the patch notes. */
+      nowMs: number;
     }
   | {
       op: 'clash-element-slab';

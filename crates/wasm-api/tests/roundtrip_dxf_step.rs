@@ -626,6 +626,7 @@ fn apply_as(ifc: &[u8], dxf: &str, me: &str, open: &[&str], exclude: &[u32]) -> 
         open_model_ids: open.iter().map(|s| s.to_string()).collect(),
         exclude: exclude.to_vec(),
         require_global_id: true,
+        ..Default::default()
     };
     wasm_api::clash_dxf::apply_clash_dxf_to_step_scoped(ifc, 1.0, dxf.as_bytes(), &scope)
         .expect("apply")
@@ -909,4 +910,144 @@ fn f5_two_differing_edit_polylines_are_refused() {
     assert_eq!(json_field(&json, "applied"), "0", "{json}");
     assert!(json.contains("\"reason\":\"duplicate-polyline\""), "{json}");
     assert_eq!(patched, ifc.as_bytes());
+}
+
+// ---------------------------------------------------------------------------------------------
+// F7: one element edited in two sections of the same export.
+// ---------------------------------------------------------------------------------------------
+
+/// The UTM section of [`utm_sheet`], cut at `x` (world) and stamped with an export time.
+fn utm_sheet_at(ifc: &[u8], x: f64, pk: f64, exported_at_ms: f64) -> String {
+    let mesh_a = eval_mesh(ifc, 100);
+    let mesh_b = eval_mesh(ifc, 200);
+    let mut sheet = build_clash_section_sheet(
+        &[
+            DrawingMesh::new(0, 100, "IfcReinforcingBar", mesh_a),
+            DrawingMesh::new(0, 200, "IfcTendon", mesh_b),
+        ],
+        Cut::Plane {
+            origin: DVec3::new(x, 4_700_000.0, 0.0),
+            normal: DVec3::X,
+        },
+        0.02,
+        &[(0, 100, GUID_A.to_string())],
+        &[(0, 200)],
+        &[DVec3::new(x, 4_700_000.025, 0.025)],
+        Some(DVec3::new(x, 4_700_000.0, 0.0)),
+        LONG_MODEL_ID,
+        pk,
+        "pk",
+        x - 0.01,
+        x + 0.01,
+        vec![],
+    );
+    sheet.meta.exported_at_ms = Some(exported_at_ms);
+    String::from_utf8(to_clash_dxf(&sheet)).unwrap()
+}
+
+fn apply_policy(ifc: &[u8], dxf: &str, policy: &str, now_ms: f64) -> (Vec<u8>, String) {
+    let scope = wasm_api::clash_dxf::ApplyScope {
+        conflict: wasm_api::clash_dxf::ConflictPolicy::parse(policy),
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+    wasm_api::clash_dxf::apply_clash_dxf_to_step_scoped(ifc, 1.0, dxf.as_bytes(), &scope)
+        .expect("apply")
+}
+
+fn centre_z(ifc: &[u8]) -> f64 {
+    let (lo, hi) = bounds(&eval_mesh(ifc, 100));
+    (lo.z + hi.z) * 0.5
+}
+
+#[test]
+fn f7_two_sections_editing_one_element_ask_before_adding_up() {
+    let ifc = utm_ifc();
+    let z0 = centre_z(ifc.as_bytes());
+    // One export, two sections through bar #100.
+    let a = utm_sheet_at(ifc.as_bytes(), 540_000.5, 1234.0, 1000.0);
+    let b = utm_sheet_at(ifc.as_bytes(), 540_001.5, 1235.0, 1000.0);
+    assert!(a.contains(" t=1000"), "export time in GUBIM_META");
+    let a_up = move_insert(&a, 100, 0.0, 0.1);
+    let b_up = move_insert(&b, 100, 0.0, 0.2);
+
+    let (after_a, json) = apply_policy(ifc.as_bytes(), &a_up, "ask", 2000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&after_a) - (z0 + 0.1)).abs() < 1e-6);
+
+    // Section B did not show A's move: asked, or skipped, nothing changes.
+    for policy in ["ask", "skip"] {
+        let (out, json) = apply_policy(&after_a, &b_up, policy, 3000.0);
+        assert_eq!(json_field(&json, "applied"), "0", "{policy}: {json}");
+        assert!(json.contains("\"reason\":\"edit-conflict\""), "{policy}: {json}");
+        assert!((centre_z(&out) - (z0 + 0.1)).abs() < 1e-6, "{policy}");
+    }
+    // Add: both edits (the behaviour before F7).
+    let (added, json) = apply_policy(&after_a, &b_up, "add", 3000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&added) - (z0 + 0.3)).abs() < 1e-6);
+    // Replace: B's drawing wins, A's move is undone.
+    let (replaced, json) = apply_policy(&after_a, &b_up, "replace", 3000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&replaced) - (z0 + 0.2)).abs() < 1e-6, "{}", centre_z(&replaced));
+    // Re-importing B changes nothing; re-importing A asks again (B's edit is newer than A's
+    // export), and replacing puts A's drawing back.
+    let (_, json) = apply_policy(&replaced, &b_up, "ask", 4000.0);
+    assert_eq!(json_field(&json, "applied"), "0", "{json}");
+    assert!(!json.contains("edit-conflict"), "{json}");
+    let (_, json) = apply_policy(&replaced, &a_up, "ask", 4000.0);
+    assert!(json.contains("\"reason\":\"edit-conflict\""), "{json}");
+    let (back_to_a, json) = apply_policy(&replaced, &a_up, "replace", 4000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&back_to_a) - (z0 + 0.1)).abs() < 1e-6, "{}", centre_z(&back_to_a));
+
+    // A section exported after A's import shows the move: no question, it adds up.
+    let b_later = utm_sheet_at(&after_a, 540_001.5, 1235.0, 2500.0);
+    let (later, json) = apply_policy(&after_a, &move_insert(&b_later, 100, 0.0, 0.2), "ask", 3000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&later) - (z0 + 0.3)).abs() < 1e-6);
+
+    // A's move put back (A re-imported as exported) is no edit to ask about.
+    let (reverted, json) = apply_policy(&after_a, &a, "ask", 2500.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    let (b_only, json) = apply_policy(&reverted, &b_up, "ask", 3000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&b_only) - (z0 + 0.2)).abs() < 1e-6);
+
+    // An untouched element in section B is not a conflict: B leaves A's move alone.
+    let (same, json) = apply_policy(&after_a, &b, "ask", 3000.0);
+    assert_eq!(json_field(&json, "applied"), "0", "{json}");
+    assert!(json.contains("\"edits\":[]"), "{json}");
+    assert!((centre_z(&same) - (z0 + 0.1)).abs() < 1e-6);
+}
+
+#[test]
+fn f7_rebends_from_two_sections_ask_and_replace_keeps_the_later_drawing() {
+    let ifc = utm_ifc();
+    let a = utm_sheet_at(ifc.as_bytes(), 540_000.5, 1234.0, 1000.0);
+    let b = utm_sheet_at(ifc.as_bytes(), 540_001.5, 1235.0, 1000.0);
+    let insert = |dxf: &str| {
+        let diff = parse_clash_dxf_edits(dxf.as_bytes()).unwrap();
+        diff.unchanged.iter().chain(&diff.edits).map(|e| e.orig_pos()).next().unwrap()
+    };
+    let v = |dxf: &str, rise: f64| {
+        let p = insert(dxf);
+        add_edit_polyline(dxf, 100, &[(p.x - 0.04, p.y), (p.x, p.y + rise), (p.x + 0.04, p.y)])
+    };
+    let height = |bytes: &[u8]| {
+        let (lo, hi) = bounds(&eval_mesh(bytes, 100));
+        hi.z - lo.z
+    };
+    let (bent_a, json) = apply_policy(ifc.as_bytes(), &v(&a, 0.1), "ask", 2000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    let (_, json) = apply_policy(&bent_a, &v(&b, 0.3), "ask", 3000.0);
+    assert!(json.contains("\"reason\":\"edit-conflict\""), "{json}");
+    let (bent_b, json) = apply_policy(&bent_a, &v(&b, 0.3), "replace", 3000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((height(&bent_b) - height(&apply_policy(ifc.as_bytes(), &v(&b, 0.3), "ask", 0.0).0)).abs() < 1e-6);
+    // A's rebend was replaced (its note reset): importing B's drawing again changes nothing
+    // and does not ask about A's.
+    let (_, json) = apply_policy(&bent_b, &v(&b, 0.3), "ask", 4000.0);
+    assert_eq!(json_field(&json, "applied"), "0", "{json}");
+    assert!(!json.contains("edit-conflict"), "{json}");
 }

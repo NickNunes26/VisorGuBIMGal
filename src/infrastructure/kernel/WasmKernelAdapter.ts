@@ -4,6 +4,7 @@ import type {
   ClashAlignmentDxfRequest,
   ClashAlignmentDxfSectionOutput,
   ClashDxfEditItem,
+  ClashDxfConflictPolicy,
   ClashDxfRoundTripResult,
   ClashReport,
   ClashRequest,
@@ -811,7 +812,7 @@ export class WasmKernelAdapter implements KernelPort {
         throw new DOMException('Exportación cancelada.', 'AbortError');
       }
 
-      await slicerWorker.call({ op: 'clash-batch-new' });
+      await slicerWorker.call({ op: 'clash-batch-new', exportTimeMs: Date.now() });
       const outputs: ClashAlignmentDxfSectionOutput[] = [];
       const total = request.sections.length;
       const cullEps = 0.05;
@@ -977,8 +978,11 @@ export class WasmKernelAdapter implements KernelPort {
 
   async applyClashDxfRoundTrip(
     modelId: ModelId,
-    dxfBytes: Uint8Array
+    dxfBytes: Uint8Array,
+    options?: { conflict?: ClashDxfConflictPolicy }
   ): Promise<ClashDxfRoundTripResult> {
+    const conflict = options?.conflict ?? 'ask';
+    const nowMs = Date.now();
     // The DXF goes to every open model. Each model takes only its own edits: an element
     // exported from an open model goes back to that model, and one exported in an earlier
     // session (model ids are per session) only to the product carrying its GlobalId. The
@@ -1012,7 +1016,9 @@ export class WasmKernelAdapter implements KernelPort {
           dxfBytes: payload,
           selfModelId: target,
           openModelIds: open,
-          exclude
+          exclude,
+          conflict,
+          nowMs
         },
         [payload.buffer as ArrayBuffer, exclude.buffer as ArrayBuffer]
       );

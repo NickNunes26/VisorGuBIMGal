@@ -278,8 +278,16 @@ pub fn patch_step_file_with(
                     if let Some(note) = patch.note() {
                         push_note(&mut appended, note);
                     }
-                    let prod_shape_id =
-                        append_swept_disk(&mut appended, &mut next_id, schema, ctx_id, &local, radius);
+                    let others = other_representations(&step, &entity.params);
+                    let prod_shape_id = append_swept_disk(
+                        &mut appended,
+                        &mut next_id,
+                        schema,
+                        ctx_id,
+                        &local,
+                        radius,
+                        &others,
+                    );
                     replacements.push((
                         ent_ref.start + arg_start,
                         ent_ref.start + arg_end,
@@ -385,6 +393,60 @@ fn fmt_real(v: f64) -> String {
     format!("{v:.6}")
 }
 
+/// A representation of the product's current shape, as the rebent shape takes it over.
+enum OldRepresentation {
+    /// The `Body`: replaced by the new swept disk.
+    Body,
+    /// The `Axis` (a bar's centreline): drawn again along the new curve, in its own context.
+    Axis { ctx_id: u32, rep_type: String },
+    /// Any other representation, kept as it is.
+    Keep(u32),
+}
+
+/// The representations of the product's current `IfcProductDefinitionShape`, in order.
+fn other_representations(step: &StepIndex<'_>, product_params: &[Value]) -> Vec<OldRepresentation> {
+    let Some(Value::Ref(shape_id)) = product_params.get(6) else {
+        return Vec::new();
+    };
+    let Ok(shape) = step.decode(*shape_id) else {
+        return Vec::new();
+    };
+    let Some(Value::List(reps)) = shape.params.get(2) else {
+        return Vec::new();
+    };
+    reps.iter()
+        .filter_map(|rep| match rep {
+            Value::Ref(id) => Some(*id),
+            _ => None,
+        })
+        .map(|id| {
+            let Ok(rep) = step.decode(id) else {
+                return OldRepresentation::Keep(id);
+            };
+            let label = match rep.params.get(1) {
+                Some(Value::String(s)) => s.to_ascii_lowercase(),
+                _ => String::new(),
+            };
+            match (label.as_str(), rep.params.first()) {
+                ("body", _) => OldRepresentation::Body,
+                ("axis", Some(Value::Ref(ctx_id))) => OldRepresentation::Axis {
+                    ctx_id: *ctx_id,
+                    rep_type: match rep.params.get(2) {
+                        Some(Value::String(t)) if t.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                            t.clone()
+                        }
+                        _ => "Curve3D".to_string(),
+                    },
+                },
+                _ => OldRepresentation::Keep(id),
+            }
+        })
+        .collect()
+}
+
+/// Appends the new swept disk and the `IfcProductDefinitionShape` that holds it. The other
+/// representations of the old shape stay: an `Axis` is drawn again along the new curve, and
+/// anything else is kept as it is.
 fn append_swept_disk(
     out: &mut String,
     next_id: &mut u32,
@@ -392,6 +454,7 @@ fn append_swept_disk(
     ctx_id: u32,
     local: &[[f64; 3]],
     radius: f64,
+    old: &[OldRepresentation],
 ) -> u32 {
     let mut take = || {
         let id = *next_id;
@@ -444,8 +507,31 @@ fn append_swept_disk(
     out.push_str(&format!(
         "#{rep_id}=IFCSHAPEREPRESENTATION(#{ctx_id},'Body','AdvancedSweptSolid',(#{solid_id}));\r\n"
     ));
+    let mut reps = Vec::with_capacity(old.len() + 1);
+    let mut body_written = false;
+    for item in old {
+        match item {
+            OldRepresentation::Body if !body_written => {
+                reps.push(rep_id);
+                body_written = true;
+            }
+            OldRepresentation::Body => {}
+            OldRepresentation::Axis { ctx_id, rep_type } => {
+                let axis_id = take();
+                out.push_str(&format!(
+                    "#{axis_id}=IFCSHAPEREPRESENTATION(#{ctx_id},'Axis','{rep_type}',(#{curve_id}));\r\n"
+                ));
+                reps.push(axis_id);
+            }
+            OldRepresentation::Keep(id) => reps.push(*id),
+        }
+    }
+    if !body_written {
+        reps.insert(0, rep_id);
+    }
+    let list = reps.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(",");
     let prod_id = take();
-    out.push_str(&format!("#{prod_id}=IFCPRODUCTDEFINITIONSHAPE($,$,(#{rep_id}));\r\n"));
+    out.push_str(&format!("#{prod_id}=IFCPRODUCTDEFINITIONSHAPE($,$,({list}));\r\n"));
     prod_id
 }
 
@@ -989,6 +1075,53 @@ ENDSEC;\r\nEND-ISO-10303-21;\r\n";
             let step = index(text.as_bytes()).expect("patched file indexes");
             assert!(step.skipped().is_empty());
             assert_eq!(find_patch_notes(text.as_bytes()), vec!["GUBIM_F5 test".to_string()]);
+        }
+    }
+
+    #[test]
+    fn rebend_keeps_other_representations_and_redraws_the_axis() {
+        for schema in ["IFC2X3", "IFC4", "IFC4X3_ADD2"] {
+            let src = file(schema)
+                .replace(
+                    "#34=IFCPRODUCTDEFINITIONSHAPE($,$,(#33));",
+                    "#35=IFCSHAPEREPRESENTATION(#13,'Axis','Curve3D',(#30));\r\n\
+#36=IFCSHAPEREPRESENTATION(#10,'Box','BoundingBox',(#37));\r\n\
+#37=IFCBOUNDINGBOX(#12,1.,0.02,0.02);\r\n\
+#34=IFCPRODUCTDEFINITIONSHAPE($,$,(#35,#33,#36));",
+                );
+            let (out, report) =
+                patch_step_file(src.as_bytes(), &[rebend(Some("2O2Fr$t4X7Zf8NOew3FLOH"))]).unwrap();
+            assert_eq!(report.applied, 1, "{schema}");
+            let text = String::from_utf8(out).unwrap();
+            let step = index(text.as_bytes()).expect("patched file indexes");
+            let bar = step.decode(100).unwrap();
+            let Some(Value::Ref(shape_id)) = bar.params.get(6) else { panic!("{schema}") };
+            let shape = step.decode(*shape_id).unwrap();
+            let Some(Value::List(reps)) = shape.params.get(2) else { panic!("{schema}") };
+            let ids: Vec<u32> = reps
+                .iter()
+                .map(|r| match r {
+                    Value::Ref(id) => *id,
+                    _ => panic!("{schema}"),
+                })
+                .collect();
+            assert_eq!(ids.len(), 3, "{schema}: {ids:?}");
+            // Order kept: Axis, Body, Box.
+            let axis = step.decode(ids[0]).unwrap();
+            let body = step.decode(ids[1]).unwrap();
+            assert_eq!(ids[2], 36, "{schema}: the Box is kept as it is");
+            assert_eq!(axis.params.first(), Some(&Value::Ref(13)), "{schema}");
+            assert_eq!(axis.params.get(1), Some(&Value::String("Axis".into())), "{schema}");
+            assert_eq!(axis.params.get(2), Some(&Value::String("Curve3D".into())), "{schema}");
+            assert_eq!(body.params.get(1), Some(&Value::String("Body".into())), "{schema}");
+            // The new Axis follows the new directrix, not the old curve #30.
+            let Some(Value::List(items)) = body.params.get(3) else { panic!("{schema}") };
+            let Some(Value::Ref(solid_id)) = items.first() else { panic!("{schema}") };
+            let solid = step.decode(*solid_id).unwrap();
+            let Some(Value::List(axis_items)) = axis.params.get(3) else { panic!("{schema}") };
+            assert_eq!(axis_items.first(), solid.params.first(), "{schema}");
+            assert_ne!(axis_items.first(), Some(&Value::Ref(30)), "{schema}");
+            assert!(step.skipped().is_empty(), "{schema}");
         }
     }
 

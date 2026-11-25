@@ -206,7 +206,7 @@ for (const schema of ['IFC2X3', 'IFC4', 'IFC4X3_ADD2']) {
     const prodLine = patched.split(/\r?\n/).find((l) => l.startsWith(`#${m.products.bar5}=`));
     const pdsId = prodLine.split(',')[6];
     const pds = patched.split(/\r?\n/).find((l) => l.startsWith(`${pdsId}=`));
-    check('[observation] bar5 Axis representation kept after rebend', /,\(#\d+,#\d+\)\)/.test(pds ?? ''), { pds });
+    check('F11: bar5 keeps its Axis representation after the rebend', /,\(#\d+,#\d+\)\)/.test(pds ?? ''), { pds });
     await S.shot(path.join(dir, `01-${schema}.png`));
   });
 }
@@ -703,6 +703,18 @@ await scenario('tendon-two-sections', async ({ dir, check, open }) => {
   const c = centre(await S.liveBounds(bid, m.products.tendon));
   check('[observation] T1 edited +0.10 in PK105 and +0.20 in PK110', true, { n1, n2, z: +c[2].toFixed(6), note: 'conflicting edits of one element from two sections' });
   check('two sections editing T1 differently: not silently summed (+0.30)', Math.abs(c[2] - 0.8) > 1e-3, { z: c[2] });
+  // F7 (Nick, 2026-11-25): warn and let the user decide. Nothing changes until they answer.
+  check('F7: the second section raises the conflict warning and changes nothing yet', (await S.conflictShown()) && Math.abs(c[2] - 0.6) < 1e-3, { z: c[2] });
+  await S.shot(path.join(dir, '01-conflict.png'));
+  const n3 = await S.resolveConflict('replace');
+  const c3 = centre(await S.liveBounds(bid, m.products.tendon));
+  check('F7: «Sustituir por este DXF» leaves T1 where PK110 draws it (+0.20)', !(await S.conflictShown()) && Math.abs(c3[2] - 0.7) < 1e-3, { n3, z: c3[2] });
+  // Importing PK105 again asks again (PK110's edit is newer than PK105's export); «Sumar» adds.
+  await S.reimport(W(dir, 'T1_105_up010_again.dxf', moveInsert(d105, blockOf(m.products.tendon), 0, 0.1).text));
+  check('F7: re-importing PK105 asks again', await S.conflictShown());
+  const n4 = await S.resolveConflict('add');
+  const c4 = centre(await S.liveBounds(bid, m.products.tendon));
+  check('F7: «Sumar las dos ediciones» adds PK105 on top (+0.30)', Math.abs(c4[2] - 0.8) < 1e-3, { n4, z: c4[2] });
 });
 
 // =============================================================================================

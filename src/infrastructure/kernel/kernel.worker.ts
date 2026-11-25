@@ -509,6 +509,7 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
     case 'clash-batch-new':
       clashBatch?.free();
       clashBatch = new ClashBatchSlicer();
+      clashBatch.setExportTime(request.exportTimeMs);
       return { value: undefined, transfer: [] };
     case 'clash-batch-add': {
       const ok = currentClashBatch().addSectionChunk(request.modelIndex, new Uint8Array(request.chunk));
@@ -562,7 +563,9 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
         request.dxfBytes,
         request.selfModelId,
         request.openModelIds,
-        request.exclude
+        request.exclude,
+        request.conflict,
+        request.nowMs
       );
       try {
         const patchedIfcBytes = out.patchedIfcBytes();
