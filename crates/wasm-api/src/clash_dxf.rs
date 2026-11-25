@@ -287,6 +287,8 @@ struct NoteState {
     value: String,
     /// `kind=move`: the same displacement in world metres (notes written since F7).
     world: Option<DVec3>,
+    /// `kind=rebend`: original `IfcProduct.Representation` `#id` before any rebend (`rep=`).
+    orig_rep: Option<u32>,
     /// Import time (ms since the Unix epoch; notes written since F7).
     at_ms: Option<f64>,
     /// Monotonic import sequence within the STEP file (`0..`), so later imports are ordered
@@ -321,7 +323,7 @@ fn parse_triple(value: &str) -> Option<DVec3> {
 /// Notes of earlier imports, in file (that is, import) order: the last one of each
 /// `(key, id, kind)` wins, and `drop=` resets the keys another section's edit replaced.
 fn read_notes(original_ifc: &[u8]) -> BTreeMap<(String, u32, String), NoteState> {
-    let mut previous = BTreeMap::new();
+    let mut previous: BTreeMap<(String, u32, String), NoteState> = BTreeMap::new();
     for (seq, note) in step_parser::find_patch_notes(original_ifc).into_iter().enumerate() {
         let kv: BTreeMap<&str, &str> = note
             .split_whitespace()
@@ -337,11 +339,17 @@ fn read_notes(original_ifc: &[u8]) -> BTreeMap<(String, u32, String), NoteState>
             continue;
         };
         let at_ms = kv.get("t").and_then(|v| v.parse::<f64>().ok()).filter(|t| t.is_finite());
+        let orig_rep = kv.get("rep").and_then(|v| v.parse::<u32>().ok()).filter(|&r| r > 0);
         for dropped in kv.get("drop").into_iter().flat_map(|d| d.split(',')) {
+            let prev_rep = previous
+                .get(&(dropped.to_string(), id, kind.to_string()))
+                .and_then(|n| n.orig_rep)
+                .or(orig_rep);
             let reset = if *kind == "move" {
                 NoteState {
                     value: "0.000000,0.000000".to_string(),
                     world: Some(DVec3::ZERO),
+                    orig_rep: None,
                     at_ms,
                     seq,
                 }
@@ -349,23 +357,76 @@ fn read_notes(original_ifc: &[u8]) -> BTreeMap<(String, u32, String), NoteState>
                 NoteState {
                     value: "-".to_string(),
                     world: None,
+                    orig_rep: prev_rep,
                     at_ms,
                     seq,
                 }
             };
             previous.insert((dropped.to_string(), id, kind.to_string()), reset);
         }
+        let prev_rep = previous
+            .get(&(key.to_string(), id, kind.to_string()))
+            .and_then(|n| n.orig_rep);
         previous.insert(
             (key.to_string(), id, kind.to_string()),
             NoteState {
                 value: value.to_string(),
                 world: kv.get("w").and_then(|v| parse_triple(v)),
+                orig_rep: orig_rep.or(prev_rep),
                 at_ms,
                 seq,
             },
         );
     }
     previous
+}
+
+/// Active notes from other sections on `express_id` of `kind` that this DXF did not show
+/// (imported after `meta.exported_at_ms`, or of unknown timestamp).
+fn unseen_notes<'a>(
+    previous: &'a BTreeMap<(String, u32, String), NoteState>,
+    meta: &cad_slicer::ParsedClashMeta,
+    express_id: u32,
+    key: &str,
+    kind: &str,
+) -> Vec<(&'a String, &'a NoteState)> {
+    previous
+        .iter()
+        .filter(|((k, id, kd), note)| {
+            *id == express_id
+                && kd == kind
+                && k != key
+                && note.is_active(kind)
+                && match (meta.exported_at_ms, note.at_ms) {
+                    (Some(exported), Some(at)) => at > exported,
+                    _ => true,
+                }
+        })
+        .map(|((k, _, _), note)| (k, note))
+        .collect()
+}
+
+/// Original `IfcProduct.Representation` `#id` of `express_id` before any F5 rebend.
+/// Returns `None` when a legacy rebend note without `rep=` already overwrote the shape.
+fn original_rep_of(
+    previous: &BTreeMap<(String, u32, String), NoteState>,
+    step: Option<&step_parser::StepIndex<'_>>,
+    express_id: u32,
+) -> Option<u32> {
+    let mut saw_rebend_note = false;
+    for ((_, id, kd), note) in previous {
+        if *id == express_id && kd == "rebend" {
+            saw_rebend_note = true;
+            if let Some(rep) = note.orig_rep {
+                return Some(rep);
+            }
+        }
+    }
+    if saw_rebend_note {
+        None
+    } else {
+        step.and_then(|s| step_parser::check_product_guid(s, express_id, None, false).ok().flatten())
+    }
 }
 
 /// Whether another section imported an active edit on `express_id` *after* both this DXF's
@@ -418,6 +479,9 @@ struct Adjust {
     undo: BTreeMap<u32, DVec3>,
     /// Write the drawing's polyline even when it is unchanged.
     force_rebend: std::collections::BTreeSet<u32>,
+    /// Restore original `IfcProduct.Representation` `#id` when `Replace` undoes a rebend from
+    /// a section that carries no `EDIT_A` polyline.
+    restore_rep: BTreeMap<u32, u32>,
     /// Other sections' keys whose move or rebend the new note resets.
     drop_moves: BTreeMap<u32, Vec<String>>,
     drop_rebends: BTreeMap<u32, Vec<String>>,
@@ -427,7 +491,8 @@ struct Plan {
     outcomes: Vec<Option<EditOutcome>>,
     reported: Vec<bool>,
     patches: Vec<step_parser::StepPatch>,
-    patch_edit_index: Vec<usize>,
+    /// `(edit_index, is_primary)` for each entry of `patches`.
+    patch_edit_index: Vec<(usize, bool)>,
     /// Elements this import patches (or would, but for a conflict), with their section key.
     acted: BTreeMap<u32, String>,
 }
@@ -472,6 +537,7 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
     let mut acted = BTreeMap::new();
     // Move applied in this import, per product (metres, world), for its rebend.
     let mut moved_now: BTreeMap<u32, DVec3> = BTreeMap::new();
+    let mut move_seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let skip = |reason| {
         Some(EditOutcome {
             status: "skipped",
@@ -509,6 +575,7 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
             }
             continue;
         }
+        move_seen.insert(*express_id);
         let key = edit_key(meta, edit);
         let own_note = previous.get(&(key.clone(), *express_id, "move".to_string()));
         let done = own_note
@@ -518,12 +585,13 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
         let undo = adjust.undo.get(express_id).copied().unwrap_or(DVec3::ZERO);
         let delta_world = meta.frame.right * own.x + meta.frame.up * own.y - undo;
         let dropping = adjust.drop_moves.get(express_id).is_some_and(|d| !d.is_empty());
+        let restoring = adjust.restore_rep.contains_key(express_id);
         let superseded = i < changed
             && scope.conflict != ConflictPolicy::Add
             && own_note
                 .filter(|n| n.is_active("move"))
                 .is_some_and(|n| has_newer_unseen_other(previous, meta, *express_id, &key, n.seq));
-        if delta_world.length() <= MOVE_EPS_M && !dropping && !superseded {
+        if delta_world.length() <= MOVE_EPS_M && !dropping && !restoring && !superseded {
             outcomes[i] = skip("already-applied");
             continue;
         }
@@ -551,7 +619,7 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
             total.z,
             note_suffix(scope.now_ms, adjust.drop_moves.get(express_id)),
         );
-        patch_edit_index.push(i);
+        patch_edit_index.push((i, true));
         if delta_world.length() <= MOVE_EPS_M {
             patches.push(step_parser::StepPatch::RecordNote {
                 express_id: *express_id,
@@ -565,6 +633,18 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
                 delta_file_units: (delta_world * inv_scale).to_array(),
                 expected_global_id: global_id.clone(),
                 note: Some(note),
+            });
+        }
+        if let Some(&rep_id) = adjust.restore_rep.get(express_id) {
+            patch_edit_index.push((i, false));
+            patches.push(step_parser::StepPatch::RestoreRepresentation {
+                express_id: *express_id,
+                representation_id: rep_id,
+                expected_global_id: global_id.clone(),
+                note: Some(format!(
+                    "GUBIM_F5 key={key} id={express_id} kind=rebend v=- rep={rep_id}{}",
+                    note_suffix(scope.now_ms, adjust.drop_rebends.get(express_id)),
+                )),
             });
         }
     }
@@ -612,7 +692,7 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
         let prior = own_rebend.map(|n| &n.value);
         // The polyline is absolute: a move applied in this import shifts the placement the
         // geometry hangs from, so an earlier rebend is written again, minus that move.
-        let shift = moved_now.get(express_id).copied().unwrap_or(DVec3::ZERO);
+        let mut shift = moved_now.get(express_id).copied().unwrap_or(DVec3::ZERO);
         let moved = shift.length() > 1e-9;
         let superseded = i < changed
             && scope.conflict != ConflictPolicy::Add
@@ -647,19 +727,70 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
             outcomes[i] = skip("out-of-range");
             continue;
         }
+        // If the drafter deleted the INSERT entity and left only EDIT_A while `Replace` must
+        // undo another section's move, emit the undo move alongside the rebend.
+        if !move_seen.contains(express_id) && adjust.drop_moves.contains_key(express_id) {
+            let undo = adjust.undo.get(express_id).copied().unwrap_or(DVec3::ZERO);
+            let delta_undo = -undo;
+            let move_note = format!(
+                "GUBIM_F5 key={key} id={express_id} kind=move v=0.000000,0.000000 w=0.000000,0.000000,0.000000{}",
+                note_suffix(scope.now_ms, adjust.drop_moves.get(express_id)),
+            );
+            patch_edit_index.push((i, false));
+            if delta_undo.length() <= MOVE_EPS_M {
+                patches.push(step_parser::StepPatch::RecordNote {
+                    express_id: *express_id,
+                    expected_global_id: global_id.clone(),
+                    note: move_note,
+                });
+            } else {
+                shift = delta_undo;
+                moved_now.insert(*express_id, delta_undo);
+                patches.push(step_parser::StepPatch::MovePlacement {
+                    express_id: *express_id,
+                    delta_file_units: (delta_undo * inv_scale).to_array(),
+                    expected_global_id: global_id.clone(),
+                    note: Some(move_note),
+                });
+            }
+        }
+        // Active unseen moves from other sections that are kept (e.g. under `Add`) already
+        // shifted `ObjectPlacement` in `original_ifc`, while this pre-move DXF's `points_3d`
+        // were drawn without them: add them so the curve lands at `points_3d + kept_unseen`.
+        let dropped_moves = adjust.drop_moves.get(express_id);
+        let kept_unseen_move: DVec3 = unseen_notes(previous, meta, *express_id, &key, "move")
+            .into_iter()
+            .filter(|(k, _)| dropped_moves.is_none_or(|d| !d.contains(*k)))
+            .filter_map(|(_, n)| n.world)
+            .sum();
         let pts_file: Vec<[f64; 3]> = points_3d
             .iter()
-            .map(|p| ((*p - shift) * inv_scale).to_array())
+            .map(|p| ((*p + kept_unseen_move - shift) * inv_scale).to_array())
             .collect();
-        patch_edit_index.push(i);
+        let rep_part = original_rep_of(previous, step, *express_id)
+            .map(|r| format!(" rep={r}"))
+            .unwrap_or_default();
+        let add_dropped_rebends: Vec<String> = if scope.conflict == ConflictPolicy::Add {
+            unseen_notes(previous, meta, *express_id, &key, "rebend")
+                .into_iter()
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dropped_rebends = adjust
+            .drop_rebends
+            .get(express_id)
+            .or((!add_dropped_rebends.is_empty()).then_some(&add_dropped_rebends));
+        patch_edit_index.push((i, true));
         patches.push(step_parser::StepPatch::RebendSweptDisk {
             express_id: *express_id,
             points_file_units: pts_file,
             radius_file_units: 0.0,
             expected_global_id: global_id.clone(),
             note: Some(format!(
-                "GUBIM_F5 key={key} id={express_id} kind=rebend v={shape}{}",
-                note_suffix(scope.now_ms, adjust.drop_rebends.get(express_id)),
+                "GUBIM_F5 key={key} id={express_id} kind=rebend v={shape}{rep_part}{}",
+                note_suffix(scope.now_ms, dropped_rebends),
             )),
         });
     }
@@ -736,21 +867,8 @@ pub fn apply_clash_dxf_to_step_indexed(
 
     // Other sections' edits of the same element this drawing did not show: made after the
     // export (or of unknown time).
-    let unseen = |express_id: u32, key: &str, kind: &str| -> Vec<(&String, &NoteState)> {
-        previous
-            .iter()
-            .filter(|((k, id, kd), note)| {
-                *id == express_id
-                    && kd == kind
-                    && k != key
-                    && note.is_active(kind)
-                    && match (meta.exported_at_ms, note.at_ms) {
-                        (Some(exported), Some(at)) => at > exported,
-                        _ => true,
-                    }
-            })
-            .map(|((k, _, _), note)| (k, note))
-            .collect()
+    let unseen = |express_id: u32, key: &str, kind: &str| {
+        unseen_notes(&previous, meta, express_id, key, kind)
     };
     let conflicted: Vec<(u32, &String)> = first
         .acted
@@ -776,6 +894,29 @@ pub fn apply_clash_dxf_to_step_indexed(
                 adjust.blocked.insert(id);
                 continue;
             }
+            let rebends = unseen(id, key, "rebend");
+            let has_rebend_in_dxf = all.iter().enumerate().any(|(idx, e)| {
+                e.express_id() == id
+                    && matches!(e, cad_slicer::DxfRoundTripEdit::Rebend { .. })
+                    && scope.admits(idx, e, &meta.model_id).is_ok()
+            });
+            if !rebends.is_empty() && !has_rebend_in_dxf {
+                // This DXF carries no EDIT_A polyline for `id` (longitudinal cut or polyline
+                // deleted in CAD): restore the product's original pre-rebend representation.
+                let orig_rep = rebends
+                    .iter()
+                    .find_map(|(_, n)| n.orig_rep)
+                    .or_else(|| {
+                        previous
+                            .get(&(key.clone(), id, "rebend".to_string()))
+                            .and_then(|n| n.orig_rep)
+                    });
+                let Some(rep_id) = orig_rep else {
+                    adjust.blocked.insert(id);
+                    continue;
+                };
+                adjust.restore_rep.insert(id, rep_id);
+            }
             if !moves.is_empty() {
                 let undo = moves.iter().filter_map(|(_, note)| note.world).sum::<DVec3>();
                 adjust.undo.insert(id, undo);
@@ -783,11 +924,10 @@ pub fn apply_clash_dxf_to_step_indexed(
                     .drop_moves
                     .insert(id, moves.iter().map(|(k, _)| (*k).clone()).collect());
             }
-            let rebends = unseen(id, key, "rebend");
             let own_rebend = previous
                 .get(&(key.clone(), id, "rebend".to_string()))
                 .is_some_and(|n| n.is_active("rebend"));
-            if !rebends.is_empty() || own_rebend {
+            if (!rebends.is_empty() && has_rebend_in_dxf) || own_rebend {
                 adjust.force_rebend.insert(id);
             }
             if !rebends.is_empty() {
@@ -812,11 +952,13 @@ pub fn apply_clash_dxf_to_step_indexed(
     } else {
         patch_with_kernel_placements(original_ifc, &patches, scale, false)?
     };
-    for (outcome, &edit_index) in report.outcomes.iter().zip(&patch_edit_index) {
-        outcomes[edit_index] = Some(EditOutcome {
-            status: if outcome.applied { "applied" } else { "skipped" },
-            reason: outcome.reason,
-        });
+    for (outcome, &(edit_index, is_primary)) in report.outcomes.iter().zip(&patch_edit_index) {
+        if is_primary || !outcome.applied {
+            outcomes[edit_index] = Some(EditOutcome {
+                status: if outcome.applied { "applied" } else { "skipped" },
+                reason: outcome.reason,
+            });
+        }
     }
     let entries: Vec<(usize, &cad_slicer::DxfRoundTripEdit, Option<EditOutcome>)> = all
         .iter()

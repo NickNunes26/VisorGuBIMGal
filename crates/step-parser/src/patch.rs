@@ -52,6 +52,15 @@ pub enum StepPatch {
         expected_global_id: Option<String>,
         note: String,
     },
+    /// Restores `IfcProduct.Representation` (`param 6`) to an existing `#representation_id`
+    /// in the STEP file when `Replace` undoes an earlier section's rebend from a section that
+    /// carries no `EDIT_A` polyline.
+    RestoreRepresentation {
+        express_id: u32,
+        representation_id: u32,
+        expected_global_id: Option<String>,
+        note: Option<String>,
+    },
 }
 
 impl StepPatch {
@@ -59,7 +68,8 @@ impl StepPatch {
         match self {
             StepPatch::MovePlacement { express_id, .. }
             | StepPatch::RebendSweptDisk { express_id, .. }
-            | StepPatch::RecordNote { express_id, .. } => *express_id,
+            | StepPatch::RecordNote { express_id, .. }
+            | StepPatch::RestoreRepresentation { express_id, .. } => *express_id,
         }
     }
 
@@ -73,15 +83,18 @@ impl StepPatch {
             }
             | StepPatch::RecordNote {
                 expected_global_id, ..
+            }
+            | StepPatch::RestoreRepresentation {
+                expected_global_id, ..
             } => expected_global_id.as_deref().filter(|g| !g.is_empty()),
         }
     }
 
     fn note(&self) -> Option<&str> {
         match self {
-            StepPatch::MovePlacement { note, .. } | StepPatch::RebendSweptDisk { note, .. } => {
-                note.as_deref()
-            }
+            StepPatch::MovePlacement { note, .. }
+            | StepPatch::RebendSweptDisk { note, .. }
+            | StepPatch::RestoreRepresentation { note, .. } => note.as_deref(),
             StepPatch::RecordNote { note, .. } => Some(note.as_str()),
         }
     }
@@ -349,6 +362,28 @@ pub fn patch_step_file_with(
                     }
                     push_note(&mut appended, note);
                     moved.insert(express_id);
+                    Ok(())
+                }
+                StepPatch::RestoreRepresentation {
+                    representation_id, ..
+                } => {
+                    if rebent.contains(&express_id) {
+                        return Err("duplicate-edit");
+                    }
+                    if step.get(*representation_id).is_none() {
+                        return Err("not-found");
+                    }
+                    let (arg_start, arg_end) =
+                        find_top_level_param_span(record, 6).ok_or("not-a-product")?;
+                    if let Some(note) = patch.note() {
+                        push_note(&mut appended, note);
+                    }
+                    replacements.push((
+                        ent_ref.start + arg_start,
+                        ent_ref.start + arg_end,
+                        format!("#{representation_id}").into_bytes(),
+                    ));
+                    rebent.insert(express_id);
                     Ok(())
                 }
             }
@@ -1264,5 +1299,58 @@ ENDSEC;\r\nEND-ISO-10303-21;\r\n";
         );
         let step = index(src.as_bytes()).unwrap();
         assert_eq!(resolve_existing_bar_radius(&step, 100), Some(0.04));
+    }
+
+    #[test]
+    fn restore_representation_rewrites_product_shape_and_validates_guid() {
+        let src = file("IFC4");
+        let (bent, r1) =
+            patch_step_file(src.as_bytes(), &[rebend(Some("2O2Fr$t4X7Zf8NOew3FLOH"))]).unwrap();
+        assert_eq!(r1.applied, 1);
+        let step_bent = index(&bent).unwrap();
+        assert_ne!(step_bent.decode(100).unwrap().params.get(6), Some(&Value::Ref(34)));
+
+        let (_, bad_guid) = patch_step_file(
+            &bent,
+            &[StepPatch::RestoreRepresentation {
+                express_id: 100,
+                representation_id: 34,
+                expected_global_id: Some("3WrongGlobalId00000000".into()),
+                note: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bad_guid.outcomes[0].reason, Some("guid-mismatch"));
+
+        let (_, bad_rep) = patch_step_file(
+            &bent,
+            &[StepPatch::RestoreRepresentation {
+                express_id: 100,
+                representation_id: 99_999,
+                expected_global_id: Some("2O2Fr$t4X7Zf8NOew3FLOH".into()),
+                note: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bad_rep.outcomes[0].reason, Some("not-found"));
+
+        let (restored, r2) = patch_step_file(
+            &bent,
+            &[StepPatch::RestoreRepresentation {
+                express_id: 100,
+                representation_id: 34,
+                expected_global_id: Some("2O2Fr$t4X7Zf8NOew3FLOH".into()),
+                note: Some("GUBIM_F5 restore".into()),
+            }],
+        )
+        .unwrap();
+        assert_eq!(r2.applied, 1);
+        let step_restored = index(&restored).unwrap();
+        assert!(step_restored.skipped().is_empty());
+        assert_eq!(step_restored.decode(100).unwrap().params.get(6), Some(&Value::Ref(34)));
+        assert_eq!(
+            find_patch_notes(&restored),
+            vec!["GUBIM_F5 test".to_string(), "GUBIM_F5 restore".to_string()]
+        );
     }
 }

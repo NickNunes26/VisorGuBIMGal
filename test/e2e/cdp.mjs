@@ -42,17 +42,18 @@ async function launchOnce({ chrome, args, port, profileDir, timeoutMs }) {
 
   let exited = null;
   let spawnError = null;
-  proc.once('error', (err) => { spawnError = err; });
-  proc.once('exit', (code, signal) => {
-    exited = { code, signal };
-    proc.stderr?.destroy();
-    cleanupProfile();
-  });
   const onProcessExit = () => {
     try { proc.kill(); } catch {}
     cleanupProfile();
   };
   process.once('exit', onProcessExit);
+  proc.once('error', (err) => { spawnError = err; });
+  proc.once('exit', (code, signal) => {
+    exited = { code, signal };
+    process.off('exit', onProcessExit);
+    proc.stderr?.destroy();
+    cleanupProfile();
+  });
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline && !exited && !spawnError) {

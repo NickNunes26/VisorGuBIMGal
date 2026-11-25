@@ -1189,3 +1189,74 @@ fn f7_reimporting_earlier_section_after_add_warns_and_replace_undoes_later_sum()
     assert_eq!(json_field(&json_a_rep, "applied"), "1", "{json_a_rep}");
     assert!((centre_z(&restored) - (z0 + 0.30)).abs() < 1e-6);
 }
+
+#[test]
+fn f7_cross_section_move_and_rebend_commute_on_add_and_restore_on_replace() {
+    let ifc = utm_ifc();
+    let a = utm_sheet_at(ifc.as_bytes(), 540_000.5, 1234.0, 1000.0);
+    let b = utm_sheet_at(ifc.as_bytes(), 540_001.5, 1235.0, 1000.0);
+    let orig_pos = |dxf: &str| {
+        let diff = parse_clash_dxf_edits(dxf.as_bytes()).unwrap();
+        diff.unchanged
+            .iter()
+            .chain(&diff.edits)
+            .map(|e| e.orig_pos())
+            .next()
+            .unwrap()
+    };
+    let v = |dxf: &str, rise: f64| {
+        let p = orig_pos(dxf);
+        add_edit_polyline(dxf, 100, &[(p.x - 0.04, p.y), (p.x, p.y + rise), (p.x + 0.04, p.y)])
+    };
+
+    // 1. Move in A (+0.20) then Rebend in B (V, rise +0.15) with `Add` must equal Rebend in A
+    //    then Move in B (+0.20) with `Add` (`V + 0.20`).
+    let a_move = move_insert(&a, 100, 0.0, 0.20);
+    let b_rebend = v(&b, 0.15);
+    let (m_first, _) = apply_policy(ifc.as_bytes(), &a_move, "ask", 2000.0);
+    let (_, ask_1) = apply_policy(&m_first, &b_rebend, "ask", 3000.0);
+    assert!(ask_1.contains("\"reason\":\"edit-conflict\""), "{ask_1}");
+    let (sum_mr, json_mr) = apply_policy(&m_first, &b_rebend, "add", 3000.0);
+    assert_eq!(json_field(&json_mr, "applied"), "1", "{json_mr}");
+
+    let a_rebend = v(&a, 0.15);
+    let b_move = move_insert(&b, 100, 0.0, 0.20);
+    let (r_first, _) = apply_policy(ifc.as_bytes(), &a_rebend, "ask", 2000.0);
+    let (sum_rm, json_rm) = apply_policy(&r_first, &b_move, "add", 3000.0);
+    assert_eq!(json_field(&json_rm, "applied"), "1", "{json_rm}");
+
+    let (v_only, _) = apply_policy(ifc.as_bytes(), &b_rebend, "ask", 2000.0);
+    let (lo_v, hi_v) = bounds(&eval_mesh(&v_only, 100));
+    let shift_z = glam::DVec3::new(0.0, 0.0, 0.20);
+    let (lo_mr, hi_mr) = bounds(&eval_mesh(&sum_mr, 100));
+    let (lo_rm, hi_rm) = bounds(&eval_mesh(&sum_rm, 100));
+    assert!(
+        (lo_mr.z - lo_rm.z).abs() < 1e-6 && (hi_mr.z - hi_rm.z).abs() < 1e-6,
+        "Add must commute on Z: move->rebend {lo_mr:?}..{hi_mr:?} vs rebend->move {lo_rm:?}..{hi_rm:?}"
+    );
+    assert!(
+        (lo_mr - (lo_v + shift_z)).length() < 1e-6 && (hi_mr - (hi_v + shift_z)).length() < 1e-6,
+        "V + 0.20 must shift pure V ({lo_v:?}..{hi_v:?}) by +0.20 Z, got {lo_mr:?}..{hi_mr:?}"
+    );
+
+    // 2. Rebend in A (V), then Move in B (+0.20) where B carries NO EDIT_A_100 polyline
+    //    (simulating a longitudinal cut or an EDIT_A polyline deleted in CAD):
+    //    `Replace` must restore the original straight bar representation shifted to z0 + 0.20.
+    let (orig_lo, orig_hi) = bounds(&eval_mesh(ifc.as_bytes(), 100));
+    let b_move_no_poly = b_move.replace("\r\n8\r\nEDIT_A_100", "\r\n8\r\nREMOVED_POLY_100");
+    let (_, ask_2) = apply_policy(&r_first, &b_move_no_poly, "ask", 3000.0);
+    assert!(ask_2.contains("\"reason\":\"edit-conflict\""), "{ask_2}");
+    let (rep_straight, json_rep) = apply_policy(&r_first, &b_move_no_poly, "replace", 3000.0);
+    assert_eq!(json_field(&json_rep, "applied"), "1", "{json_rep}");
+    let (lo_s, hi_s) = bounds(&eval_mesh(&rep_straight, 100));
+    assert!(
+        (lo_s - (orig_lo + shift_z)).length() < 1e-6 && (hi_s - (orig_hi + shift_z)).length() < 1e-6,
+        "Replace without EDIT_A must restore original straight bar shifted by +0.20 Z ({:?}..{:?}), got {lo_s:?}..{hi_s:?}",
+        orig_lo + shift_z,
+        orig_hi + shift_z
+    );
+    // Re-importing B's move is now idempotent without conflict.
+    let (_, json_idem) = apply_policy(&rep_straight, &b_move_no_poly, "ask", 4000.0);
+    assert!(json_idem.contains("\"reason\":\"already-applied\""), "{json_idem}");
+    assert!(!json_idem.contains("edit-conflict"), "{json_idem}");
+}
