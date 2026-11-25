@@ -44,13 +44,22 @@ pub enum StepPatch {
         expected_global_id: Option<String>,
         note: Option<String>,
     },
+    /// Appends a `/* ... */` round-trip note for a validated product when its geometry is
+    /// already at the target coordinates (for example, `Replace` adopting another section that
+    /// drew the same world displacement).
+    RecordNote {
+        express_id: u32,
+        expected_global_id: Option<String>,
+        note: String,
+    },
 }
 
 impl StepPatch {
     pub fn express_id(&self) -> u32 {
         match self {
             StepPatch::MovePlacement { express_id, .. }
-            | StepPatch::RebendSweptDisk { express_id, .. } => *express_id,
+            | StepPatch::RebendSweptDisk { express_id, .. }
+            | StepPatch::RecordNote { express_id, .. } => *express_id,
         }
     }
 
@@ -61,6 +70,9 @@ impl StepPatch {
             }
             | StepPatch::RebendSweptDisk {
                 expected_global_id, ..
+            }
+            | StepPatch::RecordNote {
+                expected_global_id, ..
             } => expected_global_id.as_deref().filter(|g| !g.is_empty()),
         }
     }
@@ -70,6 +82,7 @@ impl StepPatch {
             StepPatch::MovePlacement { note, .. } | StepPatch::RebendSweptDisk { note, .. } => {
                 note.as_deref()
             }
+            StepPatch::RecordNote { note, .. } => Some(note.as_str()),
         }
     }
 }
@@ -325,6 +338,17 @@ pub fn patch_step_file_with(
                         format!("#{prod_shape_id}").into_bytes(),
                     ));
                     rebent.insert(express_id);
+                    Ok(())
+                }
+                StepPatch::RecordNote { note, .. } => {
+                    if moved.contains(&express_id) {
+                        return Err("duplicate-edit");
+                    }
+                    if entity.params.len() < 7 {
+                        return Err("not-a-product");
+                    }
+                    push_note(&mut appended, note);
+                    moved.insert(express_id);
                     Ok(())
                 }
             }

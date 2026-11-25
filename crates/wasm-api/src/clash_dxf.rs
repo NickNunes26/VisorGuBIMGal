@@ -289,6 +289,9 @@ struct NoteState {
     world: Option<DVec3>,
     /// Import time (ms since the Unix epoch; notes written since F7).
     at_ms: Option<f64>,
+    /// Monotonic import sequence within the STEP file (`0..`), so later imports are ordered
+    /// reliably even when timestamps match or are absent.
+    seq: usize,
 }
 
 impl NoteState {
@@ -319,7 +322,7 @@ fn parse_triple(value: &str) -> Option<DVec3> {
 /// `(key, id, kind)` wins, and `drop=` resets the keys another section's edit replaced.
 fn read_notes(original_ifc: &[u8]) -> BTreeMap<(String, u32, String), NoteState> {
     let mut previous = BTreeMap::new();
-    for note in step_parser::find_patch_notes(original_ifc) {
+    for (seq, note) in step_parser::find_patch_notes(original_ifc).into_iter().enumerate() {
         let kv: BTreeMap<&str, &str> = note
             .split_whitespace()
             .skip(1)
@@ -340,12 +343,14 @@ fn read_notes(original_ifc: &[u8]) -> BTreeMap<(String, u32, String), NoteState>
                     value: "0.000000,0.000000".to_string(),
                     world: Some(DVec3::ZERO),
                     at_ms,
+                    seq,
                 }
             } else {
                 NoteState {
                     value: "-".to_string(),
                     world: None,
                     at_ms,
+                    seq,
                 }
             };
             previous.insert((dropped.to_string(), id, kind.to_string()), reset);
@@ -356,10 +361,33 @@ fn read_notes(original_ifc: &[u8]) -> BTreeMap<(String, u32, String), NoteState>
                 value: value.to_string(),
                 world: kv.get("w").and_then(|v| parse_triple(v)),
                 at_ms,
+                seq,
             },
         );
     }
     previous
+}
+
+/// Whether another section imported an active edit on `express_id` *after* both this DXF's
+/// export and this section's own last import (`own_seq`), meaning the element is no longer
+/// where this section left it (for example, a later section chose `Add`).
+fn has_newer_unseen_other(
+    previous: &BTreeMap<(String, u32, String), NoteState>,
+    meta: &cad_slicer::ParsedClashMeta,
+    express_id: u32,
+    key: &str,
+    own_seq: usize,
+) -> bool {
+    previous.iter().any(|((k, id, kd), note)| {
+        *id == express_id
+            && k != key
+            && note.seq > own_seq
+            && note.is_active(kd)
+            && match (meta.exported_at_ms, note.at_ms) {
+                (Some(exported), Some(at)) => at > exported,
+                _ => true,
+            }
+    })
 }
 
 /// Idempotence key of one element of one exported section.
@@ -482,14 +510,20 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
             continue;
         }
         let key = edit_key(meta, edit);
-        let done = previous
-            .get(&(key.clone(), *express_id, "move".to_string()))
+        let own_note = previous.get(&(key.clone(), *express_id, "move".to_string()));
+        let done = own_note
             .and_then(|n| parse_pair(&n.value))
             .unwrap_or(DVec2::ZERO);
         let own = *delta_2d - done;
         let undo = adjust.undo.get(express_id).copied().unwrap_or(DVec3::ZERO);
         let delta_world = meta.frame.right * own.x + meta.frame.up * own.y - undo;
-        if delta_world.length() <= MOVE_EPS_M {
+        let dropping = adjust.drop_moves.get(express_id).is_some_and(|d| !d.is_empty());
+        let superseded = i < changed
+            && scope.conflict != ConflictPolicy::Add
+            && own_note
+                .filter(|n| n.is_active("move"))
+                .is_some_and(|n| has_newer_unseen_other(previous, meta, *express_id, &key, n.seq));
+        if delta_world.length() <= MOVE_EPS_M && !dropping && !superseded {
             outcomes[i] = skip("already-applied");
             continue;
         }
@@ -507,23 +541,32 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
             outcomes[i] = skip("out-of-range");
             continue;
         }
-        moved_now.insert(*express_id, delta_world);
         let total = meta.frame.right * delta_2d.x + meta.frame.up * delta_2d.y;
+        let note = format!(
+            "GUBIM_F5 key={key} id={express_id} kind=move v={:.6},{:.6} w={:.6},{:.6},{:.6}{}",
+            delta_2d.x,
+            delta_2d.y,
+            total.x,
+            total.y,
+            total.z,
+            note_suffix(scope.now_ms, adjust.drop_moves.get(express_id)),
+        );
         patch_edit_index.push(i);
-        patches.push(step_parser::StepPatch::MovePlacement {
-            express_id: *express_id,
-            delta_file_units: (delta_world * inv_scale).to_array(),
-            expected_global_id: global_id.clone(),
-            note: Some(format!(
-                "GUBIM_F5 key={key} id={express_id} kind=move v={:.6},{:.6} w={:.6},{:.6},{:.6}{}",
-                delta_2d.x,
-                delta_2d.y,
-                total.x,
-                total.y,
-                total.z,
-                note_suffix(scope.now_ms, adjust.drop_moves.get(express_id)),
-            )),
-        });
+        if delta_world.length() <= MOVE_EPS_M {
+            patches.push(step_parser::StepPatch::RecordNote {
+                express_id: *express_id,
+                expected_global_id: global_id.clone(),
+                note,
+            });
+        } else {
+            moved_now.insert(*express_id, delta_world);
+            patches.push(step_parser::StepPatch::MovePlacement {
+                express_id: *express_id,
+                delta_file_units: (delta_world * inv_scale).to_array(),
+                expected_global_id: global_id.clone(),
+                note: Some(note),
+            });
+        }
     }
     for (i, edit) in all.iter().enumerate() {
         let cad_slicer::DxfRoundTripEdit::Rebend {
@@ -563,14 +606,18 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
                 .collect::<Vec<_>>()
                 .join(";"),
         );
-        let prior = previous
+        let own_rebend = previous
             .get(&(key.clone(), *express_id, "rebend".to_string()))
-            .filter(|n| n.is_active("rebend"))
-            .map(|n| &n.value);
+            .filter(|n| n.is_active("rebend"));
+        let prior = own_rebend.map(|n| &n.value);
         // The polyline is absolute: a move applied in this import shifts the placement the
         // geometry hangs from, so an earlier rebend is written again, minus that move.
         let shift = moved_now.get(express_id).copied().unwrap_or(DVec3::ZERO);
         let moved = shift.length() > 1e-9;
+        let superseded = i < changed
+            && scope.conflict != ConflictPolicy::Add
+            && own_rebend
+                .is_some_and(|n| has_newer_unseen_other(previous, meta, *express_id, &key, n.seq));
         if !adjust.force_rebend.contains(express_id) {
             if i >= changed {
                 // Unchanged polyline: only acts on an element an earlier import rebent.
@@ -578,7 +625,7 @@ fn plan_edits(input: &PlanInput<'_>, adjust: &Adjust) -> Plan {
                     continue;
                 }
                 reported[i] = true;
-            } else if prior == Some(&shape) && !moved {
+            } else if prior == Some(&shape) && !moved && !superseded {
                 outcomes[i] = skip("already-applied");
                 continue;
             }

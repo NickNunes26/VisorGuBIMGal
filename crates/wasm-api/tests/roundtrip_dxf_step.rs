@@ -1122,3 +1122,70 @@ fn f7_foreign_global_id_on_patched_express_id_reports_guid_mismatch_not_conflict
     assert!(!json_a.contains("already-applied"), "{json_a}");
     assert_eq!(out_a, after_a);
 }
+
+#[test]
+fn f7_replace_with_equal_displacement_records_note_and_drops_earlier_section() {
+    let ifc = utm_ifc();
+    let z0 = centre_z(ifc.as_bytes());
+    let a = utm_sheet_at(ifc.as_bytes(), 540_000.5, 1234.0, 1000.0);
+    let b = utm_sheet_at(ifc.as_bytes(), 540_001.5, 1235.0, 1000.0);
+    let a_010 = move_insert(&a, 100, 0.0, 0.10);
+    let b_010 = move_insert(&b, 100, 0.0, 0.10);
+
+    let (after_a, json) = apply_policy(ifc.as_bytes(), &a_010, "ask", 2000.0);
+    assert_eq!(json_field(&json, "applied"), "1", "{json}");
+    assert!((centre_z(&after_a) - (z0 + 0.10)).abs() < 1e-6);
+
+    // Section B also drew +0.10: `ask` warns (summing would land at +0.20), and `replace`
+    // adopts section B (`applied == 1`, z stays z0 + 0.10, A's note is dropped).
+    let (_, json_ask) = apply_policy(&after_a, &b_010, "ask", 3000.0);
+    assert!(json_ask.contains("\"reason\":\"edit-conflict\""), "{json_ask}");
+
+    let (after_b, json_rep) = apply_policy(&after_a, &b_010, "replace", 3000.0);
+    assert_eq!(json_field(&json_rep, "applied"), "1", "{json_rep}");
+    assert!((centre_z(&after_b) - (z0 + 0.10)).abs() < 1e-6);
+
+    // Re-importing B now reports `already-applied` without asking again, and a further edit
+    // in B (+0.20) applies only the +0.10 difference without conflict.
+    let (_, json_idem) = apply_policy(&after_b, &b_010, "ask", 4000.0);
+    assert_eq!(json_field(&json_idem, "applied"), "0", "{json_idem}");
+    assert!(json_idem.contains("\"reason\":\"already-applied\""), "{json_idem}");
+    assert!(!json_idem.contains("edit-conflict"), "{json_idem}");
+
+    let b_020 = move_insert(&b, 100, 0.0, 0.20);
+    let (after_b2, json_b2) = apply_policy(&after_b, &b_020, "ask", 5000.0);
+    assert_eq!(json_field(&json_b2, "applied"), "1", "{json_b2}");
+    assert!((centre_z(&after_b2) - (z0 + 0.20)).abs() < 1e-6);
+}
+
+#[test]
+fn f7_reimporting_earlier_section_after_add_warns_and_replace_undoes_later_sum() {
+    let ifc = utm_ifc();
+    let z0 = centre_z(ifc.as_bytes());
+    let a = utm_sheet_at(ifc.as_bytes(), 540_000.5, 1234.0, 1000.0);
+    let b = utm_sheet_at(ifc.as_bytes(), 540_001.5, 1235.0, 1000.0);
+    let a_030 = move_insert(&a, 100, 0.0, 0.30);
+    let b_010 = move_insert(&b, 100, 0.0, 0.10);
+
+    let (after_a, _) = apply_policy(ifc.as_bytes(), &a_030, "ask", 2000.0);
+    let (summed, json_add) = apply_policy(&after_a, &b_010, "add", 3000.0);
+    assert_eq!(json_field(&json_add, "applied"), "1", "{json_add}");
+    assert!((centre_z(&summed) - (z0 + 0.40)).abs() < 1e-6);
+
+    // Re-importing the just-summed section B is `already-applied`.
+    let (_, json_b_idem) = apply_policy(&summed, &b_010, "ask", 4000.0);
+    assert!(json_b_idem.contains("\"reason\":\"already-applied\""), "{json_b_idem}");
+    assert!(!json_b_idem.contains("edit-conflict"), "{json_b_idem}");
+
+    // Re-importing the earlier section A (+0.30) must warn because B edited #100 after A's
+    // import, and `replace` restores #100 to A's +0.30.
+    let (_, json_a_ask) = apply_policy(&summed, &a_030, "ask", 4000.0);
+    assert!(json_a_ask.contains("\"reason\":\"edit-conflict\""), "{json_a_ask}");
+
+    let (_, json_a_add) = apply_policy(&summed, &a_030, "add", 4000.0);
+    assert!(json_a_add.contains("\"reason\":\"already-applied\""), "{json_a_add}");
+
+    let (restored, json_a_rep) = apply_policy(&summed, &a_030, "replace", 4000.0);
+    assert_eq!(json_field(&json_a_rep, "applied"), "1", "{json_a_rep}");
+    assert!((centre_z(&restored) - (z0 + 0.30)).abs() < 1e-6);
+}
