@@ -808,6 +808,21 @@ await scenario('f7-three-sections-and-choices', async ({ dir, check, open }) => 
   await S.ev(`document.querySelector('[data-testid="clash-roundtrip-conflict"]')?.scrollIntoView({ block: 'center' })`);
   await sleep(100);
   await S.shot(path.join(dir, '01b-conflict-choices-scrolled.png'));
+  const boxFit = await S.ev(`(() => {
+    const box = document.querySelector('[data-testid="clash-roundtrip-conflict"]');
+    if (!box) return { ok: false };
+    const br = box.getBoundingClientRect();
+    const btns = [...box.querySelectorAll('button')].map((b) => {
+      const r = b.getBoundingClientRect();
+      return { id: b.dataset.testid, left: Math.round(r.left), right: Math.round(r.right), width: Math.round(r.width) };
+    });
+    return {
+      ok: btns.length === 4 && btns.every((r) => r.width > 0 && r.left >= br.left - 2 && r.right <= br.right + 2),
+      box: { left: Math.round(br.left), right: Math.round(br.right) },
+      btns
+    };
+  })()`);
+  check('F7 conflict choices wrap cleanly inside sidebar without horizontal overflow', boxFit.ok, boxFit);
   const nCancel = await S.resolveConflict('cancel');
   const ifcAfterCancel = readFileSync(await S.downloadPatched(), 'utf8');
   const csvAfterCancel = readFileSync(await S.downloadCsv(), 'utf8');
