@@ -774,4 +774,12 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
   }
 });
 
+await test('F7 conflict action bar wraps so all four choice buttons fit inside sidebar', () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const css = readFileSync(path.join(repoRoot, 'src/ui/styles/index.css'), 'utf8');
+  const rule = /\.clash-alignment-actions\s*\{([^}]*)\}/.exec(css);
+  assert.ok(rule, '.clash-alignment-actions rule must exist in index.css');
+  assert.match(rule[1], /\bflex-wrap\s*:\s*wrap\b/, 'clash-alignment-actions must wrap across lines');
+});
+
 console.log(`\nt171-clash-dxf-export-test: ${passed}/${passed} pass`);
