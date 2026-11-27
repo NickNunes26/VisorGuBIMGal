@@ -11,12 +11,25 @@ use std::collections::BTreeMap;
 /// Accumulates culled 3D meshes for one clash section at a time, produces its individual DXF R12
 /// bytes + instant SVG preview, drops the 3D meshes immediately, and retains only the compact 2D
 /// `ClashSectionSheet` for zero-re-slice `merge_master_dxf`.
-#[derive(Default)]
 pub struct ClashBatchStore {
     current_meshes: Vec<DrawingMesh>,
     sheets: Vec<ClashSectionSheet>,
     /// Export time written into every section's `GUBIM_META t=` (ms since the Unix epoch).
     export_time_ms: Option<f64>,
+    /// Whether `finish_section` should render an SVG preview (needed for single-section preview,
+    /// skipped during large multi-section ZIP exports to save allocations and time).
+    include_svg: bool,
+}
+
+impl Default for ClashBatchStore {
+    fn default() -> Self {
+        Self {
+            current_meshes: Vec::new(),
+            sheets: Vec::new(),
+            export_time_ms: None,
+            include_svg: true,
+        }
+    }
 }
 
 pub struct ClashSectionResult {
@@ -42,6 +55,10 @@ impl ClashBatchStore {
     /// Sets the export time the following sections carry (`GUBIM_META t=`).
     pub fn set_export_time_ms(&mut self, ms: f64) {
         self.export_time_ms = (ms.is_finite() && ms >= 0.0).then_some(ms);
+    }
+
+    pub fn set_include_svg(&mut self, include_svg: bool) {
+        self.include_svg = include_svg;
     }
 
     pub fn clear_current_section(&mut self) {
@@ -103,7 +120,11 @@ impl ClashBatchStore {
         }
 
         let dxf_bytes = to_clash_dxf(&sheet);
-        let svg = preview_svg(&sheet);
+        let svg = if self.include_svg {
+            preview_svg(&sheet)
+        } else {
+            String::new()
+        };
         let width_m = sheet.width_m;
         let height_m = sheet.height_m;
         self.sheets.push(sheet);
@@ -116,7 +137,7 @@ impl ClashBatchStore {
         }
     }
 
-    pub fn merge_master_dxf(&self, columns: Option<usize>, margin_m: f64) -> Vec<u8> {
+    pub fn merge_master_dxf(&mut self, columns: Option<usize>, margin_m: f64) -> Vec<u8> {
         let opts = GridMergeOptions {
             columns,
             margin_m: if margin_m.is_finite() && margin_m > 0.0 {
@@ -126,7 +147,10 @@ impl ClashBatchStore {
             },
             ..GridMergeOptions::default()
         };
-        merge_drawings_grid(&self.sheets, &opts).dxf_bytes
+        let out = merge_drawings_grid(&self.sheets, &opts).dxf_bytes;
+        self.sheets.clear();
+        self.sheets.shrink_to_fit();
+        out
     }
 
     pub fn section_count(&self) -> usize {

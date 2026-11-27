@@ -349,12 +349,12 @@ pub struct ClashSectionOutput {
 #[wasm_bindgen]
 impl ClashSectionOutput {
     #[wasm_bindgen(js_name = dxfBytes)]
-    pub fn dxf_bytes(&self) -> Vec<u8> {
-        self.dxf.clone()
+    pub fn dxf_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.dxf)
     }
 
-    pub fn svg(&self) -> String {
-        self.svg.clone()
+    pub fn svg(&mut self) -> String {
+        std::mem::take(&mut self.svg)
     }
 
     #[wasm_bindgen(js_name = widthM)]
@@ -387,6 +387,11 @@ impl ClashBatchSlicer {
     #[wasm_bindgen(js_name = setExportTime)]
     pub fn set_export_time(&mut self, ms: f64) {
         self.inner.set_export_time_ms(ms);
+    }
+
+    #[wasm_bindgen(js_name = setIncludeSvg)]
+    pub fn set_include_svg(&mut self, include_svg: bool) {
+        self.inner.set_include_svg(include_svg);
     }
 
     #[wasm_bindgen(js_name = clearCurrentSection)]
@@ -466,7 +471,7 @@ impl ClashBatchSlicer {
     }
 
     #[wasm_bindgen(js_name = mergeMasterDxf)]
-    pub fn merge_master_dxf(&self, columns: u32, margin_m: f64) -> Vec<u8> {
+    pub fn merge_master_dxf(&mut self, columns: u32, margin_m: f64) -> Vec<u8> {
         let cols = (columns > 0).then_some(columns as usize);
         self.inner.merge_master_dxf(cols, margin_m)
     }

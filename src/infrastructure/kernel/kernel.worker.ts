@@ -194,6 +194,7 @@ function toRequestError(error: unknown): RequestError {
     open = null;
     sheet = null;
     clashSession = null;
+    clashBatch = null;
     return allocationFailed()
       ? new RequestError('out-of-memory', 'El modelo no cabe en la memoria disponible.')
       : new RequestError('internal', `El kernel se ha detenido: ${text}`);
@@ -510,6 +511,9 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
       clashBatch?.free();
       clashBatch = new ClashBatchSlicer();
       clashBatch.setExportTime(request.exportTimeMs);
+      if (typeof request.includeSvg === 'boolean') {
+        clashBatch.setIncludeSvg(request.includeSvg);
+      }
       return { value: undefined, transfer: [] };
     case 'clash-batch-add': {
       const ok = currentClashBatch().addSectionChunk(request.modelIndex, new Uint8Array(request.chunk));

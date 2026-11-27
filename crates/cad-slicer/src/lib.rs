@@ -248,39 +248,57 @@ pub fn draw_slab_unoccluded(meshes: &[DrawingMesh], cut: Cut, depth: f64) -> Dra
     let mut layers: std::collections::BTreeMap<String, Layer> = std::collections::BTreeMap::new();
 
     for item in meshes {
+        let mut near = f64::INFINITY;
+        let mut far = f64::NEG_INFINITY;
+        for &pos in &item.mesh.positions {
+            let d = frame.depth(pos);
+            if d.is_finite() {
+                near = near.min(d);
+                far = far.max(d);
+            }
+        }
+        // Skip sub-meshes lying strictly outside the section slab [0, clean_depth].
+        if near > clean_depth + 1e-6 || far < -1e-6 {
+            continue;
+        }
+
         let layer = layers
             .entry(item.layer.clone())
             .or_insert_with(|| Layer {
                 name: item.layer.clone(),
                 ..Layer::default()
             });
-        let mut loops = Vec::new();
-        let report = cut::cut_mesh(&item.mesh, &frame, &mut loops);
-        if report.non_finite > 0 {
-            diagnostics.add(
-                item.model_id,
-                item.element_id,
-                "non-finite-coordinate",
-                "the cut skipped triangles with a coordinate that is not finite".into(),
-            );
+
+        // Only cut against the front plane (depth == 0) when the mesh straddles or touches it.
+        if near <= 1e-6 && far >= -1e-6 {
+            let mut loops = Vec::new();
+            let report = cut::cut_mesh(&item.mesh, &frame, &mut loops);
+            if report.non_finite > 0 {
+                diagnostics.add(
+                    item.model_id,
+                    item.element_id,
+                    "non-finite-coordinate",
+                    "the cut skipped triangles with a coordinate that is not finite".into(),
+                );
+            }
+            if report.truncated {
+                diagnostics.add(
+                    item.model_id,
+                    item.element_id,
+                    "cut-truncated",
+                    "the cut reached its segment limit and stopped".into(),
+                );
+            }
+            if report.open_loops > 0 {
+                diagnostics.add(
+                    item.model_id,
+                    item.element_id,
+                    "open-cut-loop",
+                    "the cut could not close a loop, which a watertight mesh would".into(),
+                );
+            }
+            layer.loops.extend(loops);
         }
-        if report.truncated {
-            diagnostics.add(
-                item.model_id,
-                item.element_id,
-                "cut-truncated",
-                "the cut reached its segment limit and stopped".into(),
-            );
-        }
-        if report.open_loops > 0 {
-            diagnostics.add(
-                item.model_id,
-                item.element_id,
-                "open-cut-loop",
-                "the cut could not close a loop, which a watertight mesh would".into(),
-            );
-        }
-        layer.loops.extend(loops);
 
         if project_slab {
             let report = project::project_mesh_unoccluded(

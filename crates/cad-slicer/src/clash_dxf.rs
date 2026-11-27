@@ -95,6 +95,12 @@ pub fn build_clash_section_sheet(
 ) -> ClashSectionSheet {
     let a_set: BTreeSet<(u32, u32)> = clash_a_refs.iter().map(|(m, id, _)| (*m, *id)).collect();
     let b_set: BTreeSet<(u32, u32)> = clash_b_refs.iter().copied().collect();
+    let clean_depth = if depth.is_finite() && depth > 0.0 {
+        depth
+    } else {
+        0.0
+    };
+    let pre_frame = Frame::of(cut);
 
     // Split meshes using composite (model_id, element_id) so federated models with colliding
     // expressIds never misclassify elements across models.
@@ -103,6 +109,20 @@ pub fn build_clash_section_sheet(
         std::collections::BTreeMap::new();
 
     for m in meshes {
+        if let Some(f) = &pre_frame {
+            let mut near = f64::INFINITY;
+            let mut far = f64::NEG_INFINITY;
+            for &pos in &m.mesh.positions {
+                let d = f.depth(pos);
+                if d.is_finite() {
+                    near = near.min(d);
+                    far = far.max(d);
+                }
+            }
+            if near > clean_depth + 1e-6 || far < -1e-6 {
+                continue;
+            }
+        }
         let key = (m.model_id, m.element_id);
         if a_set.contains(&key) {
             let mut copy = m.clone();
@@ -594,6 +614,12 @@ pub fn merge_drawings_grid(
     let an_b = dxf_bytes(&annot_layer, MAX_VALUE);
 
     out.section("ENTITIES");
+    // Cap the combined master grid DXF buffer safely below wasm32's 1 GiB Vec doubling threshold
+    // (`RawVec::capacity_overflow` at 1 GiB -> 2 GiB). Beyond 96 MiB, non-clash background layers
+    // are omitted in the master overview (they remain in full inside each `individual/PK_*.dxf`);
+    // beyond 256 MiB, only cell frames, headers, and clash markers are emitted.
+    const BACKGROUND_BUDGET_BYTES: usize = 96 * 1024 * 1024;
+    const GEOMETRY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
     for cell in &cells {
         let s = &sheets[cell.index];
         let off = cell.content_origin;
@@ -609,26 +635,31 @@ pub fn merge_drawings_grid(
             &format!("PK {} (depth {:.3} m)", s.meta.pk_label, (s.meta.s_max - s.meta.s_min).max(0.0)),
         );
 
-        // Background + CLASH_B layers.
-        for layer in crate::used_layers(&s.drawing) {
-            let lb = if layer.name == "CLASH_B" {
-                b_b.clone()
-            } else {
-                dxf_bytes(layer_map.get(&layer.name).unwrap_or(&layer.name), MAX_VALUE)
-            };
-            write_layer_geometry(&mut out, &lb, layer, off);
-        }
+        let include_bg = out.bytes.len() < BACKGROUND_BUDGET_BYTES;
+        let include_clash_geom = out.bytes.len() < GEOMETRY_BUDGET_BYTES;
 
-        // Element A geometry on CLASH_A (inlined in master grid to avoid block name collisions).
-        for block in &s.blocks_a {
-            let b_off = off + block.insert_point;
-            for ring in &block.loops {
-                for (from, to) in ring.segments() {
-                    out.line_bytes(&a_b, from + b_off, to + b_off);
+        // Background + CLASH_B layers.
+        if include_clash_geom {
+            for layer in crate::used_layers(&s.drawing) {
+                if layer.name == "CLASH_B" {
+                    write_layer_geometry(&mut out, &b_b, layer, off);
+                } else if include_bg {
+                    let lb = dxf_bytes(layer_map.get(&layer.name).unwrap_or(&layer.name), MAX_VALUE);
+                    write_layer_geometry(&mut out, &lb, layer, off);
                 }
             }
-            for seg in &block.segments {
-                out.line_bytes(&a_b, seg.a + b_off, seg.b + b_off);
+
+            // Element A geometry on CLASH_A (inlined in master grid to avoid block name collisions).
+            for block in &s.blocks_a {
+                let b_off = off + block.insert_point;
+                for ring in &block.loops {
+                    for (from, to) in ring.segments() {
+                        out.line_bytes(&a_b, from + b_off, to + b_off);
+                    }
+                }
+                for seg in &block.segments {
+                    out.line_bytes(&a_b, seg.a + b_off, seg.b + b_off);
+                }
             }
         }
 

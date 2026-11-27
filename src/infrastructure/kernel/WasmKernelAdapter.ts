@@ -812,7 +812,11 @@ export class WasmKernelAdapter implements KernelPort {
         throw new DOMException('Exportación cancelada.', 'AbortError');
       }
 
-      await slicerWorker.call({ op: 'clash-batch-new', exportTimeMs: Date.now() });
+      await slicerWorker.call({
+        op: 'clash-batch-new',
+        exportTimeMs: Date.now(),
+        includeSvg: request.sections.length <= 1 || request.includeMasterGrid === false
+      });
       const outputs: ClashAlignmentDxfSectionOutput[] = [];
       const total = request.sections.length;
       const cullEps = 0.05;

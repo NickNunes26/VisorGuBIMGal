@@ -68,6 +68,8 @@ export type WorkerRequest =
       op: 'clash-batch-new';
       /** Export time (ms since the Unix epoch) each section carries in `GUBIM_META t=`. */
       exportTimeMs: number;
+      /** When false (multi-section ZIP export), skip rendering SVG strings on each section. */
+      includeSvg?: boolean;
     }
   | { op: 'clash-batch-add'; modelIndex: number; chunk: ArrayBuffer }
   | {

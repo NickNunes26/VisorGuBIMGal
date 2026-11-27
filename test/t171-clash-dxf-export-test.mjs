@@ -782,4 +782,78 @@ await test('F7 conflict action bar wraps so all four choice buttons fit inside s
   assert.match(rule[1], /\bflex-wrap\s*:\s*wrap\b/, 'clash-alignment-actions must wrap across lines');
 });
 
+await test('multi-part IfcReinforcingBar sets classify individual clashing bar orientation and prune out-of-slab sub-meshes', () => {
+  // #100: 6 longitudinal bars (each 10 m long along X, spaced across 5 m in Y so the combined box is 10x5 m).
+  // #200: 5 transverse bars (each 4 m wide in Y, 0.04 m thick in X, spaced every 2 m along X).
+  const multiPartIfc = [
+    'ISO-10303-21;',
+    'HEADER;',
+    "FILE_DESCRIPTION(('ViewDefinition [DesignTransferView]'),'2;1');",
+    "FILE_NAME('multipart_rebar.ifc','2026-11-27T00:00:00',(''),(''),'','','');",
+    "FILE_SCHEMA(('IFC4'));",
+    'ENDSEC;',
+    'DATA;',
+    "#1=IFCPROJECT('0000000000000000000001',$,'Bridge',$,$,$,$,(#10),#2);",
+    '#2=IFCUNITASSIGNMENT((#3));',
+    '#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);',
+    "#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#11,$);",
+    '#11=IFCAXIS2PLACEMENT3D(#12,$,$);',
+    '#12=IFCCARTESIANPOINT((0.,0.,0.));',
+    "#20=IFCSITE('0000000000000000000002',$,'Site',$,$,#21,$,$,.ELEMENT.,$,$,$,$,$);",
+    '#21=IFCLOCALPLACEMENT($,#11);',
+    "#22=IFCRELAGGREGATES('0000000000000000000003',$,$,$,#1,(#20));",
+    '#40=IFCCARTESIANPOINT((0.,0.,0.));',
+    '#41=IFCCARTESIANPOINT((10.,0.,0.));',
+    '#42=IFCPOLYLINE((#40,#41));',
+    '#43=IFCSWEPTDISKSOLID(#42,0.01,$,$,$);',
+    '#44=IFCCARTESIANPOINT((0.,5.,0.));',
+    '#45=IFCCARTESIANPOINT((10.,5.,0.));',
+    '#46=IFCPOLYLINE((#44,#45));',
+    '#47=IFCSWEPTDISKSOLID(#46,0.01,$,$,$);',
+    "#48=IFCSHAPEREPRESENTATION(#10,'Body','AdvancedSweptSolid',(#43,#47));",
+    '#49=IFCPRODUCTDEFINITIONSHAPE($,$,(#48));',
+    "#100=IFCREINFORCINGBAR('2O2Fr$t4X7Zf8NOew3FLOH',$,'LongSet',$,$,#21,#49,$,$,0.02,$,$,$,$);",
+    '#50=IFCCARTESIANPOINT((1.,-2.,0.));',
+    '#51=IFCCARTESIANPOINT((1.,2.,0.));',
+    '#52=IFCPOLYLINE((#50,#51));',
+    '#53=IFCSWEPTDISKSOLID(#52,0.01,$,$,$);',
+    '#54=IFCCARTESIANPOINT((8.,-2.,0.));',
+    '#55=IFCCARTESIANPOINT((8.,2.,0.));',
+    '#56=IFCPOLYLINE((#54,#55));',
+    '#57=IFCSWEPTDISKSOLID(#56,0.01,$,$,$);',
+    "#58=IFCSHAPEREPRESENTATION(#10,'Body','AdvancedSweptSolid',(#53,#57));",
+    '#59=IFCPRODUCTDEFINITIONSHAPE($,$,(#58));',
+    "#200=IFCREINFORCINGBAR('3P3Gs$u5Y8Ag9OPfx4GMPI',$,'TransSet',$,$,#21,#59,$,$,0.02,$,$,$,$);",
+    "#300=IFCRELCONTAINEDINSPATIALSTRUCTURE('0000000000000000000004',$,$,$,(#100,#200),#20);",
+    'ENDSEC;',
+    'END-ISO-10303-21;'
+  ].join('\r\n') + '\r\n';
+
+  const model = new wasm.Model(new TextEncoder().encode(multiPartIfc));
+  try {
+    // #100 has 2 longitudinal bars 5 m apart in Y; the bar at Y=0 must classify as longitudinal (1).
+    const spanLong = model.elementSlabSpan(100, 1, 0, 1.0, 0.0, 0.0, 0.15, 2.5, 0.25);
+    assert.ok(spanLong);
+    assert.equal(spanLong[0], 1, 'multi-bar longitudinal set must classify clashing bar as longitudinal');
+    assert.equal(spanLong[1], spanLong[2], 'longitudinal bar slab must have zero depth');
+
+    // #200 has 2 transverse bars at X=1 and X=8; clash at X=1 must only span the bar at X=1 (~0.02 m, not 0.25 m).
+    const spanTrans = model.elementSlabSpan(200, 1, 0, 1.0, 0.0, 0.0, 0.15, 2.5, 0.25);
+    assert.ok(spanTrans);
+    assert.equal(spanTrans[0], 0, 'multi-bar transverse set must classify clashing bar as transverse');
+    assert.ok(spanTrans[2] - spanTrans[1] < 0.05, 'transverse bar slab must match single bar thickness (~20 mm)');
+
+    // Culling at X in [0.98, 1.02] must prune the far sub-mesh at X=8 from slabChunkForElements.
+    const culled = model.cullElementsBySlab(1, 0, 0.98, 1.02, 0.05);
+    assert.ok(culled.includes(200));
+    const chunkFiltered = model.slabChunkForElements(new Uint32Array([200]), undefined);
+    // Culling covering both X=1 and X=8 includes both sub-meshes (larger chunk).
+    model.cullElementsBySlab(1, 0, 0.0, 10.0, 0.05);
+    const chunkAll = model.slabChunkForElements(new Uint32Array([200]), undefined);
+    assert.ok(chunkFiltered.byteLength < chunkAll.byteLength, 'out-of-slab sub-mesh must be pruned from chunk');
+  } finally {
+    model.free();
+  }
+});
+
 console.log(`\nt171-clash-dxf-export-test: ${passed}/${passed} pass`);

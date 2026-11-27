@@ -863,7 +863,7 @@ pub(crate) fn project_mesh_unoccluded(
         report.too_large = true;
         return report;
     }
-    let (skipped, too_many) = feature_edges_into(mesh, frame.look, scratch);
+    let (skipped, too_many) = feature_edges_in_slab_into(mesh, frame, limit, scratch);
     report.non_finite += skipped;
     report.truncated = too_many;
 
@@ -994,7 +994,10 @@ pub(crate) fn merge_lines(visible: &mut Vec<Segment>, hidden: &mut Vec<Segment>)
         } else {
             &hidden[first_idx - vis_len]
         };
-        let mut first_dir = (first_seg.b - first_seg.a).try_normalize().unwrap();
+        let Some(mut first_dir) = (first_seg.b - first_seg.a).try_normalize() else {
+            i += 1;
+            continue;
+        };
         if first_dir.x < -1e-12 || (first_dir.x.abs() <= 1e-12 && first_dir.y < 0.0) {
             first_dir = -first_dir;
         }
@@ -1079,6 +1082,24 @@ fn subtract_into(
 /// The edges worth drawing, welded so two triangles sharing an edge count once, the triangles
 /// skipped, and whether the element had more edges than it may contribute.
 fn feature_edges_into(mesh: &Mesh, look: DVec3, scratch: &mut FeatureScratch) -> (usize, bool) {
+    feature_edges_with_slab_into(mesh, look, None, scratch)
+}
+
+fn feature_edges_in_slab_into(
+    mesh: &Mesh,
+    frame: &Frame,
+    limit: Option<f64>,
+    scratch: &mut FeatureScratch,
+) -> (usize, bool) {
+    feature_edges_with_slab_into(mesh, frame.look, Some((frame, limit)), scratch)
+}
+
+fn feature_edges_with_slab_into(
+    mesh: &Mesh,
+    look: DVec3,
+    slab: Option<(&Frame, Option<f64>)>,
+    scratch: &mut FeatureScratch,
+) -> (usize, bool) {
     let n_pos = mesh.positions.len();
     scratch.pos_to_welded.clear();
     scratch.pos_to_welded.resize(n_pos, u32::MAX);
@@ -1104,6 +1125,23 @@ fn feature_edges_into(mesh: &Mesh, look: DVec3, scratch: &mut FeatureScratch) ->
         if !(a.is_finite() && b.is_finite() && c.is_finite()) {
             skipped += 1;
             continue;
+        }
+        // Any edge overlapping [0, limit] has min_depth <= limit and max_depth >= 0, which holds
+        // for every triangle incident to that edge. Skipping triangles strictly outside the slab
+        // preserves both incident triangles of every surviving edge while avoiding welding/sorting
+        // out-of-slab triangles on long bridge girders, decks, tendons, and rebar arrays.
+        if let Some((frame, limit)) = slab {
+            let (da, db, dc) = (frame.depth(a), frame.depth(b), frame.depth(c));
+            if da < -1e-6 && db < -1e-6 && dc < -1e-6 {
+                continue;
+            }
+            if let Some(max_d) = limit
+                && da > max_d + 1e-6
+                && db > max_d + 1e-6
+                && dc > max_d + 1e-6
+            {
+                continue;
+            }
         }
         let normal = (b - a).cross(c - a);
         if normal.length_squared() <= 1e-24 {

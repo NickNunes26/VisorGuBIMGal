@@ -63,12 +63,130 @@ struct ActiveStream {
     stream: GeometryStream,
 }
 
+struct CachedPart {
+    mesh: ifc_geometry::Mesh,
+    aabb: Option<[f64; 6]>,
+}
+
+struct CachedElement {
+    hidden_by_default: bool,
+    layer: String,
+    hatching: Vec<spatial_tree::Hatching>,
+    parts: Vec<CachedPart>,
+}
+
+const MAX_GEOM_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 struct Query {
     evaluator: ModelEvaluator<'static>,
     /// What the stream draws, ascending.
     drawn: Vec<u32>,
+    /// Per-element AABB cache populated incrementally by `element_bounds` and `cull_elements_by_slab`.
+    bounds_map: std::collections::HashMap<u32, Option<[f64; 6]>>,
     /// Lazily cached `(express_id, [minX, minY, minZ, maxX, maxY, maxZ])` for O(N) 3D slab culling.
     bounds_cache: Option<Vec<(u32, [f64; 6])>>,
+    /// Bounded cache of evaluated element meshes + per-part AABBs for fast repeated slab queries.
+    geom_cache: std::collections::HashMap<u32, std::rc::Rc<CachedElement>>,
+    geom_cache_bytes: usize,
+    /// Last active horizontal slab `(ux, uy, lo_bound, hi_bound)` from `cull_elements_by_slab`
+    /// used by `slab_chunk_for_elements` to prune out-of-slab sub-meshes of multi-bar rebar groups.
+    last_slab: Option<(f64, f64, f64, f64)>,
+}
+
+impl Query {
+    fn new(evaluator: ModelEvaluator<'static>) -> Self {
+        let drawn = evaluator.element_ids();
+        Self {
+            evaluator,
+            drawn,
+            bounds_map: std::collections::HashMap::new(),
+            bounds_cache: None,
+            geom_cache: std::collections::HashMap::new(),
+            geom_cache_bytes: 0,
+            last_slab: None,
+        }
+    }
+
+    fn evaluate_cached(
+        &mut self,
+        express_id: u32,
+        data: &ModelData<'static>,
+    ) -> Option<std::rc::Rc<CachedElement>> {
+        if let Some(cached) = self.geom_cache.get(&express_id) {
+            return Some(std::rc::Rc::clone(cached));
+        }
+        let geom = self.evaluator.evaluate(express_id)?;
+        let layer = data.layer_name(geom.express_id, &geom.type_name);
+        let hatching = data.layer_hatching(geom.express_id);
+        let mut union_min = DVec3::splat(f64::INFINITY);
+        let mut union_max = DVec3::splat(f64::NEG_INFINITY);
+        let mut any_bounds = false;
+        let mut bytes = layer.len() + hatching.len() * 24 + 64;
+        let mut parts = Vec::with_capacity(geom.meshes.len());
+        for part in geom.meshes {
+            let aabb = if !part.mesh.triangles.is_empty() {
+                mesh_aabb(&part.mesh.positions)
+            } else {
+                None
+            };
+            if let Some(b) = aabb {
+                union_min = union_min.min(DVec3::new(b[0], b[1], b[2]));
+                union_max = union_max.max(DVec3::new(b[3], b[4], b[5]));
+                any_bounds = true;
+            }
+            bytes += part.mesh.positions.len() * 24 + part.mesh.triangles.len() * 12 + 48;
+            parts.push(CachedPart {
+                mesh: part.mesh,
+                aabb,
+            });
+        }
+        let elem_bounds = any_bounds.then_some([
+            union_min.x,
+            union_min.y,
+            union_min.z,
+            union_max.x,
+            union_max.y,
+            union_max.z,
+        ]);
+        self.bounds_map.entry(express_id).or_insert(elem_bounds);
+        let rc = std::rc::Rc::new(CachedElement {
+            hidden_by_default: geom.hidden_by_default,
+            layer,
+            hatching,
+            parts,
+        });
+        if bytes <= MAX_GEOM_CACHE_BYTES {
+            if self.geom_cache_bytes + bytes > MAX_GEOM_CACHE_BYTES {
+                self.geom_cache.clear();
+                self.geom_cache_bytes = 0;
+            }
+            self.geom_cache_bytes += bytes;
+            self.geom_cache.insert(express_id, std::rc::Rc::clone(&rc));
+        }
+        Some(rc)
+    }
+}
+
+fn mesh_aabb(positions: &[DVec3]) -> Option<[f64; 6]> {
+    let mut min = DVec3::splat(f64::INFINITY);
+    let mut max = DVec3::splat(f64::NEG_INFINITY);
+    let mut any = false;
+    for &p in positions {
+        if p.is_finite() {
+            min = min.min(p);
+            max = max.max(p);
+            any = true;
+        }
+    }
+    (any && min.x <= max.x && min.y <= max.y && min.z <= max.z)
+        .then_some([min.x, min.y, min.z, max.x, max.y, max.z])
+}
+
+fn aabb_dist_sq_to_point(b: &[f64; 6], p: DVec3) -> f64 {
+    let cx = p.x.clamp(b[0], b[3]);
+    let cy = p.y.clamp(b[1], b[4]);
+    let cz = p.z.clamp(b[2], b[5]);
+    DVec3::new(cx, cy, cz).distance_squared(p)
 }
 
 /// Storeys get the height of their placement, as their geometry is placed.
@@ -143,10 +261,7 @@ impl LoadedModel {
     /// The evaluator for one-off questions, made on first use.
     fn query_evaluator(&mut self) -> Option<&mut Query> {
         if self.query.is_none() {
-            self.query = ModelEvaluator::new(self.file).ok().map(|evaluator| {
-                let drawn = evaluator.element_ids();
-                Query { evaluator, drawn, bounds_cache: None }
-            });
+            self.query = ModelEvaluator::new(self.file).ok().map(Query::new);
         }
         self.query.as_mut()
     }
@@ -202,7 +317,35 @@ impl LoadedModel {
         let Some(query) = self.query_evaluator() else {
             return Vec::new();
         };
-        element_bounds_flat(&mut query.evaluator, &query.drawn, express_ids)
+        let mut out = Vec::with_capacity(express_ids.len() * 7);
+        let mut missing = Vec::new();
+        for &id in express_ids {
+            if query.drawn.binary_search(&id).is_err() {
+                continue;
+            }
+            if !query.bounds_map.contains_key(&id) {
+                missing.push(id);
+            }
+        }
+        if !missing.is_empty() {
+            let flat = element_bounds_flat(&mut query.evaluator, &query.drawn, &missing);
+            for &id in &missing {
+                query.bounds_map.entry(id).or_insert(None);
+            }
+            for chunk in flat.as_chunks::<7>().0 {
+                query.bounds_map.insert(
+                    chunk[0] as u32,
+                    Some([chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6]]),
+                );
+            }
+        }
+        for &id in express_ids {
+            if let Some(Some(b)) = query.bounds_map.get(&id) {
+                out.push(id as f64);
+                out.extend_from_slice(b);
+            }
+        }
+        out
     }
 
     /// Raw `f64` positions and `u32` triangle indices for clash narrow phase (no feature edges).
@@ -228,12 +371,37 @@ impl LoadedModel {
         long_aspect_ratio: f64,
         max_transverse_slab_m: f64,
     ) -> Option<[f64; 7]> {
-        let query = self.query_evaluator()?;
+        if self.query.is_none() {
+            self.query = ModelEvaluator::new(self.file).ok().map(Query::new);
+        }
+        let query = self.query.as_mut()?;
         query.drawn.binary_search(&express_id).ok()?;
-        let geom = query.evaluator.evaluate(express_id)?;
+        let cached = query.evaluate_cached(express_id, &self.data)?;
+        let clash_pt = DVec3::new(px, py, pz);
         let mut verts: Vec<DVec3> = Vec::new();
-        for part in geom.meshes {
-            verts.extend(part.mesh.positions);
+        if cached.parts.len() > 1 && clash_pt.is_finite() {
+            // When an element (e.g. an IFC4X3 IfcReinforcingBar group) contains multiple discrete
+            // sub-meshes, measure the sub-mesh(es) actually involved in the clash at `clash_pt`
+            // so longitudinal rebar arrays are not misclassified as wide transverse blocks and
+            // transverse stirrup arrays use the clashing stirrup's thickness rather than the array span.
+            let mut min_d2 = f64::INFINITY;
+            for part in &cached.parts {
+                if let Some(b) = &part.aabb {
+                    min_d2 = min_d2.min(aabb_dist_sq_to_point(b, clash_pt));
+                }
+            }
+            let threshold_d2 = (min_d2.sqrt() + 1e-3).powi(2);
+            for part in &cached.parts {
+                if let Some(b) = &part.aabb
+                    && aabb_dist_sq_to_point(b, clash_pt) <= threshold_d2
+                {
+                    verts.extend_from_slice(&part.mesh.positions);
+                }
+            }
+        } else {
+            for part in &cached.parts {
+                verts.extend_from_slice(&part.mesh.positions);
+            }
         }
         let cfg = clash_detector::SlabConfig {
             longitudinal_min_extent_m: if long_min_extent_m.is_finite() && long_min_extent_m > 0.0 {
@@ -300,13 +468,29 @@ impl LoadedModel {
             return Vec::new();
         };
         if query.bounds_cache.is_none() {
-            let flat = element_bounds_flat(&mut query.evaluator, &query.drawn, &query.drawn);
-            let mut cache = Vec::with_capacity(flat.len() / 7);
-            for chunk in flat.as_chunks::<7>().0 {
-                cache.push((
-                    chunk[0] as u32,
-                    [chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6]],
-                ));
+            let mut missing = Vec::new();
+            for &id in &query.drawn {
+                if !query.bounds_map.contains_key(&id) {
+                    missing.push(id);
+                }
+            }
+            if !missing.is_empty() {
+                let flat = element_bounds_flat(&mut query.evaluator, &query.drawn, &missing);
+                for &id in &missing {
+                    query.bounds_map.entry(id).or_insert(None);
+                }
+                for chunk in flat.as_chunks::<7>().0 {
+                    query.bounds_map.insert(
+                        chunk[0] as u32,
+                        Some([chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6]]),
+                    );
+                }
+            }
+            let mut cache = Vec::with_capacity(query.drawn.len());
+            for &id in &query.drawn {
+                if let Some(Some(b)) = query.bounds_map.get(&id) {
+                    cache.push((id, *b));
+                }
             }
             query.bounds_cache = Some(cache);
         }
@@ -322,6 +506,7 @@ impl LoadedModel {
                 kept.push(id);
             }
         }
+        query.last_slab = Some((ux, uy, lo_bound, hi_bound));
         kept
     }
 
@@ -335,37 +520,56 @@ impl LoadedModel {
         let mut out = Vec::new();
         let data = &self.data;
         if self.query.is_none() {
-            self.query = ModelEvaluator::new(self.file).ok().map(|evaluator| {
-                let drawn = evaluator.element_ids();
-                Query { evaluator, drawn, bounds_cache: None }
-            });
+            self.query = ModelEvaluator::new(self.file).ok().map(Query::new);
         }
         let Some(query) = self.query.as_mut() else {
             return out;
         };
+        let active_slab = query.last_slab;
         for &id in express_ids {
             if query.drawn.binary_search(&id).is_err() {
                 continue;
             }
-            let Some(geometry) = query.evaluator.evaluate(id) else {
+            let Some(cached) = query.evaluate_cached(id, data) else {
                 continue;
             };
-            if geometry.hidden_by_default {
+            if cached.hidden_by_default {
                 continue;
             }
-            let layer = data.layer_name(geometry.express_id, &geometry.type_name);
-            let hatching = data.layer_hatching(geometry.express_id);
-            for (part, element_mesh) in geometry.meshes.into_iter().enumerate() {
-                let mut mesh = element_mesh.mesh;
+            let multi_part = cached.parts.len() > 1;
+            for (part, cached_part) in cached.parts.iter().enumerate() {
+                // When an element has multiple discrete sub-meshes (e.g. a rebar group of 30+ bars)
+                // and `cull_elements_by_slab` set `active_slab`, skip sub-meshes strictly outside the slab.
+                if multi_part
+                    && let Some((ux, uy, lo_bound, hi_bound)) = active_slab
+                    && let Some(b) = &cached_part.aabb
+                {
+                    let s_lo = if ux >= 0.0 { ux * b[0] } else { ux * b[3] }
+                        + if uy >= 0.0 { uy * b[1] } else { uy * b[4] };
+                    let s_hi = if ux >= 0.0 { ux * b[3] } else { ux * b[0] }
+                        + if uy >= 0.0 { uy * b[4] } else { uy * b[1] };
+                    if s_hi < lo_bound || s_lo > hi_bound {
+                        continue;
+                    }
+                }
                 if let Some(xf) = &transform {
+                    let mut mesh = cached_part.mesh.clone();
                     for p in &mut mesh.positions {
                         *p = xf.transform_point3(*p);
                     }
+                    write_element(&mut out, id, part as u32, &cached.layer, &cached.hatching, &mesh);
+                } else {
+                    write_element(
+                        &mut out,
+                        id,
+                        part as u32,
+                        &cached.layer,
+                        &cached.hatching,
+                        &cached_part.mesh,
+                    );
                 }
-                write_element(&mut out, geometry.express_id, part as u32, &layer, &hatching, &mesh);
             }
         }
-        let _ = DVec3::ZERO; // keep glam::DVec3 available if extended
         out
     }
 
