@@ -562,6 +562,16 @@ async function handle(request: WorkerRequest): Promise<{ value: unknown; transfe
       const dxfBytes = currentClashBatch().mergeMasterDxf(request.columns, request.marginM);
       return { value: dxfBytes, transfer: [dxfBytes.buffer as ArrayBuffer] };
     }
+    case 'clash-batch-merge-begin':
+      currentClashBatch().beginMasterDxf(request.columns, request.marginM);
+      return { value: undefined, transfer: [] };
+    case 'clash-batch-merge-next': {
+      // `undefined` once the master grid DXF is complete.
+      const chunk = currentClashBatch().nextMasterDxfChunk(request.targetBytes);
+      return chunk
+        ? { value: chunk, transfer: [chunk.buffer as ArrayBuffer] }
+        : { value: undefined, transfer: [] };
+    }
     case 'clash-roundtrip-apply': {
       const out = current().model.applyClashDxf(
         request.dxfBytes,

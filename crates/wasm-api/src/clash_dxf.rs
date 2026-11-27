@@ -2,7 +2,7 @@
 
 use crate::drawing::decode_element_chunk;
 use cad_slicer::{
-    ClashSectionSheet, Cut, DrawingMesh, GridMergeOptions, Layer, SvgOptions,
+    ClashSectionSheet, Cut, DrawingMesh, GridMergeOptions, Layer, MasterGridWriter, SvgOptions,
     build_clash_section_sheet, merge_drawings_grid, to_clash_dxf, to_svg_with,
 };
 use glam::{DVec2, DVec3};
@@ -19,6 +19,20 @@ pub struct ClashBatchStore {
     /// Whether `finish_section` should render an SVG preview (needed for single-section preview,
     /// skipped during large multi-section ZIP exports to save allocations and time).
     include_svg: bool,
+    /// The master grid being streamed out, between `begin_master_dxf` and its last chunk.
+    master: Option<MasterGridWriter>,
+}
+
+fn grid_options(columns: Option<usize>, margin_m: f64) -> GridMergeOptions {
+    GridMergeOptions {
+        columns,
+        margin_m: if margin_m.is_finite() && margin_m > 0.0 {
+            margin_m
+        } else {
+            1.0
+        },
+        ..GridMergeOptions::default()
+    }
 }
 
 impl Default for ClashBatchStore {
@@ -28,6 +42,7 @@ impl Default for ClashBatchStore {
             sheets: Vec::new(),
             export_time_ms: None,
             include_svg: true,
+            master: None,
         }
     }
 }
@@ -137,20 +152,50 @@ impl ClashBatchStore {
         }
     }
 
+    /// The whole master grid DXF in one buffer. Only for small batches: a long bridge reaches
+    /// gigabytes, past what one wasm32 buffer can grow to. Large exports stream it with
+    /// [`Self::begin_master_dxf`] and [`Self::next_master_dxf_chunk`].
     pub fn merge_master_dxf(&mut self, columns: Option<usize>, margin_m: f64) -> Vec<u8> {
-        let opts = GridMergeOptions {
-            columns,
-            margin_m: if margin_m.is_finite() && margin_m > 0.0 {
-                margin_m
-            } else {
-                1.0
-            },
-            ..GridMergeOptions::default()
-        };
+        let opts = grid_options(columns, margin_m);
         let out = merge_drawings_grid(&self.sheets, &opts).dxf_bytes;
         self.sheets.clear();
         self.sheets.shrink_to_fit();
         out
+    }
+
+    /// Lays out the master grid over every finished section; the bytes then come from
+    /// [`Self::next_master_dxf_chunk`].
+    pub fn begin_master_dxf(&mut self, columns: Option<usize>, margin_m: f64) {
+        let opts = grid_options(columns, margin_m);
+        self.master = Some(MasterGridWriter::new(&self.sheets, &opts));
+    }
+
+    /// The next piece of the master grid DXF, about `target_bytes` long (whole cells, so one
+    /// huge cell may make it longer), or `None` once the file is complete. Concatenated, the
+    /// pieces are exactly [`Self::merge_master_dxf`]'s bytes. Each written cell's geometry is
+    /// freed straight away, and the sections are dropped after the last piece.
+    pub fn next_master_dxf_chunk(&mut self, target_bytes: usize) -> Option<Vec<u8>> {
+        let writer = self.master.as_mut()?;
+        let before = writer.cells_written();
+        let Some(chunk) = writer.next_chunk(&self.sheets, target_bytes.max(1)) else {
+            self.finish_master();
+            return None;
+        };
+        let after = writer.cells_written();
+        for cell in &writer.cells()[before..after] {
+            if let Some(sheet) = self.sheets.get_mut(cell.index) {
+                sheet.drawing.layers = Vec::new();
+                sheet.blocks_a = Vec::new();
+                sheet.markers = Vec::new();
+            }
+        }
+        Some(chunk)
+    }
+
+    fn finish_master(&mut self) {
+        self.master = None;
+        self.sheets.clear();
+        self.sheets.shrink_to_fit();
     }
 
     pub fn section_count(&self) -> usize {
@@ -160,6 +205,7 @@ impl ClashBatchStore {
     pub fn clear(&mut self) {
         self.current_meshes.clear();
         self.sheets.clear();
+        self.master = None;
     }
 }
 

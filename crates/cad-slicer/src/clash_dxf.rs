@@ -487,200 +487,282 @@ pub struct GridMergeResult {
 
 /// Arranges already-sliced, `(0, 0)`-normalized [`ClashSectionSheet`] items into a single
 /// non-overlapping 2D grid DXF (`clashes_all.dxf`), sorted by PK, without re-slicing.
+///
+/// Builds the whole file in one buffer: fine for tests and small batches. Large batches (a
+/// bridge with hundreds of sections reaches gigabytes) go through [`MasterGridWriter`], which
+/// hands the same bytes out in bounded chunks so no single buffer outgrows wasm32's memory.
 pub fn merge_drawings_grid(
     sheets: &[ClashSectionSheet],
     options: &GridMergeOptions,
 ) -> GridMergeResult {
-    if sheets.is_empty() {
-        let mut out = DxfWriter::default();
-        out.header(DVec2::ZERO, DVec2::ZERO);
-        out.layer_table(&[("SHEET_FRAME".to_string(), 8, false)]);
-        out.section("ENTITIES");
-        out.end_section();
-        out.group(0, b"EOF");
-        return GridMergeResult {
-            dxf_bytes: out.bytes,
-            cells: Vec::new(),
-        };
+    let mut writer = MasterGridWriter::new(sheets, options);
+    let mut dxf_bytes = Vec::new();
+    while let Some(chunk) = writer.next_chunk(sheets, usize::MAX) {
+        dxf_bytes.extend_from_slice(&chunk);
     }
-
-    let mut order: Vec<usize> = (0..sheets.len()).collect();
-    order.sort_by(|&a, &b| {
-        sheets[a]
-            .meta
-            .pk_m
-            .total_cmp(&sheets[b].meta.pk_m)
-            .then_with(|| a.cmp(&b))
-    });
-
-    let n = order.len();
-    let cols = options
-        .columns
-        .filter(|&c| c > 0)
-        .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
-        .max(1);
-    let rows = n.div_ceil(cols);
-    let margin = options.margin_m.max(0.1);
-    let pad = options.frame_padding_m.max(0.05);
-
-    // Determine uniform column widths and row heights so every cell frame is strictly disjoint.
-    let mut col_widths = vec![1.0_f64; cols];
-    let mut row_heights = vec![1.0_f64; rows];
-    let header_h_for = |w: f64, h: f64| -> f64 { (w.max(h).max(1.0) * 0.06).clamp(0.15, 1.2) };
-
-    for (slot, &sheet_idx) in order.iter().enumerate() {
-        let r = slot / cols;
-        let c = slot % cols;
-        let s = &sheets[sheet_idx];
-        let hh = header_h_for(s.width_m, s.height_m);
-        let cell_w = s.width_m.max(0.5) + 2.0 * pad;
-        let cell_h = s.height_m.max(0.5) + 2.0 * pad + hh;
-        col_widths[c] = col_widths[c].max(cell_w);
-        row_heights[r] = row_heights[r].max(cell_h);
+    GridMergeResult {
+        dxf_bytes,
+        cells: writer.cells,
     }
+}
 
-    let mut col_x = vec![0.0_f64; cols];
-    for c in 1..cols {
-        col_x[c] = col_x[c - 1] + col_widths[c - 1] + margin;
-    }
-    // Lay out rows top-to-bottom (row 0 at top, descending Y) so reading order matches left-to-right, top-to-bottom.
-    let total_height: f64 =
-        row_heights.iter().sum::<f64>() + margin * rows.saturating_sub(1) as f64;
-    let mut row_y = vec![0.0_f64; rows];
-    let mut cursor_y = total_height;
-    for r in 0..rows {
-        cursor_y -= row_heights[r];
-        row_y[r] = cursor_y;
-        cursor_y -= margin;
-    }
+/// Streams the master grid DXF (`clashes_all.dxf`) in bounded chunks: the header and layer
+/// table first, then whole cells in PK order until a chunk reaches its target size, then the
+/// end of the file. Concatenating every chunk gives exactly [`merge_drawings_grid`]'s bytes.
+///
+/// Every cell keeps all of its layers, however large the file grows: the caller writes each
+/// chunk out (into a ZIP entry, a file) before asking for the next, so memory holds one chunk
+/// at a time rather than the whole master grid.
+///
+/// `sheets` must be the same slice, unchanged, on every call; once [`Self::cells_written`]
+/// passes a cell, its sheet's geometry is no longer read and may be freed.
+pub struct MasterGridWriter {
+    cells: Vec<GridLayoutCell>,
+    header: Option<Vec<u8>>,
+    layer_map: std::collections::BTreeMap<String, String>,
+    frame_b: Vec<u8>,
+    a_b: Vec<u8>,
+    b_b: Vec<u8>,
+    m_b: Vec<u8>,
+    ax_b: Vec<u8>,
+    an_b: Vec<u8>,
+    pad: f64,
+    next_cell: usize,
+    finished: bool,
+}
 
-    let mut cells = Vec::with_capacity(n);
-    for (slot, &sheet_idx) in order.iter().enumerate() {
-        let r = slot / cols;
-        let c = slot % cols;
-        let s = &sheets[sheet_idx];
-        let fmin = DVec2::new(col_x[c], row_y[r]);
-        let fmax = DVec2::new(col_x[c] + col_widths[c], row_y[r] + row_heights[r]);
-        let content_origin = DVec2::new(fmin.x + pad, fmin.y + pad);
-        cells.push(GridLayoutCell {
-            index: sheet_idx,
-            pk_m: s.meta.pk_m,
-            pk_label: s.meta.pk_label.clone(),
-            frame_min: fmin,
-            frame_max: fmax,
-            content_origin,
+fn grid_header_height(w: f64, h: f64) -> f64 {
+    (w.max(h).max(1.0) * 0.06).clamp(0.15, 1.2)
+}
+
+impl MasterGridWriter {
+    /// Lays out the grid and prepares the file header; writes no cell yet.
+    pub fn new(sheets: &[ClashSectionSheet], options: &GridMergeOptions) -> Self {
+        let pad = options.frame_padding_m.max(0.05);
+        if sheets.is_empty() {
+            let mut out = DxfWriter::default();
+            out.header(DVec2::ZERO, DVec2::ZERO);
+            out.layer_table(&[("SHEET_FRAME".to_string(), 8, false)]);
+            out.section("ENTITIES");
+            return Self {
+                cells: Vec::new(),
+                header: Some(out.bytes),
+                layer_map: std::collections::BTreeMap::new(),
+                frame_b: Vec::new(),
+                a_b: Vec::new(),
+                b_b: Vec::new(),
+                m_b: Vec::new(),
+                ax_b: Vec::new(),
+                an_b: Vec::new(),
+                pad,
+                next_cell: 0,
+                finished: false,
+            };
+        }
+
+        let mut order: Vec<usize> = (0..sheets.len()).collect();
+        order.sort_by(|&a, &b| {
+            sheets[a]
+                .meta
+                .pk_m
+                .total_cmp(&sheets[b].meta.pk_m)
+                .then_with(|| a.cmp(&b))
         });
+
+        let n = order.len();
+        let cols = options
+            .columns
+            .filter(|&c| c > 0)
+            .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
+            .max(1);
+        let rows = n.div_ceil(cols);
+        let margin = options.margin_m.max(0.1);
+
+        // Determine uniform column widths and row heights so every cell frame is strictly disjoint.
+        let mut col_widths = vec![1.0_f64; cols];
+        let mut row_heights = vec![1.0_f64; rows];
+
+        for (slot, &sheet_idx) in order.iter().enumerate() {
+            let r = slot / cols;
+            let c = slot % cols;
+            let s = &sheets[sheet_idx];
+            let hh = grid_header_height(s.width_m, s.height_m);
+            let cell_w = s.width_m.max(0.5) + 2.0 * pad;
+            let cell_h = s.height_m.max(0.5) + 2.0 * pad + hh;
+            col_widths[c] = col_widths[c].max(cell_w);
+            row_heights[r] = row_heights[r].max(cell_h);
+        }
+
+        let mut col_x = vec![0.0_f64; cols];
+        for c in 1..cols {
+            col_x[c] = col_x[c - 1] + col_widths[c - 1] + margin;
+        }
+        // Lay out rows top-to-bottom (row 0 at top, descending Y) so reading order matches left-to-right, top-to-bottom.
+        let total_height: f64 =
+            row_heights.iter().sum::<f64>() + margin * rows.saturating_sub(1) as f64;
+        let mut row_y = vec![0.0_f64; rows];
+        let mut cursor_y = total_height;
+        for r in 0..rows {
+            cursor_y -= row_heights[r];
+            row_y[r] = cursor_y;
+            cursor_y -= margin;
+        }
+
+        let mut cells = Vec::with_capacity(n);
+        for (slot, &sheet_idx) in order.iter().enumerate() {
+            let r = slot / cols;
+            let c = slot % cols;
+            let s = &sheets[sheet_idx];
+            let fmin = DVec2::new(col_x[c], row_y[r]);
+            let fmax = DVec2::new(col_x[c] + col_widths[c], row_y[r] + row_heights[r]);
+            let content_origin = DVec2::new(fmin.x + pad, fmin.y + pad);
+            cells.push(GridLayoutCell {
+                index: sheet_idx,
+                pk_m: s.meta.pk_m,
+                pk_label: s.meta.pk_label.clone(),
+                frame_min: fmin,
+                frame_max: fmax,
+                content_origin,
+            });
+        }
+
+        // Collect union of all layers across all sheets.
+        let mut seen_layers = BTreeSet::new();
+        let mut layer_defs: Vec<(String, u8, bool)> = Vec::new();
+        let mut layer_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut ensure_layer = |raw: &str, aci: u8| -> String {
+            if let Some(existing) = layer_map.get(raw) {
+                return existing.clone();
+            }
+            let assigned = clean_r12_name(raw, &mut seen_layers);
+            layer_defs.push((assigned.clone(), aci, false));
+            layer_map.insert(raw.to_string(), assigned.clone());
+            assigned
+        };
+
+        let frame_layer = ensure_layer("SHEET_FRAME", 8);
+        let clash_a_layer = ensure_layer("CLASH_A", 1);
+        let clash_b_layer = ensure_layer("CLASH_B", 4);
+        let marker_layer = ensure_layer("CLASH_MARKER", 2);
+        let axis_layer = ensure_layer("ALIGNMENT_AXIS", 3);
+        let annot_layer = ensure_layer("ANNOTATION", 7);
+
+        for s in sheets {
+            for layer in crate::used_layers(&s.drawing) {
+                let aci = if layer.name == "CLASH_B" { 4 } else { 7 };
+                ensure_layer(&layer.name, aci);
+            }
+        }
+
+        let total_width = col_x[cols - 1] + col_widths[cols - 1];
+        let mut out = DxfWriter::default();
+        out.text(999, &format!("GUBIM_MASTER_GRID sections={n} units=m"));
+        out.header(DVec2::ZERO, DVec2::new(total_width, total_height));
+        out.layer_table(&layer_defs);
+        out.section("ENTITIES");
+
+        Self {
+            cells,
+            header: Some(out.bytes),
+            layer_map,
+            frame_b: dxf_bytes(&frame_layer, MAX_VALUE),
+            a_b: dxf_bytes(&clash_a_layer, MAX_VALUE),
+            b_b: dxf_bytes(&clash_b_layer, MAX_VALUE),
+            m_b: dxf_bytes(&marker_layer, MAX_VALUE),
+            ax_b: dxf_bytes(&axis_layer, MAX_VALUE),
+            an_b: dxf_bytes(&annot_layer, MAX_VALUE),
+            pad,
+            next_cell: 0,
+            finished: false,
+        }
     }
 
-    // Collect union of all layers across all sheets.
-    let mut seen_layers = BTreeSet::new();
-    let mut layer_defs: Vec<(String, u8, bool)> = Vec::new();
-    let mut layer_map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    let mut ensure_layer = |raw: &str, aci: u8| -> String {
-        if let Some(existing) = layer_map.get(raw) {
-            return existing.clone();
-        }
-        let assigned = clean_r12_name(raw, &mut seen_layers);
-        layer_defs.push((assigned.clone(), aci, false));
-        layer_map.insert(raw.to_string(), assigned.clone());
-        assigned
-    };
-
-    let frame_layer = ensure_layer("SHEET_FRAME", 8);
-    let clash_a_layer = ensure_layer("CLASH_A", 1);
-    let clash_b_layer = ensure_layer("CLASH_B", 4);
-    let marker_layer = ensure_layer("CLASH_MARKER", 2);
-    let axis_layer = ensure_layer("ALIGNMENT_AXIS", 3);
-    let annot_layer = ensure_layer("ANNOTATION", 7);
-
-    for s in sheets {
-        for layer in crate::used_layers(&s.drawing) {
-            let aci = if layer.name == "CLASH_B" { 4 } else { 7 };
-            ensure_layer(&layer.name, aci);
-        }
+    /// Cell placements, in PK order (the order they are written).
+    pub fn cells(&self) -> &[GridLayoutCell] {
+        &self.cells
     }
 
-    let total_width = col_x[cols - 1] + col_widths[cols - 1];
-    let mut out = DxfWriter::default();
-    out.text(999, &format!("GUBIM_MASTER_GRID sections={n} units=m"));
-    out.header(DVec2::ZERO, DVec2::new(total_width, total_height));
-    out.layer_table(&layer_defs);
+    /// How many cells, from the front of [`Self::cells`], are already written.
+    pub fn cells_written(&self) -> usize {
+        self.next_cell
+    }
 
-    let frame_b = dxf_bytes(&frame_layer, MAX_VALUE);
-    let a_b = dxf_bytes(&clash_a_layer, MAX_VALUE);
-    let b_b = dxf_bytes(&clash_b_layer, MAX_VALUE);
-    let m_b = dxf_bytes(&marker_layer, MAX_VALUE);
-    let ax_b = dxf_bytes(&axis_layer, MAX_VALUE);
-    let an_b = dxf_bytes(&annot_layer, MAX_VALUE);
+    /// The next piece of the file, or `None` once the end of file went out. A chunk holds whole
+    /// cells and stops at the first cell boundary at or past `target_bytes`, so one very large
+    /// cell makes a chunk larger than the target, never a cell split across two.
+    pub fn next_chunk(&mut self, sheets: &[ClashSectionSheet], target_bytes: usize) -> Option<Vec<u8>> {
+        if self.finished {
+            return None;
+        }
+        let mut out = DxfWriter {
+            bytes: self.header.take().unwrap_or_default(),
+        };
+        while self.next_cell < self.cells.len() && out.bytes.len() < target_bytes {
+            self.write_cell(&mut out, sheets);
+            self.next_cell += 1;
+        }
+        if self.next_cell >= self.cells.len() {
+            out.end_section();
+            out.group(0, b"EOF");
+            self.finished = true;
+        }
+        Some(out.bytes)
+    }
 
-    out.section("ENTITIES");
-    // Cap the combined master grid DXF buffer safely below wasm32's 1 GiB Vec doubling threshold
-    // (`RawVec::capacity_overflow` at 1 GiB -> 2 GiB). Beyond 96 MiB, non-clash background layers
-    // are omitted in the master overview (they remain in full inside each `individual/PK_*.dxf`);
-    // beyond 256 MiB, only cell frames, headers, and clash markers are emitted.
-    const BACKGROUND_BUDGET_BYTES: usize = 96 * 1024 * 1024;
-    const GEOMETRY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-    for cell in &cells {
-        let s = &sheets[cell.index];
+    fn write_cell(&self, out: &mut DxfWriter, sheets: &[ClashSectionSheet]) {
+        let cell = &self.cells[self.next_cell];
+        let Some(s) = sheets.get(cell.index) else {
+            return;
+        };
         let off = cell.content_origin;
+        let pad = self.pad;
 
         // Cell frame border & PK title on SHEET_FRAME.
-        out.rect(&frame_b, cell.frame_min, cell.frame_max);
-        let hh = header_h_for(s.width_m, s.height_m);
+        out.rect(&self.frame_b, cell.frame_min, cell.frame_max);
+        let hh = grid_header_height(s.width_m, s.height_m);
         let title_pos = DVec2::new(cell.frame_min.x + pad, cell.frame_max.y - hh * 0.75);
         out.left_text(
-            &an_b,
+            &self.an_b,
             title_pos,
             (hh * 0.5).clamp(0.08, 0.5),
             &format!("PK {} (depth {:.3} m)", s.meta.pk_label, (s.meta.s_max - s.meta.s_min).max(0.0)),
         );
 
-        let include_bg = out.bytes.len() < BACKGROUND_BUDGET_BYTES;
-        let include_clash_geom = out.bytes.len() < GEOMETRY_BUDGET_BYTES;
-
         // Background + CLASH_B layers.
-        if include_clash_geom {
-            for layer in crate::used_layers(&s.drawing) {
-                if layer.name == "CLASH_B" {
-                    write_layer_geometry(&mut out, &b_b, layer, off);
-                } else if include_bg {
-                    let lb = dxf_bytes(layer_map.get(&layer.name).unwrap_or(&layer.name), MAX_VALUE);
-                    write_layer_geometry(&mut out, &lb, layer, off);
+        for layer in crate::used_layers(&s.drawing) {
+            if layer.name == "CLASH_B" {
+                write_layer_geometry(out, &self.b_b, layer, off);
+            } else {
+                let lb = dxf_bytes(self.layer_map.get(&layer.name).unwrap_or(&layer.name), MAX_VALUE);
+                write_layer_geometry(out, &lb, layer, off);
+            }
+        }
+
+        // Element A geometry on CLASH_A (inlined in master grid to avoid block name collisions).
+        for block in &s.blocks_a {
+            let b_off = off + block.insert_point;
+            for ring in &block.loops {
+                for (from, to) in ring.segments() {
+                    out.line_bytes(&self.a_b, from + b_off, to + b_off);
                 }
             }
-
-            // Element A geometry on CLASH_A (inlined in master grid to avoid block name collisions).
-            for block in &s.blocks_a {
-                let b_off = off + block.insert_point;
-                for ring in &block.loops {
-                    for (from, to) in ring.segments() {
-                        out.line_bytes(&a_b, from + b_off, to + b_off);
-                    }
-                }
-                for seg in &block.segments {
-                    out.line_bytes(&a_b, seg.a + b_off, seg.b + b_off);
-                }
+            for seg in &block.segments {
+                out.line_bytes(&self.a_b, seg.a + b_off, seg.b + b_off);
             }
         }
 
         // Markers + Alignment axis.
         for marker in &s.markers {
-            out.marker(&m_b, marker.position + off, marker.radius_m);
+            out.marker(&self.m_b, marker.position + off, marker.radius_m);
         }
         if let Some(axis_x) = s.alignment_axis_x {
             out.line_bytes(
-                &ax_b,
+                &self.ax_b,
                 DVec2::new(off.x + axis_x, cell.frame_min.y + pad * 0.5),
                 DVec2::new(off.x + axis_x, off.y + s.height_m + pad * 0.5),
             );
         }
-    }
-    out.end_section();
-    out.group(0, b"EOF");
-
-    GridMergeResult {
-        dxf_bytes: out.bytes,
-        cells,
     }
 }
 

@@ -1,8 +1,10 @@
 import { t } from '../i18n';
 
 /**
- * A ZIP reader and writer for small archives such as BCF files, on the browser's own deflate
- * streams. Stored and deflated entries only; no ZIP64, no encryption, no spanning. Every entry's
+ * A ZIP reader and writer for archives such as BCF files and clash DXF exports, on the
+ * browser's own deflate streams. A large entry can be deflated as it arrives
+ * (`StreamingZipEntry`). Stored and deflated entries only; no ZIP64 (so at most 4 GB), no
+ * encryption, no spanning. Every entry's
  * size and CRC-32 are checked, and the total a reader inflates is capped, so a hostile archive
  * fails with a message instead of filling the memory.
  */
@@ -32,10 +34,18 @@ const CRC_TABLE = (() => {
 })();
 
 export function crc32(bytes: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
+  return (crc32Update(0xffffffff, bytes) ^ 0xffffffff) >>> 0;
 }
+
+/** Folds `bytes` into a running CRC-32 register (start at `0xffffffff`, finish with `^ 0xffffffff`). */
+function crc32Update(register: number, bytes: Uint8Array): number {
+  let crc = register;
+  for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return crc;
+}
+
+/** ZIP without ZIP64 stores sizes and offsets in 32 bits. */
+const MAX_ZIP32 = 0xffffffff;
 
 async function through(bytes: Uint8Array, stream: CompressionStream | DecompressionStream, limit: number): Promise<Uint8Array> {
   const writer = stream.writable.getWriter();
@@ -133,6 +143,75 @@ export interface ZipEntry {
   data: Uint8Array;
 }
 
+/** An entry already deflated by a {@link StreamingZipEntry}; `writeZip` copies it as is. */
+export interface DeflatedZipEntry {
+  name: string;
+  /** CRC-32 of the uncompressed bytes. */
+  crc: number;
+  /** Uncompressed size in bytes. */
+  size: number;
+  /** The raw-deflate stream, in the pieces it came out in. */
+  deflated: readonly Uint8Array[];
+}
+
+/**
+ * Builds one ZIP entry from bytes that arrive in pieces, deflating each piece as it comes, so
+ * a file far larger than memory comfortably holds (a master DXF of gigabytes) never exists
+ * uncompressed in one buffer: only its deflated stream is kept.
+ */
+export class StreamingZipEntry {
+  private register = 0xffffffff;
+  private size = 0;
+  private readonly writer: WritableStreamDefaultWriter<BufferSource>;
+  private readonly output: Promise<Uint8Array[]>;
+  private readonly name: string;
+
+  constructor(name: string) {
+    this.name = name;
+    const stream = new CompressionStream('deflate-raw');
+    this.writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    this.output = (async () => {
+      const pieces: Uint8Array[] = [];
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return pieces;
+        pieces.push(value);
+      }
+    })();
+    // A failed write surfaces through `finish`; keep it from going unhandled meanwhile.
+    this.output.catch(() => undefined);
+  }
+
+  /** Adds the next piece of the file. The caller may drop `bytes` once this resolves. */
+  async write(bytes: Uint8Array): Promise<void> {
+    if (bytes.length === 0) return;
+    if (this.size + bytes.length > MAX_ZIP32) {
+      throw new ZipError(t('zip.archiveTooLarge', { name: this.name }));
+    }
+    this.register = crc32Update(this.register, bytes);
+    this.size += bytes.length;
+    await this.writer.ready;
+    await this.writer.write(bytes as Uint8Array<ArrayBuffer>);
+  }
+
+  /** Closes the stream and returns the finished entry. */
+  async finish(): Promise<DeflatedZipEntry> {
+    await this.writer.close();
+    const deflated = await this.output;
+    return {
+      name: this.name,
+      crc: (this.register ^ 0xffffffff) >>> 0,
+      size: this.size,
+      deflated
+    };
+  }
+}
+
+function isDeflatedEntry(entry: ZipEntry | DeflatedZipEntry): entry is DeflatedZipEntry {
+  return 'deflated' in entry;
+}
+
 /** MS-DOS time and date, which ZIP stores, of a moment in local time. */
 function dosTime(date: Date): [number, number] {
   const year = Math.max(1980, date.getFullYear());
@@ -143,7 +222,10 @@ function dosTime(date: Date): [number, number] {
 }
 
 /** An archive of the entries in order, each deflated unless that would not make it smaller. */
-export async function writeZip(entries: readonly ZipEntry[], modified = new Date()): Promise<Uint8Array> {
+export async function writeZip(
+  entries: readonly (ZipEntry | DeflatedZipEntry)[],
+  modified = new Date()
+): Promise<Uint8Array> {
   const [time, date] = dosTime(modified);
   const encoder = new TextEncoder();
   const locals: Uint8Array[] = [];
@@ -151,10 +233,26 @@ export async function writeZip(entries: readonly ZipEntry[], modified = new Date
   let offset = 0;
   for (const entry of entries) {
     const name = encoder.encode(entry.name);
-    const crc = crc32(entry.data);
-    const deflated = await through(entry.data, new CompressionStream('deflate-raw'), Number.MAX_SAFE_INTEGER);
-    const method = deflated.length < entry.data.length ? DEFLATED : STORED;
-    const data = method === DEFLATED ? deflated : entry.data;
+    let crc: number;
+    let size: number;
+    let method: number;
+    let pieces: readonly Uint8Array[];
+    if (isDeflatedEntry(entry)) {
+      crc = entry.crc;
+      size = entry.size;
+      method = DEFLATED;
+      pieces = entry.deflated;
+    } else {
+      crc = crc32(entry.data);
+      size = entry.data.length;
+      const deflated = await through(entry.data, new CompressionStream('deflate-raw'), Number.MAX_SAFE_INTEGER);
+      method = deflated.length < entry.data.length ? DEFLATED : STORED;
+      pieces = [method === DEFLATED ? deflated : entry.data];
+    }
+    const packed = pieces.reduce((sum, p) => sum + p.length, 0);
+    if (size > MAX_ZIP32 || packed > MAX_ZIP32 || offset + 30 + name.length + packed > MAX_ZIP32) {
+      throw new ZipError(t('zip.archiveTooLarge', { name: entry.name }));
+    }
 
     const local = new Uint8Array(30 + name.length);
     const lv = new DataView(local.buffer);
@@ -165,8 +263,8 @@ export async function writeZip(entries: readonly ZipEntry[], modified = new Date
     lv.setUint16(10, time, true);
     lv.setUint16(12, date, true);
     lv.setUint32(14, crc, true);
-    lv.setUint32(18, data.length, true);
-    lv.setUint32(22, entry.data.length, true);
+    lv.setUint32(18, packed, true);
+    lv.setUint32(22, size, true);
     lv.setUint16(26, name.length, true);
     local.set(name, 30);
 
@@ -180,15 +278,16 @@ export async function writeZip(entries: readonly ZipEntry[], modified = new Date
     cv.setUint16(12, time, true);
     cv.setUint16(14, date, true);
     cv.setUint32(16, crc, true);
-    cv.setUint32(20, data.length, true);
-    cv.setUint32(24, entry.data.length, true);
+    cv.setUint32(20, packed, true);
+    cv.setUint32(24, size, true);
     cv.setUint16(28, name.length, true);
     cv.setUint32(42, offset, true);
     central.set(name, 46);
 
-    locals.push(local, data);
+    locals.push(local);
+    for (const piece of pieces) locals.push(piece);
     centrals.push(central);
-    offset += local.length + data.length;
+    offset += local.length + packed;
   }
   const centralSize = centrals.reduce((sum, c) => sum + c.length, 0);
   const endRecord = new Uint8Array(22);
@@ -201,9 +300,11 @@ export async function writeZip(entries: readonly ZipEntry[], modified = new Date
 
   const out = new Uint8Array(offset + centralSize + 22);
   let at = 0;
-  for (const part of [...locals, ...centrals, endRecord]) {
-    out.set(part, at);
-    at += part.length;
+  for (const parts of [locals, centrals, [endRecord]]) {
+    for (const part of parts) {
+      out.set(part, at);
+      at += part.length;
+    }
   }
   return out;
 }

@@ -1,6 +1,6 @@
 use cad_slicer::{
-    Cut, DrawingMesh, GridMergeOptions, build_clash_section_sheet, draw_slab_unoccluded,
-    merge_drawings_grid, to_clash_dxf,
+    ClashSectionSheet, Cut, DrawingMesh, GridMergeOptions, MasterGridWriter,
+    build_clash_section_sheet, draw_slab_unoccluded, merge_drawings_grid, to_clash_dxf,
 };
 use glam::DVec3;
 use ifc_geometry::Mesh;
@@ -28,15 +28,13 @@ fn unoccluded_slab_keeps_elements_behind_concrete_and_zero_depth_emits_cut_only(
         normal: DVec3::X,
     };
 
-    // Depth = 0 -> cut loops only, rebar behind cut plane is not cut.
+    // Depth = 0 -> cut loops only, rebar behind cut plane is not cut. A mesh wholly outside the
+    // slab is skipped before its layer is made, so the layer is either absent or empty.
     let zero_draw = draw_slab_unoccluded(&[concrete.clone(), rebar.clone()], cut, 0.0);
-    let rebar_layer_zero = zero_draw
-        .layers
-        .iter()
-        .find(|l| l.name == "IfcReinforcingBar")
-        .unwrap();
-    assert!(rebar_layer_zero.loops.is_empty());
-    assert!(rebar_layer_zero.visible.is_empty());
+    if let Some(rebar_layer_zero) = zero_draw.layers.iter().find(|l| l.name == "IfcReinforcingBar") {
+        assert!(rebar_layer_zero.loops.is_empty());
+        assert!(rebar_layer_zero.visible.is_empty());
+    }
 
     // Depth = 0.05 -> rebar inside [5.00, 5.05] IS visible (no occlusion!).
     let slab_draw = draw_slab_unoccluded(&[concrete, rebar], cut, 0.05);
@@ -178,6 +176,68 @@ fn merge_drawings_grid_packs_50_sections_with_zero_overlap_and_under_50ms_per_se
     assert!(text.contains("SHEET_FRAME"));
     assert!(text.contains("GUBIM_MASTER_GRID sections=50 units=m"));
     assert!(text.ends_with("0\r\nEOF\r\n"));
+}
+
+fn bridge_sheet(i: usize) -> ClashSectionSheet {
+    let pk = 100.0 + i as f64 * 3.0;
+    let deck = box_drawing_mesh(1, "IfcBeam", [pk - 1.0, -4.0, 0.0], [pk + 1.0, 4.0, 2.0]);
+    let bar_a = box_drawing_mesh(100 + i as u32, "IfcReinforcingBar", [pk, -3.0, 0.3], [pk + 0.02, 3.0, 0.34]);
+    let tendon_b = box_drawing_mesh(200 + i as u32, "IfcTendon", [pk - 1.0, 1.0, 0.31], [pk + 1.0, 1.1, 0.40]);
+    build_clash_section_sheet(
+        &[deck, bar_a, tendon_b],
+        Cut::Plane {
+            origin: DVec3::new(pk, 0.0, 0.0),
+            normal: DVec3::X,
+        },
+        0.02,
+        &[(0, 100 + i as u32, format!("GUID_{i}"))],
+        &[(0, 200 + i as u32)],
+        &[DVec3::new(pk + 0.01, 1.05, 0.33)],
+        None,
+        "bridge",
+        pk,
+        format!("0+{pk:06.2}"),
+        pk,
+        pk + 0.02,
+        vec![],
+    )
+}
+
+#[test]
+fn master_grid_writer_streams_the_same_bytes_in_bounded_chunks_and_keeps_every_background() {
+    let sheets: Vec<ClashSectionSheet> = (0..40).map(bridge_sheet).collect();
+    let whole = merge_drawings_grid(&sheets, &GridMergeOptions::default());
+
+    // A target far below one cell's size: the header goes out alone, then one cell per chunk,
+    // the last one closing the file.
+    let mut writer = MasterGridWriter::new(&sheets, &GridMergeOptions::default());
+    let mut chunks = Vec::new();
+    let mut written = Vec::new();
+    while let Some(chunk) = writer.next_chunk(&sheets, 1) {
+        chunks.push(chunk);
+        written.push(writer.cells_written());
+    }
+    assert!(writer.next_chunk(&sheets, 1).is_none());
+    assert_eq!(chunks.len(), 41);
+    assert_eq!(written, (0..=40).collect::<Vec<_>>());
+    assert_eq!(chunks.concat(), whole.dxf_bytes, "streamed chunks must equal the one-buffer file");
+    assert_eq!(writer.cells(), whole.cells.as_slice());
+
+    // Every cell, not just the first ones, carries the bridge background layer.
+    let text = String::from_utf8_lossy(&whole.dxf_bytes);
+    let cells_with_deck = text
+        .split("PK 0+")
+        .skip(1)
+        .filter(|cell| cell.contains("8\r\nIfcBeam\r\n"))
+        .count();
+    assert_eq!(cells_with_deck, 40);
+
+    // Empty input still yields a complete, minimal DXF.
+    let mut empty = MasterGridWriter::new(&[], &GridMergeOptions::default());
+    let only = empty.next_chunk(&[], 1).unwrap();
+    assert!(empty.next_chunk(&[], 1).is_none());
+    assert_eq!(only, merge_drawings_grid(&[], &GridMergeOptions::default()).dxf_bytes);
+    assert!(String::from_utf8_lossy(&only).ends_with("0\r\nEOF\r\n"));
 }
 
 #[test]

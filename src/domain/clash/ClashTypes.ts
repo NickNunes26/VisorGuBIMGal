@@ -97,6 +97,13 @@ export interface ClashAlignmentDxfRequest {
   gridColumns?: number;
   /** Gap between grid cells in metres (default 1.0). */
   gridMarginM?: number;
+  /**
+   * Receives the master grid DXF in pieces, in file order, instead of `masterDxfBytes`. The
+   * master grid of a long bridge reaches gigabytes: a sink that deflates or writes each piece
+   * as it arrives keeps the whole file from ever sitting in memory. Without a sink the pieces
+   * are joined into `masterDxfBytes`, which only suits small batches.
+   */
+  onMasterDxfChunk?: (chunk: Uint8Array) => void | Promise<void>;
 }
 
 export interface ClashAlignmentDxfSectionOutput {
@@ -111,6 +118,7 @@ export interface ClashAlignmentDxfSectionOutput {
 
 export interface ClashAlignmentDxfBatch {
   sections: ClashAlignmentDxfSectionOutput[];
+  /** The master grid DXF, when the request gave no `onMasterDxfChunk` sink. */
   masterDxfBytes?: Uint8Array;
 }
 

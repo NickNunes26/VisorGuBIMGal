@@ -634,7 +634,8 @@ export const es = {
     unzippedTooLarge: 'El archivo descomprimido sería demasiado grande.',
     corruptEntry: 'La entrada «{name}» está dañada.',
     truncatedEntry: 'La entrada «{name}» está cortada.',
-    unsupportedCompression: 'La entrada «{name}» usa una compresión no admitida ({method}).'
+    unsupportedCompression: 'La entrada «{name}» usa una compresión no admitida ({method}).',
+    archiveTooLarge: 'El archivo ZIP superaría los 4 GB, el máximo sin ZIP64 («{name}»).'
   },
   clash: {
     needModel: 'Carga al menos un modelo IFC para analizar interferencias.',

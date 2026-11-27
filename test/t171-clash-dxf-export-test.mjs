@@ -39,7 +39,7 @@ const { relativeModelTransform, transformSlabQueryToSource } = await import(
   '../src/infrastructure/kernel/drawingRequest.ts'
 );
 const { WasmKernelAdapter } = await import('../src/infrastructure/kernel/WasmKernelAdapter.ts');
-const { readZip } = await import('../src/ui/viewer/zipArchive.ts');
+const { readZip, StreamingZipEntry, writeZip } = await import('../src/ui/viewer/zipArchive.ts');
 const wasm = await import('../src/infrastructure/kernel/pkg/wasm_api.js');
 
 const wasmBytes = readFileSync(
@@ -242,6 +242,14 @@ await test('packages individual DXFs, clashes_all.dxf master grid, and summary.c
             } finally {
               out.free();
             }
+          }
+          if (req.onMasterDxfChunk) {
+            // Stream it like the real adapter, in pieces far smaller than one cell.
+            slicer.beginMasterDxf(0, 1.0);
+            for (let piece = slicer.nextMasterDxfChunk(64); piece; piece = slicer.nextMasterDxfChunk(64)) {
+              await req.onMasterDxfChunk(piece);
+            }
+            return { sections: outputs };
           }
           const masterDxfBytes = slicer.mergeMasterDxf(0, 1.0);
           return { sections: outputs, masterDxfBytes };
@@ -616,6 +624,15 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
               value = this.batch.mergeMasterDxf(request.columns, request.marginM);
               break;
             }
+            case 'clash-batch-merge-begin': {
+              this.batch.beginMasterDxf(request.columns, request.marginM);
+              value = undefined;
+              break;
+            }
+            case 'clash-batch-merge-next': {
+              value = this.batch.nextMasterDxfChunk(request.targetBytes);
+              break;
+            }
             case 'clash-roundtrip-apply': {
               const out = this.model.applyClashDxf(
                 request.dxfBytes,
@@ -772,6 +789,35 @@ await test('WasmKernelAdapter orchestrates elementSlabSpan, exportClashAlignment
   } finally {
     globalThis.Worker = prevWorker;
   }
+});
+
+await test('StreamingZipEntry deflates a file arriving in uneven pieces into an entry readZip restores exactly', async () => {
+  // DXF-like text with some variation, ~3 MB, fed in pieces of awkward sizes.
+  const lines = [];
+  for (let i = 0; i < 60000; i++) {
+    lines.push(`0\r\nLINE\r\n8\r\nB500B\r\n10\r\n${(i * 0.137).toFixed(6)}\r\n20\r\n${(i % 977) * 0.01}\r\n`);
+  }
+  const whole = new TextEncoder().encode(lines.join(''));
+  const entry = new StreamingZipEntry('clashes_all.dxf');
+  const sizes = [1, 7, 4096, 65537, 1_000_003];
+  for (let at = 0, k = 0; at < whole.length; k++) {
+    const end = Math.min(whole.length, at + sizes[k % sizes.length]);
+    await entry.write(whole.slice(at, end));
+    at = end;
+  }
+  const deflated = await entry.finish();
+  assert.equal(deflated.size, whole.length);
+  assert.ok(deflated.deflated.reduce((s, p) => s + p.length, 0) < whole.length / 3, 'DXF text must deflate well');
+
+  const zip = await writeZip([
+    { name: 'individual/a.dxf', data: new TextEncoder().encode('0\r\nEOF\r\n') },
+    deflated,
+    { name: 'summary.csv', data: new TextEncoder().encode('pk\n') }
+  ]);
+  const files = await readZip(zip); // checks every entry's size and CRC-32
+  assert.deepEqual([...files.keys()], ['individual/a.dxf', 'clashes_all.dxf', 'summary.csv']);
+  assert.deepEqual(files.get('clashes_all.dxf'), whole);
+  assert.equal(new TextDecoder().decode(files.get('summary.csv')), 'pk\n');
 });
 
 await test('F7 conflict action bar wraps so all four choice buttons fit inside sidebar', () => {

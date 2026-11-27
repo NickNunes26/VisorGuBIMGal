@@ -51,6 +51,19 @@ interface Pending {
 
 const isClosed = (error: unknown) => error instanceof KernelError && error.code === 'model-not-open';
 
+/** Size the slicer Worker aims for in each piece of the streamed master grid DXF. */
+const MASTER_DXF_CHUNK_BYTES = 16 * 1024 * 1024;
+
+function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, p) => sum + p.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
 /**
  * One Worker, with its own WASM instance, per model. A crash stays inside its model, and
  * closing a model returns all its memory, which a shared instance could never do: WASM
@@ -965,11 +978,32 @@ export class WasmKernelAdapter implements KernelPort {
           throw new DOMException('Exportación cancelada.', 'AbortError');
         }
         onProgress?.('Generando DXF maestro combinado', 94);
-        masterDxfBytes = await slicerWorker.call<Uint8Array>({
-          op: 'clash-batch-merge',
+        // Streamed out in pieces: the master grid of a long bridge outgrows any single wasm32
+        // buffer, and is better never held whole on this side either.
+        await slicerWorker.call({
+          op: 'clash-batch-merge-begin',
           columns: request.gridColumns ?? 0,
           marginM: request.gridMarginM ?? 1.0
         });
+        const collected: Uint8Array[] = [];
+        for (;;) {
+          if (signal?.aborted) {
+            throw new DOMException('Exportación cancelada.', 'AbortError');
+          }
+          const chunk = await slicerWorker.call<Uint8Array | undefined>({
+            op: 'clash-batch-merge-next',
+            targetBytes: MASTER_DXF_CHUNK_BYTES
+          });
+          if (!chunk) break;
+          if (request.onMasterDxfChunk) {
+            await request.onMasterDxfChunk(chunk);
+          } else {
+            collected.push(chunk);
+          }
+        }
+        if (!request.onMasterDxfChunk) {
+          masterDxfBytes = concatBytes(collected);
+        }
       }
 
       onProgress?.('Planos DXF listos', 100);

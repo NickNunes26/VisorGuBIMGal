@@ -12,7 +12,7 @@ import type {
 import type { KernelPort, ProgressHandler } from '../../domain/kernel/KernelPort';
 import type { ModelId } from '../../domain/models/ModelRecord';
 import type { ClashDisplayEntry } from './clashDetector';
-import { writeZip, type ZipEntry } from './zipArchive';
+import { StreamingZipEntry, writeZip, type DeflatedZipEntry, type ZipEntry } from './zipArchive';
 
 export interface ClashAlignmentZipExportResult {
   zipBytes: Uint8Array;
@@ -142,11 +142,19 @@ export async function exportClashAlignmentZip(
   }
 
   const primaryModelId = modelIds[0] ?? entries[0]?.elementA.modelId ?? 'model';
+  // The master grid holds every section's full drawing (gigabytes on a long bridge), so it is
+  // deflated piece by piece as the kernel streams it and never kept uncompressed.
+  const master = new StreamingZipEntry('clashes_all.dxf');
+  let masterWritten = false;
   const batch = await kernel.exportClashAlignmentDxf(
     {
       modelIds,
       sections: sections.map((s) => toSectionSpec(s, primaryModelId)),
-      includeMasterGrid: true
+      includeMasterGrid: true,
+      onMasterDxfChunk: async (chunk) => {
+        masterWritten = true;
+        await master.write(chunk);
+      }
     },
     (phase, pct) => {
       const scaled = 10 + Math.round(pct * 0.85);
@@ -158,11 +166,14 @@ export async function exportClashAlignmentZip(
   options.onProgress?.('Empaquetando archivo ZIP', 97);
   const summaryCsv = buildClashSummaryCsv(sections);
   const encoder = new TextEncoder();
-  const zipEntries: ZipEntry[] = batch.sections.map((s) => ({
+  const zipEntries: (ZipEntry | DeflatedZipEntry)[] = batch.sections.map((s) => ({
     name: s.fileName,
     data: s.dxfBytes
   }));
-  if (batch.masterDxfBytes) {
+  if (masterWritten) {
+    zipEntries.push(await master.finish());
+  } else if (batch.masterDxfBytes) {
+    // A kernel that ignores the sink still hands the whole file back.
     zipEntries.push({
       name: 'clashes_all.dxf',
       data: batch.masterDxfBytes

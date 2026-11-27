@@ -476,6 +476,21 @@ impl ClashBatchSlicer {
         self.inner.merge_master_dxf(cols, margin_m)
     }
 
+    /// Lays out the master grid DXF; pull its bytes with `nextMasterDxfChunk` (F4).
+    #[wasm_bindgen(js_name = beginMasterDxf)]
+    pub fn begin_master_dxf(&mut self, columns: u32, margin_m: f64) {
+        let cols = (columns > 0).then_some(columns as usize);
+        self.inner.begin_master_dxf(cols, margin_m);
+    }
+
+    /// The next piece of the master grid DXF (about `target_bytes`, whole cells), or
+    /// `undefined` once the file is complete. No piece holds the whole grid, so a bridge whose
+    /// master grid reaches gigabytes never needs one wasm32 buffer that large.
+    #[wasm_bindgen(js_name = nextMasterDxfChunk)]
+    pub fn next_master_dxf_chunk(&mut self, target_bytes: u32) -> Option<Vec<u8>> {
+        self.inner.next_master_dxf_chunk(target_bytes as usize)
+    }
+
     #[wasm_bindgen(js_name = sectionCount)]
     pub fn section_count(&self) -> u32 {
         self.inner.section_count() as u32

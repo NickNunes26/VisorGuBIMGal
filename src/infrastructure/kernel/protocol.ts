@@ -94,6 +94,8 @@ export type WorkerRequest =
       annotations: string[];
     }
   | { op: 'clash-batch-merge'; columns: number; marginM: number }
+  | { op: 'clash-batch-merge-begin'; columns: number; marginM: number }
+  | { op: 'clash-batch-merge-next'; targetBytes: number }
   | {
       op: 'clash-roundtrip-apply';
       dxfBytes: Uint8Array;

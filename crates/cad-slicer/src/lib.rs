@@ -19,7 +19,7 @@ mod text;
 
 pub use clash_dxf::{
     ClashBlockA, ClashDxfMeta, ClashMarker2D, ClashSectionSheet, GridLayoutCell, GridMergeOptions,
-    GridMergeResult, build_clash_section_sheet, merge_drawings_grid, to_clash_dxf,
+    GridMergeResult, MasterGridWriter, build_clash_section_sheet, merge_drawings_grid, to_clash_dxf,
 };
 pub use cut::{Axis, Cut, Frame, Look};
 pub use dimension::OverallDimensions;
