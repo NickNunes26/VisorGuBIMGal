@@ -4,8 +4,8 @@ import type { FilePort, OpenedFileSource, SaveFileOptions } from '../../domain/f
 export class WebFilePort implements FilePort {
   readonly usesNativePicker = false;
 
-  async pickIfcFile(): Promise<OpenedFileSource | null> {
-    return null;
+  async pickIfcFiles(): Promise<OpenedFileSource[]> {
+    return [];
   }
 
   async saveFile(options: SaveFileOptions): Promise<boolean> {

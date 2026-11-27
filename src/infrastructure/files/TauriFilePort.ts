@@ -52,9 +52,9 @@ function encodeContentBytes(content: string | Uint8Array): Uint8Array {
 export class TauriFilePort implements FilePort {
   readonly usesNativePicker = true;
 
-  async pickIfcFile(): Promise<OpenedFileSource | null> {
-    const meta = await invoke<DesktopFileToken | null>('pick_ifc_file');
-    return meta ? toOpenedFileSource(meta) : null;
+  async pickIfcFiles(): Promise<OpenedFileSource[]> {
+    const list = await invoke<DesktopFileToken[]>('pick_ifc_files');
+    return Array.isArray(list) ? list.map(toOpenedFileSource) : [];
   }
 
   async saveFile(options: SaveFileOptions): Promise<boolean> {

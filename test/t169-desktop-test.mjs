@@ -49,7 +49,7 @@ await test('gisOnline transitions offline after threshold consecutive tile error
 await test('WebFilePort implements FilePort cleanly for web host', async () => {
   const port = new WebFilePort();
   assert.equal(port.usesNativePicker, false);
-  assert.equal(await port.pickIfcFile(), null);
+  assert.deepEqual(await port.pickIfcFiles(), []);
   assert.equal(await port.openPath('C:\\model.ifc'), null);
   assert.deepEqual(await port.consumeInitialFiles(), []);
   const unsub = port.onExternalOpen(() => {});
@@ -121,6 +121,31 @@ await test('index.css has balanced braces so .gis-map-stage is never swallowed b
 await test('Header IFC file input supports multi-file upload', () => {
   const header = readFileSync(path.resolve('src', 'ui', 'components', 'Header.tsx'), 'utf8');
   assert.match(header, /type="file"[\s\S]*?accept="\.ifc"[\s\S]*?multiple/);
+});
+
+await test('desktop opens several IFCs at once: native multi-select dialog and HTML5 drop (E2)', () => {
+  // The desktop host bypasses `<input multiple>` with its native dialog, so that dialog itself
+  // must be multi-select and its result must reach the multi-file loader.
+  const rust = readFileSync(path.resolve('src-tauri', 'src', 'lib.rs'), 'utf8');
+  assert.match(rust, /async fn pick_ifc_files\(/);
+  assert.match(rust, /\.blocking_pick_files\(\)/);
+  assert.doesNotMatch(rust, /\.blocking_pick_file\(\)/, 'single-file dialog must not come back');
+  assert.match(rust, /generate_handler!\[[\s\S]*?pick_ifc_files[\s\S]*?\]/);
+
+  const port = readFileSync(path.resolve('src', 'infrastructure', 'files', 'TauriFilePort.ts'), 'utf8');
+  assert.match(port, /invoke<DesktopFileToken\[\]>\('pick_ifc_files'\)/);
+
+  const header = readFileSync(path.resolve('src', 'ui', 'components', 'Header.tsx'), 'utf8');
+  const nativeBranch = /if \(filePort\.usesNativePicker\) \{([\s\S]*?)\r?\n    \}\r?\n/.exec(header);
+  assert.ok(nativeBranch, 'Header must have a native-picker branch');
+  assert.match(nativeBranch[1], /pickIfcFiles\(\)/);
+  assert.match(nativeBranch[1], /onOpenFiles\(picked\)/);
+
+  // On Windows, Tauri swallows file drops unless the window's own drag-drop handling is off;
+  // only then do BimViewer's HTML5 drop events (which accept several .ifc files) fire.
+  const conf = JSON.parse(readFileSync(path.resolve('src-tauri', 'tauri.conf.json'), 'utf8'));
+  const main = conf.app.windows.find((w) => w.label === 'main');
+  assert.equal(main.dragDropEnabled, false);
 });
 
 console.log(`\nt169-desktop-test: ${passed}/${passed} pass`);

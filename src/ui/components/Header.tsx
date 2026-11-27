@@ -66,8 +66,13 @@ export const Header: React.FC<HeaderProps> = ({
 
   const handleOpenClick = async () => {
     if (filePort.usesNativePicker) {
-      const picked = await filePort.pickIfcFile();
-      if (picked) onOpenFile(picked);
+      const picked = await filePort.pickIfcFiles();
+      if (picked.length === 0) return;
+      if (onOpenFiles) {
+        onOpenFiles(picked);
+      } else {
+        onOpenFile(picked[0]);
+      }
       return;
     }
     fileInputRef.current?.click();

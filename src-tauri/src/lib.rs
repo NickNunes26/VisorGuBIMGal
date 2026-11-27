@@ -136,27 +136,35 @@ fn register_ifc_path(path: String, registry: State<'_, FileRegistry>) -> Option<
     registry.register(&p)
 }
 
+/// Native multi-select IFC dialog: every picked file is authorized for the `gubim-file`
+/// protocol, in the order the dialog returns them. Empty when cancelled.
 #[tauri::command]
-async fn pick_ifc_file(
+async fn pick_ifc_files(
     app: AppHandle,
     registry: State<'_, FileRegistry>,
-) -> Result<Option<DesktopFileToken>, String> {
+) -> Result<Vec<DesktopFileToken>, String> {
     let picked = app
         .dialog()
         .file()
         .add_filter("Modelos IFC", &["ifc", "IFC"])
-        .blocking_pick_file();
+        .blocking_pick_files();
 
-    let Some(file_path) = picked else {
-        return Ok(None);
+    let Some(file_paths) = picked else {
+        return Ok(Vec::new());
     };
-    let path_buf = match file_path {
-        FilePath::Path(p) => p,
-        FilePath::Url(url) => url
-            .to_file_path()
-            .map_err(|_| "Ruta de archivo no valida.".to_string())?,
-    };
-    Ok(registry.register(&path_buf))
+    let mut tokens = Vec::with_capacity(file_paths.len());
+    for file_path in file_paths {
+        let path_buf = match file_path {
+            FilePath::Path(p) => p,
+            FilePath::Url(url) => url
+                .to_file_path()
+                .map_err(|_| "Ruta de archivo no valida.".to_string())?,
+        };
+        if let Some(token) = registry.register(&path_buf) {
+            tokens.push(token);
+        }
+    }
+    Ok(tokens)
 }
 
 #[tauri::command]
@@ -283,7 +291,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             take_pending_files,
             register_ifc_path,
-            pick_ifc_file,
+            pick_ifc_files,
             save_exported_file
         ])
         .run(tauri::generate_context!())

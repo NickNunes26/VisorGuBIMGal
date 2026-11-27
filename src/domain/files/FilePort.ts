@@ -25,8 +25,11 @@ export interface SaveFileOptions {
 export interface FilePort {
   /** True when the host opens files via a native OS dialog instead of a DOM `<input type="file">`. */
   readonly usesNativePicker: boolean;
-  /** Opens a native IFC file picker; returns null if cancelled or if the host uses DOM `<input>`. */
-  pickIfcFile(): Promise<OpenedFileSource | null>;
+  /**
+   * Opens a native multi-select IFC file picker; returns the picked files in order, or an empty
+   * list if cancelled or if the host uses DOM `<input multiple>`.
+   */
+  pickIfcFiles(): Promise<OpenedFileSource[]>;
   /** Saves text or binary output via browser download or native save dialog. Returns true if saved. */
   saveFile(options: SaveFileOptions): Promise<boolean>;
   /** Opens an IFC directly from a local file path (desktop only; returns null on web). */
