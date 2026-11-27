@@ -49,7 +49,28 @@
 
 ---
 
+## Siguiente sprint — Pista D: Alineaciones LandXML fuera de los choques
+*Pedida por el propietario el 2026-11-27. Hoy el LandXML solo se carga dentro de `ClashPanel` (`handleLoadLandXml`, `ClashPanel.tsx`) y solo sirve para los planos de choques (F1–F4); `SectionDxfPanel` no sabe de alineaciones. El parser de F1 (`src/domain/alignment/landXml.ts`) lee solo la alineación horizontal (`Line`, `Curve`, `Spiral`), sin perfil longitudinal.*
+
+| ID | Elemento | Tamaño | Dependencias |
+|---|---|---|---|
+| **L1** | **Importador LandXML propio, fuera de los choques** (cargar uno o varios `.xml`/`.landxml` desde la barra superior o arrastrándolos, como un IFC; lista de alineaciones del proyecto con nombre, `PK` inicial/final y avisos del parser; dibujar el eje en 3D y en el mapa GIS; la alineación cargada la comparten choques, planos y GIS, así que `ClashPanel` deja de tener su propio cargador) | M | Ninguna (su interfaz definitiva, con U1/U2) |
+| **L2** | **Planos y cortes desde la alineación** (sección transversal normal al eje en un `PK` o cada N m entre dos `PK`, con corte 3D en el visor y planos DXF/SVG por lotes, reutilizando `Cut::Plane` de C21 y el DXF maestro por trozos de F4; planta del eje con rótulos de `PK`; perfil longitudinal a lo largo del eje, que exige ampliar el parser con el perfil vertical `Profile`/`ProfAlign`) | L | L1 |
+
+---
+
+## Siguiente sprint — Pista E: Revisión de choques
+*Pedida por el propietario el 2026-11-27: no debería hacer falta revisar uno a uno todos los choques. Hoy la lista de `ClashPanel` solo se filtra por tipo (duro/blando, `filteredEntries`), y esa misma lista alimenta la exportación DXF por alineación: en Jabarrellas Eje 1 salieron 706 secciones.*
+
+| ID | Elemento | Tamaño | Dependencias |
+|---|---|---|---|
+| **K1** | **Ignorar choques menores que un umbral** (campo «Ignorar penetraciones menores de XX mm» junto a la holgura; los choques duros con `penetrationM` por debajo quedan fuera de la lista, del recuento, de la exportación DXF/`summary.csv` y de los temas BCF, con un aviso «N choques ocultos por el umbral» y forma de verlos; el umbral se aplica al resultado sin repetir la detección, y se guarda con las reglas de choques cuando exista P1) | S | Ninguna (persistencia, con P1) |
+
+---
+
 ## Orden de ejecución recomendado
 1. ~~**Pista 0:** **F1 → F2 → F3 → F4 → F5**~~ (**Completada** — pendiente solo revisión en sesión dedicada y `test:e2e` en navegador).
 2. **Ola 1 (en paralelo):** **E9** (escritorio soberano) + **U0** (extracción de almacenes) + **P1** (IndexedDB).
 3. **Ola 2:** **U1 → U2** (rediseño CAD + SolidJS) integrando directamente **A1** y **C18** sobre los nuevos componentes.
+4. **K1** en cualquier momento: es pequeña, no depende de nada y reduce directamente el número de secciones exportadas.
+5. **Pista D:** **L1 → L2**. La lógica de L1 (cargar, guardar y compartir alineaciones) puede empezar en la Ola 1; su interfaz entra con U1/U2 para no diseñarla dos veces.
