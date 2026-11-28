@@ -8,6 +8,14 @@ import {
   reduceGisOnlineState
 } from '../src/ui/viewer/gisOnline.ts';
 import { WebFilePort } from '../src/infrastructure/files/WebFilePort.ts';
+import {
+  DESKTOP_READ_CHUNK,
+  DesktopFilePort,
+  desktopFileUrl,
+  desktopSaveUrl,
+  isDesktopHost,
+  readDesktopFile
+} from '../src/infrastructure/files/DesktopFilePort.ts';
 
 let passed = 0;
 async function test(name, fn) {
@@ -57,11 +65,11 @@ await test('WebFilePort implements FilePort cleanly for web host', async () => {
   unsub();
 });
 
-await test('no desktop/Tauri host branches leak outside composition.ts and TauriFilePort.ts (E2)', () => {
+await test('no desktop host branches leak outside composition.ts and DesktopFilePort.ts (E2, E9)', () => {
   const root = path.resolve('src');
   const allowed = new Set([
     path.join(root, 'infrastructure', 'composition.ts'),
-    path.join(root, 'infrastructure', 'files', 'TauriFilePort.ts')
+    path.join(root, 'infrastructure', 'files', 'DesktopFilePort.ts')
   ]);
   const violations = [];
   function walk(dir) {
@@ -72,14 +80,28 @@ await test('no desktop/Tauri host branches leak outside composition.ts and Tauri
       } else if (full.endsWith('.ts') || full.endsWith('.tsx')) {
         if (allowed.has(full)) continue;
         const text = readFileSync(full, 'utf8');
-        if (/__TAURI__|isTauriHost|@tauri-apps|TauriFilePort/.test(text)) {
+        if (/__TAURI|@tauri-apps|TauriFilePort|chrome\.webview|isDesktopHost|DesktopFilePort/.test(text)) {
           violations.push(path.relative(root, full));
         }
       }
     }
   }
   walk(root);
-  assert.deepEqual(violations, [], `Tauri/desktop references found outside composition: ${violations.join(', ')}`);
+  assert.deepEqual(violations, [], `desktop references found outside composition: ${violations.join(', ')}`);
+});
+
+await test('Tauri is gone: no src-tauri, no @tauri-apps packages (E9)', () => {
+  assert.throws(() => statSync(path.resolve('src-tauri')), /ENOENT/);
+  const pkg = JSON.parse(readFileSync(path.resolve('package.json'), 'utf8'));
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  assert.deepEqual(Object.keys(deps).filter((d) => d.startsWith('@tauri-apps')), []);
+  assert.doesNotMatch(JSON.stringify(pkg.scripts), /tauri/);
+  // The shell's resolved crates: no Tauri, and none of the MPL-2.0 crates it pulled in (E9).
+  const lock = readFileSync(path.resolve('desktop', 'Cargo.lock'), 'utf8');
+  const crates = [...lock.matchAll(/^name = "([^"]+)"$/gm)].map((m) => m[1]);
+  assert.ok(crates.includes('webview2-com') && crates.includes('windows'), 'lock must list the shell crates');
+  const banned = ['option-ext', 'cssparser', 'cssparser-macros', 'selectors', 'dtoa-short', 'servo_arc'];
+  assert.deepEqual(crates.filter((c) => c.startsWith('tauri') || banned.includes(c)), []);
 });
 
 await test('vite.config.ts preserves /VisorGuBIMGal/ for web production and uses ./ for desktop (E3)', () => {
@@ -89,15 +111,17 @@ await test('vite.config.ts preserves /VisorGuBIMGal/ for web production and uses
   assert.match(cfg, /'\.\/'/);
 });
 
-await test('src-tauri/tauri.conf.json defines a strict non-null Content Security Policy', () => {
-  const conf = JSON.parse(readFileSync(path.resolve('src-tauri', 'tauri.conf.json'), 'utf8'));
-  const csp = conf?.app?.security?.csp;
-  assert.equal(typeof csp, 'string', 'CSP must be a non-null policy string');
+await test('the desktop build carries a strict Content Security Policy (E9)', () => {
+  const csp = readFileSync(path.resolve('desktop', 'content-security-policy.txt'), 'utf8').trim();
   assert.ok(csp.includes("default-src 'self'"), 'CSP must restrict default-src to self');
   assert.ok(csp.includes("script-src 'self' 'wasm-unsafe-eval'"), 'CSP must allow only self scripts + wasm');
   assert.ok(csp.includes("object-src 'none'"), 'CSP must disallow plugins/objects');
-  assert.ok(csp.includes('http://gubim-file.localhost'), 'CSP must allow local gubim-file protocol');
+  assert.match(csp, /connect-src [^;]*https:\/\/gubim-file\.localhost/, 'CSP must allow the local file host');
   assert.ok(!csp.includes("'unsafe-eval'"), 'CSP must not allow unsafe-eval (only wasm-unsafe-eval)');
+  assert.ok(!csp.includes('frame-ancestors'), 'frame-ancestors is ignored in a <meta> CSP');
+  const build = readFileSync(path.resolve('scripts', 'build-desktop.mjs'), 'utf8');
+  assert.match(build, /content-security-policy\.txt/);
+  assert.match(build, /http-equiv="Content-Security-Policy"/);
 });
 
 await test('index.css has balanced braces so .gis-map-stage is never swallowed by a CSS syntax error', () => {
@@ -123,29 +147,139 @@ await test('Header IFC file input supports multi-file upload', () => {
   assert.match(header, /type="file"[\s\S]*?accept="\.ifc"[\s\S]*?multiple/);
 });
 
-await test('desktop opens several IFCs at once: native multi-select dialog and HTML5 drop (E2)', () => {
+await test('desktop opens several IFCs at once: native multi-select dialog and HTML5 drop (E2, E9)', () => {
   // The desktop host bypasses `<input multiple>` with its native dialog, so that dialog itself
   // must be multi-select and its result must reach the multi-file loader.
-  const rust = readFileSync(path.resolve('src-tauri', 'src', 'lib.rs'), 'utf8');
-  assert.match(rust, /async fn pick_ifc_files\(/);
-  assert.match(rust, /\.blocking_pick_files\(\)/);
-  assert.doesNotMatch(rust, /\.blocking_pick_file\(\)/, 'single-file dialog must not come back');
-  assert.match(rust, /generate_handler!\[[\s\S]*?pick_ifc_files[\s\S]*?\]/);
+  const host = readFileSync(path.resolve('desktop', 'src', 'host.rs'), 'utf8');
+  assert.match(host, /"pickIfcFiles" =>/);
+  assert.match(host, /FOS_ALLOWMULTISELECT/);
+  // HTML5 drops reach BimViewer (several .ifc files) as long as the shell leaves external drops on.
+  assert.doesNotMatch(host, /SetAllowExternalDrop\(false\)/);
 
-  const port = readFileSync(path.resolve('src', 'infrastructure', 'files', 'TauriFilePort.ts'), 'utf8');
-  assert.match(port, /invoke<DesktopFileToken\[\]>\('pick_ifc_files'\)/);
+  const port = readFileSync(path.resolve('src', 'infrastructure', 'files', 'DesktopFilePort.ts'), 'utf8');
+  assert.match(port, /this\.call<DesktopFileToken\[\]>\('pickIfcFiles'\)/);
 
   const header = readFileSync(path.resolve('src', 'ui', 'components', 'Header.tsx'), 'utf8');
   const nativeBranch = /if \(filePort\.usesNativePicker\) \{([\s\S]*?)\r?\n    \}\r?\n/.exec(header);
   assert.ok(nativeBranch, 'Header must have a native-picker branch');
   assert.match(nativeBranch[1], /pickIfcFiles\(\)/);
   assert.match(nativeBranch[1], /onOpenFiles\(picked\)/);
+});
 
-  // On Windows, Tauri swallows file drops unless the window's own drag-drop handling is off;
-  // only then do BimViewer's HTML5 drop events (which accept several .ifc files) fire.
-  const conf = JSON.parse(readFileSync(path.resolve('src-tauri', 'tauri.conf.json'), 'utf8'));
-  const main = conf.app.windows.find((w) => w.label === 'main');
-  assert.equal(main.dragDropEnabled, false);
+/** A stand-in for window.chrome.webview and for the shell behind it. */
+function fakeShell(handler) {
+  const listeners = [];
+  const sent = [];
+  const host = {
+    postMessage(msg) {
+      sent.push(msg);
+      const reply = handler(msg);
+      if (reply) queueMicrotask(() => listeners.forEach((l) => l({ data: { id: msg.id, ...reply } })));
+    },
+    addEventListener(type, l) {
+      if (type === 'message') listeners.push(l);
+    },
+    emit(data) {
+      listeners.forEach((l) => l({ data }));
+    }
+  };
+  return { host, sent };
+}
+
+/** A fetch that serves `bytes` as the shell does: ranges only, at most DESKTOP_READ_CHUNK. */
+function fakeFileFetch(bytes, calls) {
+  return async (url) => {
+    calls.push(url);
+    const m = /\?start=(\d+)&end=(\d+)$/.exec(url);
+    if (!m) return new Response('Bad range', { status: 400 });
+    const [start, end] = [Number(m[1]), Number(m[2])];
+    if (end - start > DESKTOP_READ_CHUNK || end > bytes.length) return new Response('Bad range', { status: 416 });
+    return new Response(bytes.slice(start, end));
+  };
+}
+
+await test('isDesktopHost needs a WebView2 bridge with postMessage and addEventListener (E9)', () => {
+  assert.equal(isDesktopHost(undefined), false);
+  assert.equal(isDesktopHost({}), false);
+  assert.equal(isDesktopHost({ chrome: {} }), false);
+  assert.equal(isDesktopHost({ chrome: { webview: { postMessage() {} } } }), false);
+  assert.equal(isDesktopHost({ chrome: { webview: { postMessage() {}, addEventListener() {} } } }), true);
+});
+
+await test('DesktopFilePort reads a file in bounded ranges and reassembles it exactly (E4, E9)', async () => {
+  const size = 2 * DESKTOP_READ_CHUNK + 12345;
+  const bytes = new Uint8Array(size);
+  for (let i = 0; i < size; i++) bytes[i] = (i * 31 + (i >> 16)) & 0xff;
+  const calls = [];
+  const { host, sent } = fakeShell((msg) =>
+    msg.cmd === 'takePendingFiles' ? { ok: true, result: [{ token: 'f-7', name: 'big.ifc', size }] } : null
+  );
+  const port = new DesktopFilePort(host, fakeFileFetch(bytes, calls));
+  const [file] = await port.consumeInitialFiles();
+  assert.deepEqual(sent, [{ id: 1, cmd: 'takePendingFiles', args: null }]);
+  assert.equal(file.name, 'big.ifc');
+  assert.equal(file.size, size);
+  const read = new Uint8Array(await file.arrayBuffer());
+  assert.equal(read.length, size);
+  assert.ok(read.every((b, i) => b === bytes[i]), 'bytes must match');
+  assert.deepEqual(calls, [
+    desktopFileUrl('f-7', 0, DESKTOP_READ_CHUNK),
+    desktopFileUrl('f-7', DESKTOP_READ_CHUNK, 2 * DESKTOP_READ_CHUNK),
+    desktopFileUrl('f-7', 2 * DESKTOP_READ_CHUNK, size)
+  ]);
+  // An empty file needs no request; a file that shrank under us is an error, not a short read.
+  const before = calls.length;
+  assert.equal((await readDesktopFile({ token: 'f-0', name: 'e.ifc', size: 0 }, fakeFileFetch(bytes, calls))).byteLength, 0);
+  assert.equal(calls.length, before);
+  await assert.rejects(readDesktopFile({ token: 'f-8', name: 'x.ifc', size: 10 }, async () => new Response(new Uint8Array(4))), /cambió/);
+  await assert.rejects(readDesktopFile({ token: 'f-9', name: 'x.ifc', size: 10 }, async () => new Response('x', { status: 404 })), /404/);
+});
+
+await test('DesktopFilePort: open-file events, picking, error replies (E1, E9)', async () => {
+  const { host, sent } = fakeShell((msg) => {
+    if (msg.cmd === 'pickIfcFiles') return { ok: true, result: [{ token: 'f-1', name: 'a.ifc', size: 1 }, { token: 'f-2', name: 'b.ifc', size: 2 }] };
+    if (msg.cmd === 'registerIfcPath') return { ok: false, error: 'no' };
+    return null;
+  });
+  const port = new DesktopFilePort(host, async () => new Response(new Uint8Array(0)));
+  assert.equal(port.usesNativePicker, true);
+  const picked = await port.pickIfcFiles();
+  assert.deepEqual(picked.map((p) => p.name), ['a.ifc', 'b.ifc']);
+  await assert.rejects(port.openPath('C:\\x.ifc'), /no/);
+  assert.deepEqual(sent.map((m) => [m.id, m.cmd]), [[1, 'pickIfcFiles'], [2, 'registerIfcPath']]);
+  assert.deepEqual(sent[1].args, { path: 'C:\\x.ifc' });
+
+  const seen = [];
+  const stop = port.onExternalOpen((src) => seen.push(src.name));
+  host.emit({ event: 'open-file', file: { token: 'f-3', name: 'segundo.ifc', size: 9 } });
+  host.emit({ id: 999, ok: true, result: [] }); // a reply nobody waits for is ignored
+  stop();
+  host.emit({ event: 'open-file', file: { token: 'f-4', name: 'tercero.ifc', size: 9 } });
+  assert.deepEqual(seen, ['segundo.ifc']);
+});
+
+await test('DesktopFilePort saves by posting the bytes; the shell answers 1 saved, 0 cancelled (E2, E9)', async () => {
+  assert.equal(
+    desktopSaveUrl({ defaultName: 'plano planta ñ.dxf', filterName: 'Plano DXF', extensions: ['dxf', 'svg'] }),
+    'https://gubim-file.localhost/__save?name=plano%20planta%20%C3%B1.dxf&filter=Plano%20DXF&ext=dxf%2Csvg'
+  );
+  const posted = [];
+  let answer = '1';
+  let status = 200;
+  const port = new DesktopFilePort(fakeShell(() => null).host, async (url, init) => {
+    posted.push({ url, method: init.method, type: init.body.type, bytes: new Uint8Array(await init.body.arrayBuffer()) });
+    return new Response(answer, { status });
+  });
+  assert.equal(await port.saveFile({ defaultName: 'a.csv', content: 'x;y', mimeType: 'text/csv', extensions: ['csv'] }), true);
+  assert.equal(posted[0].method, 'POST');
+  assert.equal(posted[0].type, '', 'an untyped Blob keeps the request simple (no preflight)');
+  assert.deepEqual([...posted[0].bytes], [...new TextEncoder().encode('x;y')]);
+  answer = '0';
+  assert.equal(await port.saveFile({ defaultName: 'b.glb', content: new Uint8Array([1, 2, 3]), mimeType: 'model/gltf-binary' }), false);
+  assert.deepEqual([...posted[1].bytes], [1, 2, 3]);
+  answer = 'No se pudo escribir';
+  status = 500;
+  await assert.rejects(port.saveFile({ defaultName: 'c.txt', content: 'z', mimeType: 'text/plain' }), /No se pudo escribir/);
 });
 
 console.log(`\nt169-desktop-test: ${passed}/${passed} pass`);

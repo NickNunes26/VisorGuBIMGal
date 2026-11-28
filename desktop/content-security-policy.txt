@@ -1,0 +1,1 @@
+default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://www.ign.es; connect-src 'self' https://gubim-file.localhost https://*.tile.openstreetmap.org https://www.ign.es; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'

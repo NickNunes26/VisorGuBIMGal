@@ -23,7 +23,7 @@
 
 | ID | Elemento | Tamaño | Dependencias |
 |---|---|---|---|
-| **E9** | **Sustituir Tauri v2 por carcasa propia en Rust puro (Win32 + WebView2)** (`windows` MIT/Apache-2.0 + `webview2-com` MIT, instancia única `CreateMutexW`/`WM_COPYDATA`, diálogos nativos, `WebResourceRequested` para `.ifc` grandes, instalador NSIS, pasa `cargo deny check`) | M | Ninguna |
+| **E9** | **Sustituir Tauri v2 por carcasa propia en Rust puro (Win32 + WebView2)** (`windows` MIT/Apache-2.0 + `webview2-com` MIT, instancia única `CreateMutexW`/`WM_COPYDATA`, diálogos nativos, `WebResourceRequested` para `.ifc` grandes, instalador NSIS, pasa `cargo deny check`) — **Hecho en `feat/desktop-E9`**, pendiente de revisión | M | Ninguna |
 
 ---
 

@@ -37,6 +37,11 @@ jobs:
       - name: Cargo build wasm-api
         run: cargo build -p wasm-api --release --target wasm32-unknown-unknown
 
+      - name: Desktop shell (E9), platform-independent part
+        run: |
+          cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path desktop/Cargo.toml
+
   licences:
     runs-on: ubuntu-latest
     steps:
@@ -50,6 +55,9 @@ jobs:
 
       - name: Run cargo deny check
         run: cargo deny check
+
+      - name: Run cargo deny check on the desktop shell (E9)
+        run: cargo deny --manifest-path desktop/Cargo.toml --config deny.toml check
 
   web:
     runs-on: ubuntu-latest

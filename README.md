@@ -19,7 +19,7 @@ Visor BIM y GIS de código abierto ejecutado íntegramente en local (client-side
   - **Exportación glTF/GLB:** exportación de la escena visible a `.glb` 2.0.
 - **Contexto GIS 2D:** Mapa Leaflet con capas IGN PNOA (WMS) y OpenStreetMap, transformación geodésica con Proj4js (`IfcMapConversion` / UTM 29N `EPSG:25829` y otros CRS) y estado explícito sin conexión.
 - **Interfaz en castellano con capa i18n:** Todos los textos salen del catálogo `src/ui/i18n/es.ts`, listo para añadir gallego e inglés.
-- **Aplicación de escritorio Windows (experimental):** Carcasa Tauri v2 con apertura por doble clic en `.ifc`, instancia única, `FilePort` desacoplado en `composition.ts`, protocolo local para archivos grandes e instalador NSIS sin firmar (sustitución planificada en el siguiente sprint por una carcasa propia sin dependencias MPL-2.0, ver **E9**).
+- **Aplicación de escritorio Windows (experimental):** Carcasa propia en Rust puro (Win32 + WebView2, sin Tauri ni dependencias MPL-2.0, **E9**) con apertura por doble clic en `.ifc`, instancia única, diálogos nativos, `FilePort` desacoplado en `composition.ts`, lectura de archivos grandes por tramos e instalador NSIS sin firmar.
 
 ## Pila tecnológica
 
@@ -63,7 +63,9 @@ cargo test --workspace                               # >500 pruebas unitarias y 
 
 ```bash
 npm run build:desktop   # Paquete web con base relativa (./)
-npm run desktop:build   # Compila el ejecutable e instalador NSIS sin firmar en src-tauri/target/release/bundle/nsis/
+npm run desktop:build   # Ejecutable e instalador NSIS sin firmar en desktop/target/release/bundle/ (necesita NSIS 3)
+npm run desktop:dev     # Servidor Vite + carcasa apuntando a él
+node test/e2e/desktop-check.mjs   # Comprobación de la carcasa real (tras desktop:build)
 ```
 
 ## Documentación técnica
@@ -93,7 +95,6 @@ La documentación técnica completa se organiza en [`docs/`](./docs/00_index.md)
 - [x] **Fase 3 (GIS y rendimiento):** Integración Leaflet + Proj4js con estado sin conexión, caché OPFS, compresión `q16`, instanciación en GPU y LoD adaptativo.
 - [x] **Fase 4a (CI/CD y caché local):** CI completo en GitHub Actions (`rust`, `licences`, `web`, `bench`, `browser`), despliegue continuo en GitHub Pages y caché de geometría en OPFS.
 - [ ] **Siguiente sprint:**
-  - **E9:** Sustituir Tauri por una carcasa de escritorio Windows propia en Rust puro (Win32 + WebView2, cero dependencias MPL-2.0).
   - Persistencia de sesión de trabajo en IndexedDB (vistas guardadas, incidencias BCF, reglas de choques y preferencias).
   - Auditoría de accesibilidad (navegación por teclado, `:focus-visible`, `aria-live` y contraste WCAG).
   - Idiomas adicionales (gallego e inglés, C18) sobre la capa i18n existente.
